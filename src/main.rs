@@ -1,6 +1,7 @@
 mod active_client;
 mod config;
 mod event_reader;
+mod state_export;
 mod udev_monitor;
 mod virtual_devices;
 
