@@ -1024,7 +1024,7 @@ impl EventReader {
         if value == 1 {
             self.update_config().await;
         };
-        let config = self.current_config.lock().await;
+        let config = self.current_config.lock().await.clone();
         let modifiers = self.modifiers.lock().await.clone();
         if let Some(map) = config.bindings.remap.get(&event) {
             if let Some(event_list) = map.get(&modifiers) {
