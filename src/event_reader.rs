@@ -1406,9 +1406,33 @@ impl EventReader {
     }
 
     async fn write_state(&self) {
-        let config = self.current_config.lock().await.clone();
-        let modifiers = self.modifiers.lock().await.clone();
-        let layout = *self.active_layout.lock().await;
+        // Each lock acquisition is guarded by a timeout so that a deadlock
+        // (same task trying to re-acquire a lock it already holds) surfaces
+        // immediately in the journal instead of silently freezing makima.
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+        let config = match tokio::time::timeout(TIMEOUT, self.current_config.lock()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                eprintln!("makima: write_state: current_config lock timed out — possible deadlock");
+                return;
+            }
+        };
+        let modifiers = match tokio::time::timeout(TIMEOUT, self.modifiers.lock()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                eprintln!("makima: write_state: modifiers lock timed out — possible deadlock");
+                return;
+            }
+        };
+        let layout = match tokio::time::timeout(TIMEOUT, self.active_layout.lock()).await {
+            Ok(guard) => *guard,
+            Err(_) => {
+                eprintln!("makima: write_state: active_layout lock timed out — possible deadlock");
+                return;
+            }
+        };
+
         crate::state_export::write_state(&config, &modifiers, layout).await;
     }
 
