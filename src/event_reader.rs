@@ -358,6 +358,7 @@ impl EventReader {
                 .unwrap()
                 .name
         );
+        self.write_state().await;
         tokio::join!(
             self.event_loop(),
             self.cursor_loop(),
