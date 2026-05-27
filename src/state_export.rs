@@ -9,6 +9,7 @@
 
 use crate::config::Event;
 use crate::Config;
+use evdev::Key;
 use serde_json;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -49,13 +50,40 @@ pub async fn write_state(config: &Config, modifiers: &[Event], layout: u16) {
         }
     }
 
-    // Build modifier_active: only combos whose modifier set exactly matches
-    // the currently held modifiers. Empty when no modifier is held.
+    // Build modifier_active: combos reachable given the currently held modifiers.
+    //
+    // makima tracks held modifiers by their OUTPUT key (e.g. KEY_LEFTCTRL when
+    // L1/BTN_TL is held), because toggle_modifiers is called with the remap
+    // output. Combo entries in config.bindings.remap use the INPUT key (BTN_TL)
+    // as the HashMap key. To bridge the gap we look up each custom modifier's
+    // base output via remap[input_mod][vec![]] and check if that output key is
+    // currently held. Any input modifier whose output is active is "live".
+    let active_input_mods: Vec<Event> = config
+        .mapped_modifiers
+        .custom
+        .iter()
+        .filter(|input_mod| {
+            config
+                .bindings
+                .remap
+                .get(*input_mod)
+                .and_then(|m| m.get(&vec![]))
+                .map(|output_keys: &Vec<Key>| {
+                    output_keys
+                        .iter()
+                        .any(|k| modifiers.contains(&Event::Key(*k)))
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
     let mut modifier_active = serde_json::Map::new();
-    if !modifiers.is_empty() {
+    if !active_input_mods.is_empty() {
         for (trigger, modifier_map) in &config.bindings.remap {
             for (combo, actions) in modifier_map {
-                if !combo.is_empty() && combo.as_slice() == modifiers {
+                // Show combos whose modifier set is fully covered by active input mods.
+                if !combo.is_empty() && combo.iter().all(|m| active_input_mods.contains(m)) {
                     let action_list: Vec<serde_json::Value> = actions
                         .iter()
                         .map(|k| serde_json::Value::String(format!("{:?}", k)))
