@@ -13,7 +13,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_stream::StreamExt;
 
 struct Stick {
@@ -53,6 +53,7 @@ pub struct EventReader {
     modifiers: Arc<Mutex<Vec<Event>>>,
     modifier_was_activated: Arc<Mutex<bool>>,
     device_is_connected: Arc<Mutex<bool>>,
+    device_error_notify: Arc<Notify>,
     active_layout: Arc<Mutex<u16>>,
     current_config: Arc<Mutex<Config>>,
     environment: Environment,
@@ -67,6 +68,7 @@ impl EventReader {
         modifiers: Arc<Mutex<Vec<Event>>>,
         modifier_was_activated: Arc<Mutex<bool>>,
         environment: Environment,
+        device_error_notify: Arc<Notify>,
     ) -> Self {
         let mut position_vector: Vec<i32> = Vec::new();
         for i in [0, 0] {
@@ -328,6 +330,7 @@ impl EventReader {
             modifiers,
             modifier_was_activated,
             device_is_connected,
+            device_error_notify,
             active_layout,
             current_config,
             environment,
@@ -376,7 +379,20 @@ impl EventReader {
                 }
             }
         }
-        while let Some(Ok(event)) = stream.next().await {
+        let mut had_device_error = false;
+        while let Some(event_result) = stream.next().await {
+            let event = match event_result {
+                Ok(e) => e,
+                Err(e) => {
+                    println!(
+                        "[makima] Device read error on \"{}\": {} — signaling reconnect.",
+                        self.current_config.lock().await.name,
+                        e
+                    );
+                    had_device_error = true;
+                    break;
+                }
+            };
             match (
                 event.event_type(),
                 RelativeAxisType(event.code()),
@@ -985,6 +1001,9 @@ impl EventReader {
                 }
                 _ => self.emit_default_event(event).await,
             }
+        }
+        if had_device_error {
+            self.device_error_notify.notify_one();
         }
         let mut device_is_connected = self.device_is_connected.lock().await;
         *device_is_connected = false;

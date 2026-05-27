@@ -4,7 +4,7 @@ use crate::virtual_devices::VirtualDevices;
 use crate::Config;
 use evdev::{Device, EventStream};
 use std::{env, path::Path, process::Command, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -31,7 +31,8 @@ pub struct Environment {
 
 pub async fn start_monitoring_udev(config_files: Vec<Config>, mut tasks: Vec<JoinHandle<()>>) {
     let environment = set_environment();
-    launch_tasks(&config_files, &mut tasks, environment.clone());
+    let device_error_notify = Arc::new(Notify::new());
+    launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone());
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -41,14 +42,29 @@ pub async fn start_monitoring_udev(config_files: Vec<Config>, mut tasks: Vec<Joi
             .unwrap(),
     )
     .unwrap();
-    while let Some(Ok(event)) = monitor.next().await {
-        if is_mapped(&event.device(), &config_files) {
-            println!("---------------------\n\nReinitializing...\n");
-            for task in &tasks {
-                task.abort();
+    loop {
+        tokio::select! {
+            event = monitor.next() => {
+                if let Some(Ok(event)) = event {
+                    if is_mapped(&event.device(), &config_files) {
+                        println!("---------------------\n\nReinitializing...\n");
+                        for task in &tasks {
+                            task.abort();
+                        }
+                        tasks.clear();
+                        launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone());
+                    }
+                }
             }
-            tasks.clear();
-            launch_tasks(&config_files, &mut tasks, environment.clone())
+            _ = device_error_notify.notified() => {
+                println!("---------------------\n\nDevice error detected, reinitializing...\n");
+                for task in &tasks {
+                    task.abort();
+                }
+                tasks.clear();
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone());
+            }
         }
     }
 }
@@ -57,6 +73,7 @@ pub fn launch_tasks(
     config_files: &Vec<Config>,
     tasks: &mut Vec<JoinHandle<()>>,
     environment: Environment,
+    device_error_notify: Arc<Notify>,
 ) {
     let modifiers: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Default::default()));
     let modifier_was_activated: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -147,6 +164,7 @@ pub fn launch_tasks(
                 modifiers.clone(),
                 modifier_was_activated.clone(),
                 environment.clone(),
+                device_error_notify.clone(),
             );
             tasks.push(tokio::spawn(start_reader(reader)));
             devices_found += 1
