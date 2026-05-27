@@ -15,6 +15,17 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify};
 use tokio_stream::StreamExt;
+use serde_json;
+
+// ── State Export ──────────────────────────────────────────────────────────────
+
+fn event_to_str(event: &Event) -> String {
+    match event {
+        Event::Key(k)  => format!("{:?}", k),
+        Event::Axis(a) => format!("{:?}", a),
+        Event::Hold    => "Hold".to_string(),
+    }
+}
 
 struct Stick {
     function: String,
@@ -1331,18 +1342,21 @@ impl EventReader {
     }
 
     async fn toggle_modifiers(&self, modifier: Event, value: i32, config: &Config) {
-        let mut modifiers = self.modifiers.lock().await;
-        if config.mapped_modifiers.all.contains(&modifier) {
-            match value {
-                1 => {
-                    modifiers.push(modifier);
-                    modifiers.sort();
-                    modifiers.dedup();
+        {
+            let mut modifiers = self.modifiers.lock().await;
+            if config.mapped_modifiers.all.contains(&modifier) {
+                match value {
+                    1 => {
+                        modifiers.push(modifier);
+                        modifiers.sort();
+                        modifiers.dedup();
+                    }
+                    0 => modifiers.retain(|&x| x != modifier),
+                    _ => {}
                 }
-                0 => modifiers.retain(|&x| x != modifier),
-                _ => {}
             }
-        }
+        } // lock released here
+        self.write_state().await;
     }
 
     async fn released_keys(&self, modifiers: &Vec<Event>, config: &Config) -> Vec<Key> {
@@ -1397,7 +1411,75 @@ impl EventReader {
                     self.update_config().await;
                 }
             };
+            self.write_state().await;
         })
+    }
+
+    async fn write_state(&self) {
+        let config = self.current_config.lock().await.clone();
+        let modifiers = self.modifiers.lock().await.clone();
+        let layout = *self.active_layout.lock().await;
+
+        // Build bindings map: all remaps from current config
+        let mut bindings = serde_json::Map::new();
+        for (trigger, modifier_map) in &config.bindings.remap {
+            for (combo, actions) in modifier_map {
+                let key = if combo.is_empty() {
+                    event_to_str(trigger)
+                } else {
+                    let parts: Vec<String> = combo.iter().map(event_to_str).collect();
+                    format!("{}-{}", parts.join("-"), event_to_str(trigger))
+                };
+                let action_list: Vec<serde_json::Value> = actions
+                    .iter()
+                    .map(|k| serde_json::Value::String(format!("{:?}", k)))
+                    .collect();
+                bindings.insert(key, serde_json::json!({
+                    "action": action_list,
+                    "origin": config.name,
+                }));
+            }
+        }
+
+        // Build modifier_active: combos whose modifier set matches current modifiers
+        let mut modifier_active = serde_json::Map::new();
+        if !modifiers.is_empty() {
+            for (trigger, modifier_map) in &config.bindings.remap {
+                for (combo, actions) in modifier_map {
+                    if !combo.is_empty() && combo == &modifiers {
+                        let key = event_to_str(trigger);
+                        let action_list: Vec<serde_json::Value> = actions
+                            .iter()
+                            .map(|k| serde_json::Value::String(format!("{:?}", k)))
+                            .collect();
+                        modifier_active.insert(key, serde_json::json!({
+                            "action": action_list,
+                            "origin": config.name,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let state = serde_json::json!({
+            "context": {
+                "config_stack": [config.name],
+                "layout": layout,
+            },
+            "bindings": bindings,
+            "modifier_active": modifier_active,
+        });
+
+        let tmp_path = "/tmp/makima-state.json.tmp";
+        let final_path = "/tmp/makima-state.json";
+        match serde_json::to_string_pretty(&state) {
+            Ok(json) => {
+                if std::fs::write(tmp_path, json).is_ok() {
+                    let _ = std::fs::rename(tmp_path, final_path);
+                }
+            }
+            Err(e) => eprintln!("makima: state export failed: {}", e),
+        }
     }
 
     pub async fn cursor_loop(&self) {
