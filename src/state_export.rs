@@ -1,8 +1,8 @@
 // ── Deckery State Export ──────────────────────────────────────────────────────
 //
 // Writes /tmp/makima-state.json atomically on every config or modifier change.
-// The file is consumed by the Deckery HUD overlay (eww widget) to display
-// live button mappings without re-implementing any of makima's lookup logic.
+// The file is consumed by the Deckery HUD overlay to display live button
+// mappings without re-implementing any of makima's lookup logic.
 //
 // Called from EventReader::write_state() in event_reader.rs, which handles
 // all Arc/Mutex locking and passes plain values here.
@@ -13,12 +13,24 @@ use evdev::Key;
 use serde::Serialize;
 use serde_json;
 
+// ── Structs ───────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LastEvent {
     pub input: String,
     pub action: Vec<String>,
     pub kind: String,
     pub value: i32,
+}
+
+/// Fire-and-forget record of the last discrete user action.
+/// Written by the backend on press; never deleted by the backend.
+/// The HUD reads `ts` and fades the display after 1.5 s.
+#[derive(Debug, Clone, Serialize)]
+pub struct LastAction {
+    pub r#type: String,           // "keys" | "command" | "exec"
+    pub value: serde_json::Value, // [KEY_*] for keys, string for command/exec
+    pub ts: f64,                  // Unix timestamp (secs + fractional)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -31,6 +43,14 @@ pub fn event_to_str(event: &Event) -> String {
     }
 }
 
+/// Current Unix timestamp as f64 (seconds + fractional).
+pub fn now_ts() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 // ── Main export function ──────────────────────────────────────────────────────
 
 pub async fn write_state(
@@ -40,6 +60,7 @@ pub async fn write_state(
     paused: bool,
     last_event: &Option<LastEvent>,
     held_keys: &[Event],
+    last_action: &Option<LastAction>,
 ) {
     // Build bindings map: all remaps from current config.
     // Key format: "BTN_FOO" for plain bindings, "MOD-BTN_FOO" for combos.
@@ -67,25 +88,14 @@ pub async fn write_state(
     }
 
     // Build modifier_active: combos reachable given the currently held modifiers.
-    //
-    // makima tracks held modifiers by their OUTPUT key (e.g. KEY_LEFTCTRL when
-    // L1/BTN_TL is held), because toggle_modifiers is called with the remap
-    // output. Combo entries in config.bindings.remap use the INPUT key (BTN_TL)
-    // as the HashMap key. To bridge the gap we look up each custom modifier's
-    // base output via remap[input_mod][vec![]] and check if that output key is
-    // currently held. Any input modifier whose output is active is "live".
     let active_input_mods: Vec<Event> = config
         .mapped_modifiers
         .custom
         .iter()
         .filter(|input_mod| {
-            // Case 1: the patch path — BTN_TL is held directly in self.modifiers
-            // because convert_event called toggle_modifiers with the input key.
             if modifiers.contains(input_mod) {
                 return true;
             }
-            // Case 2: legacy remap-only path — self.modifiers holds the output
-            // key (KEY_LEFTCTRL), look it up via the remap table.
             config
                 .bindings
                 .remap
@@ -105,7 +115,6 @@ pub async fn write_state(
     if !active_input_mods.is_empty() {
         for (trigger, modifier_map) in &config.bindings.remap {
             for (combo, actions) in modifier_map {
-                // Show combos whose modifier set is fully covered by active input mods.
                 if !combo.is_empty() && combo.iter().all(|m| active_input_mods.contains(m)) {
                     let action_list: Vec<serde_json::Value> = actions
                         .iter()
@@ -124,9 +133,31 @@ pub async fn write_state(
     }
 
     // held_modifiers: modifier buttons currently held (for combo-view switching).
-    // active_buttons: ALL buttons currently held (for per-button highlighting).
+    // active_buttons: ALL input buttons currently held (for per-button highlighting).
     let held_modifiers: Vec<String> = modifiers.iter().map(event_to_str).collect();
     let active_buttons: Vec<String> = held_keys.iter().map(event_to_str).collect();
+
+    // active_outputs: the union of all evdev output keys currently being held,
+    // derived from held_keys + current modifier context.
+    // Used by the HUD to highlight active system-level keys in the center strip.
+    let mut sorted_mods = modifiers.to_vec();
+    sorted_mods.sort();
+    sorted_mods.dedup();
+    let mut active_outputs: Vec<String> = Vec::new();
+    for held_event in held_keys {
+        if let Some(modifier_map) = config.bindings.remap.get(held_event) {
+            let output = modifier_map
+                .get(&sorted_mods)
+                .or_else(|| modifier_map.get(&vec![]));
+            if let Some(keys) = output {
+                for k in keys {
+                    active_outputs.push(format!("{:?}", k));
+                }
+            }
+        }
+    }
+    active_outputs.sort();
+    active_outputs.dedup();
 
     let state = serde_json::json!({
         "context": {
@@ -135,7 +166,9 @@ pub async fn write_state(
             "paused": paused,
             "held_modifiers": held_modifiers,
             "active_buttons": active_buttons,
+            "active_outputs": active_outputs,
         },
+        "last_action": last_action,
         "last_event": last_event,
         "bindings": bindings,
         "modifier_active": modifier_active,

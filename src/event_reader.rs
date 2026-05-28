@@ -1,6 +1,6 @@
 use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, Relative, Scroll};
-use crate::state_export::LastEvent;
+use crate::state_export::{LastAction, LastEvent};
 use crate::udev_monitor::Environment;
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
@@ -57,6 +57,7 @@ pub struct EventReader {
     modifier_was_activated: Arc<Mutex<bool>>,
     paused: Arc<Mutex<bool>>,
     last_event: Arc<Mutex<Option<LastEvent>>>,
+    last_action: Arc<Mutex<Option<LastAction>>>,
     held_keys: Arc<Mutex<Vec<Event>>>,
     device_is_connected: Arc<Mutex<bool>>,
     device_error_notify: Arc<Notify>,
@@ -88,6 +89,7 @@ impl EventReader {
         let active_layout: Arc<Mutex<u16>> = Arc::new(Mutex::new(0));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let last_event: Arc<Mutex<Option<LastEvent>>> = Arc::new(Mutex::new(None));
+        let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(
             config
@@ -340,6 +342,7 @@ impl EventReader {
             modifier_was_activated,
             paused,
             last_event,
+            last_action,
             held_keys,
             device_is_connected,
             device_error_notify,
@@ -1034,6 +1037,11 @@ impl EventReader {
         value: i32,
         send_zero: bool,
     ) {
+        // DEBUG: log every key press/release to trace BTN_MODE
+        if matches!(event, Event::Key(_)) && (value == 1 || value == 0) {
+            eprintln!("[debug] convert_event: {:?} value={}", event, value);
+        }
+
         // Track all currently held buttons so the HUD can highlight them.
         // Only KEY events are tracked (not axis/stick movements).
         if matches!(event, Event::Key(_)) {
@@ -1292,9 +1300,17 @@ impl EventReader {
                 let mut le = self.last_event.lock().await;
                 *le = Some(LastEvent {
                     input: label.clone(),
-                    action: vec![label],
+                    action: vec![label.clone()],
                     kind: "passthrough".to_string(),
                     value,
+                });
+            }
+            if value == 1 {
+                let mut la = self.last_action.lock().await;
+                *la = Some(LastAction {
+                    r#type: "keys".to_string(),
+                    value: serde_json::json!([label]),
+                    ts: crate::state_export::now_ts(),
                 });
             }
             // write_state is called by toggle_modifiers below.
@@ -1448,6 +1464,10 @@ impl EventReader {
     }
 
     async fn toggle_modifiers(&self, modifier: Event, value: i32, config: &Config) {
+        eprintln!("[debug] toggle_modifiers: {:?} value={} in_all={} in_custom={}",
+            modifier, value,
+            config.mapped_modifiers.all.contains(&modifier),
+            config.mapped_modifiers.custom.contains(&modifier));
         {
             let mut modifiers = self.modifiers.lock().await;
             if config.mapped_modifiers.all.contains(&modifier) {
@@ -1563,6 +1583,13 @@ impl EventReader {
                 return;
             }
         };
+        let last_action = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                eprintln!("makima: write_state: last_action lock timed out — possible deadlock");
+                return;
+            }
+        };
         let held_keys = match tokio::time::timeout(TIMEOUT, self.held_keys.lock()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
@@ -1570,7 +1597,7 @@ impl EventReader {
                 return;
             }
         };
-        crate::state_export::write_state(&config, &modifiers, layout, paused, &last_event, &held_keys).await;
+        crate::state_export::write_state(&config, &modifiers, layout, paused, &last_event, &held_keys, &last_action).await;
     }
 
     /// Record the actual emitted key output for the HUD last-event display.
@@ -1584,6 +1611,16 @@ impl EventReader {
                 action: emitted.iter().map(|k| format!("{:?}", k)).collect(),
                 kind: "remap".to_string(),
                 value,
+            });
+        }
+        if value == 1 {
+            let mut la = self.last_action.lock().await;
+            *la = Some(LastAction {
+                r#type: "keys".to_string(),
+                value: serde_json::json!(
+                    emitted.iter().map(|k| format!("{:?}", k)).collect::<Vec<_>>()
+                ),
+                ts: crate::state_export::now_ts(),
             });
         }
         self.write_state().await;
@@ -1600,12 +1637,21 @@ impl EventReader {
                 value: 1,
             });
         }
+        {
+            let mut la = self.last_action.lock().await;
+            *la = Some(LastAction {
+                r#type: "command".to_string(),
+                value: serde_json::Value::String(commands.join(" ")),
+                ts: crate::state_export::now_ts(),
+            });
+        }
         self.write_state().await;
     }
 
     async fn start_control_socket(&self) {
         let paused         = self.paused.clone();
         let last_event     = self.last_event.clone();
+        let last_action    = self.last_action.clone();
         let current_config = self.current_config.clone();
         let modifiers      = self.modifiers.clone();
         let active_layout  = self.active_layout.clone();
@@ -1622,6 +1668,7 @@ impl EventReader {
             while let Ok((stream, _addr)) = listener.accept().await {
                 let paused         = paused.clone();
                 let last_event     = last_event.clone();
+                let last_action    = last_action.clone();
                 let current_config = current_config.clone();
                 let modifiers      = modifiers.clone();
                 let active_layout  = active_layout.clone();
@@ -1655,12 +1702,16 @@ impl EventReader {
                                     TIMEOUT, last_event.lock()).await {
                                     Ok(g) => g.clone(), Err(_) => return,
                                 };
+                                let la = match tokio::time::timeout(
+                                    TIMEOUT, last_action.lock()).await {
+                                    Ok(g) => g.clone(), Err(_) => return,
+                                };
                                 let hk = match tokio::time::timeout(
                                     TIMEOUT, held_keys.lock()).await {
                                     Ok(g) => g.clone(), Err(_) => return,
                                 };
                                 crate::state_export::write_state(
-                                    &config, &mods, layout, is_paused, &le, &hk,
+                                    &config, &mods, layout, is_paused, &le, &hk, &la,
                                 ).await;
                             }
                             _ => {}
