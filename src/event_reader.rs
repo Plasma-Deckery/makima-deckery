@@ -1280,6 +1280,9 @@ impl EventReader {
         config: &Config,
     ) {
         if *self.paused.lock().await {
+            // Even when paused, update the state file so held_keys changes
+            // (e.g. button releases) are reflected in the HUD immediately.
+            self.write_state().await;
             return;
         }
         // Record passthrough key events (press and release).
@@ -1601,8 +1604,12 @@ impl EventReader {
     }
 
     async fn start_control_socket(&self) {
-        let paused = self.paused.clone();
-        let last_event = self.last_event.clone();
+        let paused         = self.paused.clone();
+        let last_event     = self.last_event.clone();
+        let current_config = self.current_config.clone();
+        let modifiers      = self.modifiers.clone();
+        let active_layout  = self.active_layout.clone();
+        let held_keys      = self.held_keys.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file("/tmp/makima-control.sock");
             let listener = match UnixListener::bind("/tmp/makima-control.sock") {
@@ -1613,26 +1620,52 @@ impl EventReader {
                 }
             };
             while let Ok((stream, _addr)) = listener.accept().await {
-                let paused = paused.clone();
-                let last_event = last_event.clone();
+                let paused         = paused.clone();
+                let last_event     = last_event.clone();
+                let current_config = current_config.clone();
+                let modifiers      = modifiers.clone();
+                let active_layout  = active_layout.clone();
+                let held_keys      = held_keys.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream.into_std().unwrap());
                     let mut line = String::new();
                     if reader.read_line(&mut line).is_ok() {
                         let cmd = line.trim();
                         match cmd {
-                            "pause" => {
-                                *paused.lock().await = true;
-                            }
-                            "resume" => {
-                                *paused.lock().await = false;
+                            "pause" | "resume" => {
+                                let is_paused = cmd == "pause";
+                                *paused.lock().await = is_paused;
+                                // Write state immediately so the HUD sees the updated
+                                // paused flag without waiting for the next button event.
+                                const TIMEOUT: std::time::Duration =
+                                    std::time::Duration::from_millis(200);
+                                let config = match tokio::time::timeout(
+                                    TIMEOUT, current_config.lock()).await {
+                                    Ok(g) => g.clone(), Err(_) => return,
+                                };
+                                let mods = match tokio::time::timeout(
+                                    TIMEOUT, modifiers.lock()).await {
+                                    Ok(g) => g.clone(), Err(_) => return,
+                                };
+                                let layout = match tokio::time::timeout(
+                                    TIMEOUT, active_layout.lock()).await {
+                                    Ok(g) => *g, Err(_) => return,
+                                };
+                                let le = match tokio::time::timeout(
+                                    TIMEOUT, last_event.lock()).await {
+                                    Ok(g) => g.clone(), Err(_) => return,
+                                };
+                                let hk = match tokio::time::timeout(
+                                    TIMEOUT, held_keys.lock()).await {
+                                    Ok(g) => g.clone(), Err(_) => return,
+                                };
+                                crate::state_export::write_state(
+                                    &config, &mods, layout, is_paused, &le, &hk,
+                                ).await;
                             }
                             _ => {}
                         }
                     }
-                    // Note: last_event is captured but not used in the socket handler.
-                    // Dropping it here keeps the Arc alive until the task ends.
-                    drop(last_event);
                 });
             }
         });
