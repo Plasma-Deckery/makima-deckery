@@ -67,7 +67,7 @@ echo "pause"  | nc -U /tmp/makima.sock   # suspend all remapping
 echo "resume" | nc -U /tmp/makima.sock   # re-enable remapping
 ```
 
-When paused, all input passes through unmodified. The `paused` flag is reflected in `/tmp/makima-state.json`. Useful for temporarily bypassing remapping (e.g. when a game takes over input).
+When paused, all input passes through unmodified. The `paused` flag is reflected in `/tmp/makima-state.json`. The primary use case is **HUD dry-run mode**: the overlay can show the full binding map without any remapping actually taking effect — useful for exploring layouts without triggering actions.
 
 ---
 
