@@ -10,7 +10,16 @@
 use crate::config::Event;
 use crate::Config;
 use evdev::Key;
+use serde::Serialize;
 use serde_json;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LastEvent {
+    pub input: String,
+    pub action: Vec<String>,
+    pub kind: String,
+    pub value: i32,
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -24,7 +33,13 @@ pub fn event_to_str(event: &Event) -> String {
 
 // ── Main export function ──────────────────────────────────────────────────────
 
-pub async fn write_state(config: &Config, modifiers: &[Event], layout: u16) {
+pub async fn write_state(
+    config: &Config,
+    modifiers: &[Event],
+    layout: u16,
+    paused: bool,
+    last_event: &Option<LastEvent>,
+) {
     // Build bindings map: all remaps from current config.
     // Key format: "BTN_FOO" for plain bindings, "MOD-BTN_FOO" for combos.
     let mut bindings = serde_json::Map::new();
@@ -63,6 +78,13 @@ pub async fn write_state(config: &Config, modifiers: &[Event], layout: u16) {
         .custom
         .iter()
         .filter(|input_mod| {
+            // Case 1: the patch path — BTN_TL is held directly in self.modifiers
+            // because convert_event called toggle_modifiers with the input key.
+            if modifiers.contains(input_mod) {
+                return true;
+            }
+            // Case 2: legacy remap-only path — self.modifiers holds the output
+            // key (KEY_LEFTCTRL), look it up via the remap table.
             config
                 .bindings
                 .remap
@@ -105,6 +127,8 @@ pub async fn write_state(config: &Config, modifiers: &[Event], layout: u16) {
             "config_stack": [config.name],
             "layout": layout,
         },
+        "paused": paused,
+        "last_event": last_event,
         "bindings": bindings,
         "modifier_active": modifier_active,
     });

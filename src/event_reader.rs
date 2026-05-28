@@ -1,5 +1,6 @@
 use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, Relative, Scroll};
+use crate::state_export::LastEvent;
 use crate::udev_monitor::Environment;
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
@@ -7,6 +8,7 @@ use evdev::{AbsoluteAxisType, EventStream, EventType, InputEvent, Key, RelativeA
 use fork::{fork, setsid, Fork};
 use std::{
     future::Future,
+    io::{BufRead, BufReader},
     option::Option,
     pin::Pin,
     process::{Command, Stdio},
@@ -14,6 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{Mutex, Notify};
+use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
 
 struct Stick {
@@ -52,6 +55,8 @@ pub struct EventReader {
     scroll_movement: Arc<Mutex<(i32, i32)>>,
     modifiers: Arc<Mutex<Vec<Event>>>,
     modifier_was_activated: Arc<Mutex<bool>>,
+    paused: Arc<Mutex<bool>>,
+    last_event: Arc<Mutex<Option<LastEvent>>>,
     device_is_connected: Arc<Mutex<bool>>,
     device_error_notify: Arc<Notify>,
     active_layout: Arc<Mutex<u16>>,
@@ -80,6 +85,8 @@ impl EventReader {
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
         let active_layout: Arc<Mutex<u16>> = Arc::new(Mutex::new(0));
+        let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let last_event: Arc<Mutex<Option<LastEvent>>> = Arc::new(Mutex::new(None));
         let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(
             config
                 .iter()
@@ -329,6 +336,8 @@ impl EventReader {
             scroll_movement,
             modifiers,
             modifier_was_activated,
+            paused,
+            last_event,
             device_is_connected,
             device_error_notify,
             active_layout,
@@ -348,6 +357,7 @@ impl EventReader {
                 .name
         );
         self.write_state().await;
+        self.start_control_socket().await;
         tokio::join!(
             self.event_loop(),
             self.cursor_loop(),
@@ -1025,9 +1035,50 @@ impl EventReader {
             self.update_config().await;
         };
         let config = self.current_config.lock().await.clone();
-        let modifiers = self.modifiers.lock().await.clone();
+        let paused = *self.paused.lock().await;
+        let mut modifiers = self.modifiers.lock().await.clone();
+        modifiers.sort();
+        modifiers.dedup();
+
+        // ── Custom modifier + remap intercept ──────────────────────────────────
+        // A button that is BOTH in CUSTOM_MODIFIERS and has a base remap entry
+        // acts as two things simultaneously:
+        //   1. It emits the remap output (e.g. KEY_LEFTCTRL) as a held system
+        //      key, so Ctrl+click etc. work natively while the button is held.
+        //   2. It tracks the INPUT key (e.g. BTN_TL) in self.modifiers, so
+        //      combo entries keyed on BTN_TL are found correctly.
+        // Without this intercept makima would track the OUTPUT key (KEY_LEFTCTRL)
+        // instead of the input key, causing combo lookups to never match.
+        if config.mapped_modifiers.custom.contains(&event) {
+            if let Some(out_keys) = config.bindings.remap
+                .get(&event)
+                .and_then(|m| m.get(&vec![]))
+                .cloned()
+            {
+                {
+                    if !paused {
+                        let mut virt_dev = self.virt_dev.lock().await;
+                        for key in &out_keys {
+                            virt_dev.keys.emit(&[
+                                InputEvent::new_now(EventType::KEY, key.code(), value),
+                            ]).unwrap();
+                        }
+                    }
+                }
+                if value == 1 {
+                    self.set_last_emitted(&event, &out_keys, value).await;
+                }
+                self.toggle_modifiers(event, value, &config).await;
+                return;
+            }
+        }
+        // ───────────────────────────────────────────────────────────────────────
+
         if let Some(map) = config.bindings.remap.get(&event) {
             if let Some(event_list) = map.get(&modifiers) {
+                if value == 1 {
+                    self.set_last_emitted(&event, event_list, value).await;
+                }
                 self.emit_event(
                     event_list,
                     value,
@@ -1038,7 +1089,9 @@ impl EventReader {
                 )
                 .await;
                 if send_zero {
-                    let modifiers = self.modifiers.lock().await.clone();
+                    let mut modifiers = self.modifiers.lock().await.clone();
+                    modifiers.sort();
+                    modifiers.dedup();
                     self.emit_event(
                         event_list,
                         0,
@@ -1061,7 +1114,10 @@ impl EventReader {
             if let Some(map) = config.bindings.commands.get(&event) {
                 if let Some(command_list) = map.get(&modifiers) {
                     if value == 1 {
-                        self.spawn_subprocess(command_list).await
+                        self.set_last_emitted_cmd(&event, command_list).await;
+                        if !paused {
+                            self.spawn_subprocess(command_list).await
+                        }
                     };
                     return;
                 }
@@ -1075,10 +1131,15 @@ impl EventReader {
                 };
             }
             if let Some(event_list) = map.get(&Vec::new()) {
+                if value == 1 {
+                    self.set_last_emitted(&event, event_list, value).await;
+                }
                 self.emit_event(event_list, value, &modifiers, &config, true, false)
                     .await;
                 if send_zero {
-                    let modifiers = self.modifiers.lock().await.clone();
+                    let mut modifiers = self.modifiers.lock().await.clone();
+                    modifiers.sort();
+                    modifiers.dedup();
                     self.emit_event(event_list, 0, &modifiers, &config, true, false)
                         .await;
                 }
@@ -1088,6 +1149,7 @@ impl EventReader {
         if let Some(map) = config.bindings.commands.get(&event) {
             if let Some(command_list) = map.get(&modifiers) {
                 if value == 1 {
+                    self.set_last_emitted_cmd(&event, command_list).await;
                     self.spawn_subprocess(command_list).await
                 };
                 return;
@@ -1096,7 +1158,9 @@ impl EventReader {
         if let Some(map) = config.bindings.movements.get(&event) {
             if let Some(movement) = map.get(&modifiers) {
                 if value <= 1 {
-                    self.emit_movement(movement, value).await;
+                    if !paused {
+                        self.emit_movement(movement, value).await;
+                    }
                 }
                 return;
             };
@@ -1134,6 +1198,10 @@ impl EventReader {
         release_keys: bool,
         ignore_modifiers: bool,
     ) {
+        let paused = *self.paused.lock().await;
+        if paused {
+            return;
+        }
         let mut virt_dev = self.virt_dev.lock().await;
         let mut modifier_was_activated = self.modifier_was_activated.lock().await;
         if release_keys && value != 2 {
@@ -1147,11 +1215,25 @@ impl EventReader {
                 }
             }
         } else if ignore_modifiers {
-            for key in modifiers.iter() {
-                if let Event::Key(key) = key {
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 0);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap();
+            // For each active modifier, release its OUTPUT key (not the raw input
+            // code). For a custom modifier with a remap (e.g. BTN_TL → KEY_LEFTCTRL)
+            // that means releasing KEY_LEFTCTRL so the system modifier state is
+            // cleared before the combo keys are emitted.
+            for modifier in modifiers.iter() {
+                let codes: Vec<u16> = config
+                    .bindings
+                    .remap
+                    .get(modifier)
+                    .and_then(|m| m.get(&vec![]))
+                    .map(|keys| keys.iter().map(|k| k.code()).collect())
+                    .unwrap_or_else(|| match modifier {
+                        Event::Key(k) => vec![k.code()],
+                        _ => vec![],
+                    });
+                for code in codes {
+                    virt_dev.keys.emit(&[
+                        InputEvent::new_now(EventType::KEY, code, 0),
+                    ]).unwrap();
                 }
             }
         }
@@ -1189,6 +1271,23 @@ impl EventReader {
         modifiers: &Vec<Event>,
         config: &Config,
     ) {
+        if *self.paused.lock().await {
+            return;
+        }
+        // Record passthrough events (only press, not release).
+        if value == 1 && default_event.event_type() == EventType::KEY {
+            let label = crate::state_export::event_to_str(&event);
+            {
+                let mut le = self.last_event.lock().await;
+                *le = Some(LastEvent {
+                    input: label.clone(),
+                    action: vec![label],
+                    kind: "passthrough".to_string(),
+                    value,
+                });
+            }
+            // write_state is called by toggle_modifiers below.
+        }
         let mut virt_dev = self.virt_dev.lock().await;
         let mut modifier_was_activated = self.modifier_was_activated.lock().await;
         if config.mapped_modifiers.all.contains(&event) && value != 2 {
@@ -1234,6 +1333,9 @@ impl EventReader {
     }
 
     async fn emit_default_event(&self, event: InputEvent) {
+        if *self.paused.lock().await {
+            return;
+        }
         match event.event_type() {
             EventType::KEY => {
                 let mut virt_dev = self.virt_dev.lock().await;
@@ -1271,6 +1373,9 @@ impl EventReader {
     }
 
     async fn spawn_subprocess(&self, command_list: &Vec<String>) {
+        if *self.paused.lock().await {
+            return;
+        }
         let mut modifier_was_activated = self.modifier_was_activated.lock().await;
         *modifier_was_activated = true;
         let (user, running_as_root) = if let Ok(sudo_user) = &self.environment.sudo_user {
@@ -1433,7 +1538,89 @@ impl EventReader {
             }
         };
 
-        crate::state_export::write_state(&config, &modifiers, layout).await;
+        let paused = match tokio::time::timeout(TIMEOUT, self.paused.lock()).await {
+            Ok(guard) => *guard,
+            Err(_) => {
+                eprintln!("makima: write_state: paused lock timed out — possible deadlock");
+                return;
+            }
+        };
+        let last_event = match tokio::time::timeout(TIMEOUT, self.last_event.lock()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                eprintln!("makima: write_state: last_event lock timed out — possible deadlock");
+                return;
+            }
+        };
+        crate::state_export::write_state(&config, &modifiers, layout, paused, &last_event).await;
+    }
+
+    /// Record the actual emitted key output for the HUD last-event display.
+    /// Called at the emission site (not at input time) so the action reflects
+    /// what was truly sent to the virtual device.
+    async fn set_last_emitted(&self, trigger: &Event, emitted: &[Key], value: i32) {
+        {
+            let mut le = self.last_event.lock().await;
+            *le = Some(LastEvent {
+                input: crate::state_export::event_to_str(trigger),
+                action: emitted.iter().map(|k| format!("{:?}", k)).collect(),
+                kind: "remap".to_string(),
+                value,
+            });
+        }
+        self.write_state().await;
+    }
+
+    /// Record a spawned command as the last emitted action.
+    async fn set_last_emitted_cmd(&self, trigger: &Event, commands: &[String]) {
+        {
+            let mut le = self.last_event.lock().await;
+            *le = Some(LastEvent {
+                input: crate::state_export::event_to_str(trigger),
+                action: commands.to_vec(),
+                kind: "command".to_string(),
+                value: 1,
+            });
+        }
+        self.write_state().await;
+    }
+
+    async fn start_control_socket(&self) {
+        let paused = self.paused.clone();
+        let last_event = self.last_event.clone();
+        tokio::spawn(async move {
+            let _ = std::fs::remove_file("/tmp/makima-control.sock");
+            let listener = match UnixListener::bind("/tmp/makima-control.sock") {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("makima: control socket bind failed: {}", e);
+                    return;
+                }
+            };
+            while let Ok((stream, _addr)) = listener.accept().await {
+                let paused = paused.clone();
+                let last_event = last_event.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream.into_std().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_ok() {
+                        let cmd = line.trim();
+                        match cmd {
+                            "pause" => {
+                                *paused.lock().await = true;
+                            }
+                            "resume" => {
+                                *paused.lock().await = false;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Note: last_event is captured but not used in the socket handler.
+                    // Dropping it here keeps the Arc alive until the task ends.
+                    drop(last_event);
+                });
+            }
+        });
     }
 
     pub async fn cursor_loop(&self) {
@@ -1466,18 +1653,20 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            let (x_coord, y_coord) = if self.settings.invert_cursor_axis {
-                                (-stick_position[0], -stick_position[1])
-                            } else {
-                                (stick_position[0], stick_position[1])
-                            };
-                            let virtual_event_x: InputEvent =
-                                InputEvent::new_now(EventType::RELATIVE, 0, x_coord);
-                            let virtual_event_y: InputEvent =
-                                InputEvent::new_now(EventType::RELATIVE, 1, y_coord);
-                            let mut virt_dev = self.virt_dev.lock().await;
-                            virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                            virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                            if !*self.paused.lock().await {
+                                let (x_coord, y_coord) = if self.settings.invert_cursor_axis {
+                                    (-stick_position[0], -stick_position[1])
+                                } else {
+                                    (stick_position[0], stick_position[1])
+                                };
+                                let virtual_event_x: InputEvent =
+                                    InputEvent::new_now(EventType::RELATIVE, 0, x_coord);
+                                let virtual_event_y: InputEvent =
+                                    InputEvent::new_now(EventType::RELATIVE, 1, y_coord);
+                                let mut virt_dev = self.virt_dev.lock().await;
+                                virt_dev.axis.emit(&[virtual_event_x]).unwrap();
+                                virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                            }
                         }
                     }
                 }
@@ -1518,18 +1707,20 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            let (x_coord, y_coord) = if self.settings.invert_scroll_axis {
-                                (-stick_position[0], -stick_position[1])
-                            } else {
-                                (stick_position[0], stick_position[1])
-                            };
-                            let virtual_event_x: InputEvent =
-                                InputEvent::new_now(EventType::RELATIVE, 12, x_coord);
-                            let virtual_event_y: InputEvent =
-                                InputEvent::new_now(EventType::RELATIVE, 11, y_coord);
-                            let mut virt_dev = self.virt_dev.lock().await;
-                            virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                            virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                            if !*self.paused.lock().await {
+                                let (x_coord, y_coord) = if self.settings.invert_scroll_axis {
+                                    (-stick_position[0], -stick_position[1])
+                                } else {
+                                    (stick_position[0], stick_position[1])
+                                };
+                                let virtual_event_x: InputEvent =
+                                    InputEvent::new_now(EventType::RELATIVE, 12, x_coord);
+                                let virtual_event_y: InputEvent =
+                                    InputEvent::new_now(EventType::RELATIVE, 11, y_coord);
+                                let mut virt_dev = self.virt_dev.lock().await;
+                                virt_dev.axis.emit(&[virtual_event_x]).unwrap();
+                                virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                            }
                         }
                     }
                 }
@@ -1564,23 +1755,25 @@ impl EventReader {
                     if current_speed > speed as f32 {
                         current_speed = speed as f32
                     }
-                    if cursor_movement.0 != 0 {
-                        let mut virt_dev = self.virt_dev.lock().await;
-                        let virtual_event_x: InputEvent = InputEvent::new_now(
-                            EventType::RELATIVE,
-                            0,
-                            cursor_movement.0 * current_speed as i32,
-                        );
-                        virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                    }
-                    if cursor_movement.1 != 0 {
-                        let mut virt_dev = self.virt_dev.lock().await;
-                        let virtual_event_y: InputEvent = InputEvent::new_now(
-                            EventType::RELATIVE,
-                            1,
-                            cursor_movement.1 * current_speed as i32,
-                        );
-                        virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                    if !*self.paused.lock().await {
+                        if cursor_movement.0 != 0 {
+                            let mut virt_dev = self.virt_dev.lock().await;
+                            let virtual_event_x: InputEvent = InputEvent::new_now(
+                                EventType::RELATIVE,
+                                0,
+                                cursor_movement.0 * current_speed as i32,
+                            );
+                            virt_dev.axis.emit(&[virtual_event_x]).unwrap();
+                        }
+                        if cursor_movement.1 != 0 {
+                            let mut virt_dev = self.virt_dev.lock().await;
+                            let virtual_event_y: InputEvent = InputEvent::new_now(
+                                EventType::RELATIVE,
+                                1,
+                                cursor_movement.1 * current_speed as i32,
+                            );
+                            virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                        }
                     }
                 }
             }
@@ -1612,22 +1805,24 @@ impl EventReader {
                     if current_speed > speed as f32 {
                         current_speed = speed as f32
                     }
-                    let mut virt_dev = self.virt_dev.lock().await;
-                    if scroll_movement.0 != 0 {
-                        let virtual_event_x: InputEvent = InputEvent::new_now(
-                            EventType::RELATIVE,
-                            12,
-                            scroll_movement.0 * current_speed as i32,
-                        );
-                        virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                    }
-                    if scroll_movement.1 != 0 {
-                        let virtual_event_y: InputEvent = InputEvent::new_now(
-                            EventType::RELATIVE,
-                            11,
-                            scroll_movement.1 * current_speed as i32,
-                        );
-                        virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                    if !*self.paused.lock().await {
+                        let mut virt_dev = self.virt_dev.lock().await;
+                        if scroll_movement.0 != 0 {
+                            let virtual_event_x: InputEvent = InputEvent::new_now(
+                                EventType::RELATIVE,
+                                12,
+                                scroll_movement.0 * current_speed as i32,
+                            );
+                            virt_dev.axis.emit(&[virtual_event_x]).unwrap();
+                        }
+                        if scroll_movement.1 != 0 {
+                            let virtual_event_y: InputEvent = InputEvent::new_now(
+                                EventType::RELATIVE,
+                                11,
+                                scroll_movement.1 * current_speed as i32,
+                            );
+                            virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                        }
                     }
                 }
             }
