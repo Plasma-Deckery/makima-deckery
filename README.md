@@ -71,6 +71,38 @@ When paused, all input passes through unmodified. The `paused` flag is reflected
 
 ---
 
+## Setup
+
+### Systemd services
+
+Two user services are required. Both are tracked in [steamdeck-dotfiles](https://github.com/Plasma-Deckery/steamdeck-dotfiles).
+
+**`makima.service`** runs the remapper. Environment variables must be hardcoded because the service starts before the desktop session environment is fully inherited:
+
+```ini
+[Service]
+ExecStart=/home/<user>/.local/bin/makima
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=DISPLAY=:0
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_CURRENT_DESKTOP=KDE
+```
+
+**`makima-resume-watcher.service`** watches for the `PrepareForSleep(false)` DBus signal and restarts makima after suspend. This is required because the Steam Deck kernel silently freezes evdev file descriptors on suspend without returning an error — makima cannot detect this on its own and will stop processing input until restarted.
+
+```bash
+systemctl --user enable --now makima.service
+systemctl --user enable --now makima-resume-watcher.service
+```
+
+### Building
+
+makima-deckery depends on a patched `evdev` crate that adds `BTN_GRIPL/R/L2/R2` keycodes for the Steam Deck's back paddles. The upstream binary does not include this.
+
+The build runs inside a [distrobox](https://github.com/containers/distrobox) container (`deckery`) with the Rust toolchain and patched dependencies pre-installed. See [steamdeck-dotfiles](https://github.com/Plasma-Deckery/steamdeck-dotfiles) for container setup.
+
+---
+
 ## Relationship to upstream
 
 Bug fixes are submitted to upstream as PRs. Features specific to the Deckery HUD architecture (state export, IPC) are maintained here; an upstream proposal may follow once the HUD design stabilises.
