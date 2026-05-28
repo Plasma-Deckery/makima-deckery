@@ -57,6 +57,7 @@ pub struct EventReader {
     modifier_was_activated: Arc<Mutex<bool>>,
     paused: Arc<Mutex<bool>>,
     last_event: Arc<Mutex<Option<LastEvent>>>,
+    held_keys: Arc<Mutex<Vec<Event>>>,
     device_is_connected: Arc<Mutex<bool>>,
     device_error_notify: Arc<Notify>,
     active_layout: Arc<Mutex<u16>>,
@@ -87,6 +88,7 @@ impl EventReader {
         let active_layout: Arc<Mutex<u16>> = Arc::new(Mutex::new(0));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let last_event: Arc<Mutex<Option<LastEvent>>> = Arc::new(Mutex::new(None));
+        let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(
             config
                 .iter()
@@ -338,6 +340,7 @@ impl EventReader {
             modifier_was_activated,
             paused,
             last_event,
+            held_keys,
             device_is_connected,
             device_error_notify,
             active_layout,
@@ -1031,6 +1034,17 @@ impl EventReader {
         value: i32,
         send_zero: bool,
     ) {
+        // Track all currently held buttons so the HUD can highlight them.
+        // Only KEY events are tracked (not axis/stick movements).
+        if matches!(event, Event::Key(_)) {
+            let mut held = self.held_keys.lock().await;
+            match value {
+                1 => { held.push(event); held.sort(); held.dedup(); }
+                0 => held.retain(|&x| x != event),
+                _ => {}
+            }
+        } // lock dropped before any await
+
         if value == 1 {
             self.update_config().await;
         };
@@ -1065,9 +1079,7 @@ impl EventReader {
                         }
                     }
                 }
-                if value == 1 {
-                    self.set_last_emitted(&event, &out_keys, value).await;
-                }
+                self.set_last_emitted(&event, &out_keys, value).await;
                 self.toggle_modifiers(event, value, &config).await;
                 return;
             }
@@ -1076,9 +1088,7 @@ impl EventReader {
 
         if let Some(map) = config.bindings.remap.get(&event) {
             if let Some(event_list) = map.get(&modifiers) {
-                if value == 1 {
-                    self.set_last_emitted(&event, event_list, value).await;
-                }
+                self.set_last_emitted(&event, event_list, value).await;
                 self.emit_event(
                     event_list,
                     value,
@@ -1131,9 +1141,7 @@ impl EventReader {
                 };
             }
             if let Some(event_list) = map.get(&Vec::new()) {
-                if value == 1 {
-                    self.set_last_emitted(&event, event_list, value).await;
-                }
+                self.set_last_emitted(&event, event_list, value).await;
                 self.emit_event(event_list, value, &modifiers, &config, true, false)
                     .await;
                 if send_zero {
@@ -1274,8 +1282,8 @@ impl EventReader {
         if *self.paused.lock().await {
             return;
         }
-        // Record passthrough events (only press, not release).
-        if value == 1 && default_event.event_type() == EventType::KEY {
+        // Record passthrough key events (press and release).
+        if (value == 1 || value == 0) && default_event.event_type() == EventType::KEY {
             let label = crate::state_export::event_to_str(&event);
             {
                 let mut le = self.last_event.lock().await;
@@ -1552,7 +1560,14 @@ impl EventReader {
                 return;
             }
         };
-        crate::state_export::write_state(&config, &modifiers, layout, paused, &last_event).await;
+        let held_keys = match tokio::time::timeout(TIMEOUT, self.held_keys.lock()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                eprintln!("makima: write_state: held_keys lock timed out — possible deadlock");
+                return;
+            }
+        };
+        crate::state_export::write_state(&config, &modifiers, layout, paused, &last_event, &held_keys).await;
     }
 
     /// Record the actual emitted key output for the HUD last-event display.

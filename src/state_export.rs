@@ -39,6 +39,7 @@ pub async fn write_state(
     layout: u16,
     paused: bool,
     last_event: &Option<LastEvent>,
+    held_keys: &[Event],
 ) {
     // Build bindings map: all remaps from current config.
     // Key format: "BTN_FOO" for plain bindings, "MOD-BTN_FOO" for combos.
@@ -122,12 +123,19 @@ pub async fn write_state(
         }
     }
 
+    // held_modifiers: modifier buttons currently held (for combo-view switching).
+    // active_buttons: ALL buttons currently held (for per-button highlighting).
+    let held_modifiers: Vec<String> = modifiers.iter().map(event_to_str).collect();
+    let active_buttons: Vec<String> = held_keys.iter().map(event_to_str).collect();
+
     let state = serde_json::json!({
         "context": {
             "config_stack": [config.name],
             "layout": layout,
+            "paused": paused,
+            "held_modifiers": held_modifiers,
+            "active_buttons": active_buttons,
         },
-        "paused": paused,
         "last_event": last_event,
         "bindings": bindings,
         "modifier_active": modifier_active,
