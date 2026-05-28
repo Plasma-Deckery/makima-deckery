@@ -26,16 +26,19 @@ On every config or modifier change, makima writes a fully-resolved state snapsho
 ```json
 {
   "context": {
-    "config_stack": ["Steam Deck", "Steam Deck::konsole"],
+    "config_stack": ["Steam Deck"],
     "layout": 0,
-    "paused": false
+    "paused": false,
+    "held_modifiers": ["BTN_TL"],
+    "active_buttons": ["BTN_TL", "BTN_EAST"],
+    "active_outputs": ["KEY_C", "KEY_LEFTCTRL"]
   },
   "bindings": {
-    "BTN_SOUTH": { "action": ["KEY_ENTER"], "origin": "base" },
-    "BTN_EAST":  { "action": ["KEY_C", "KEY_LEFTCTRL"], "origin": "app:konsole" }
+    "BTN_SOUTH": { "action": ["KEY_ENTER"], "origin": "Steam Deck" },
+    "BTN_TL-BTN_EAST": { "action": ["KEY_C", "KEY_LEFTCTRL"], "origin": "Steam Deck" }
   },
   "modifier_active": {
-    "BTN_TL-BTN_GRIPR2": { "action": ["KEY_LEFTCTRL", "KEY_PAGEDOWN"], "origin": "base" }
+    "BTN_EAST": { "action": ["KEY_C", "KEY_LEFTCTRL"], "origin": "Steam Deck" }
   },
   "last_action": {
     "type": "keys",
@@ -45,9 +48,12 @@ On every config or modifier change, makima writes a fully-resolved state snapsho
 }
 ```
 
-- **`bindings`** — all buttons with their current action, fully resolved (per-app overrides already merged)
-- **`modifier_active`** — empty when no modifier is held; populated with the active combos while a modifier key is pressed
-- **`origin`** — where each binding comes from: `"base"` or `"app:<classname>"`
+- **`bindings`** — all remaps from the active config; plain buttons as `"BTN_FOO"`, combos as `"MOD-BTN_FOO"`
+- **`modifier_active`** — empty when no modifier held; while a modifier is pressed, contains every trigger reachable via that combo, keyed by trigger button
+- **`held_modifiers`** — modifier buttons currently physically held
+- **`active_buttons`** — all input buttons currently held (for button highlighting in the HUD)
+- **`active_outputs`** — evdev keys currently being emitted (derived from held buttons + modifier context)
+- **`config_stack`** — inheritance chain for the active config; currently always one element (`[config.name]`); will grow once the planned `EXTENDS` feature lands
 - **`last_action`** — the most recent discrete user action with a Unix timestamp (for HUD fade-out)
 
 ---
