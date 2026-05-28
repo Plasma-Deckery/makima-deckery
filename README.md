@@ -1,311 +1,70 @@
-# makima
+# makima-deckery
 
-Makima is a daemon for Linux to remap keyboards, mice, controllers and tablets.\
-It works on both Wayland and X11 as it relies on the `evdev` kernel interface.
+> **Deckery-specific fork of [cyber-sushi/makima](https://github.com/cyber-sushi/makima).**
+> For installation, configuration and general usage see the [upstream README](https://github.com/cyber-sushi/makima#readme).
 
-## Features
-- Translates keys, buttons or combinations to other keys, sequences or shell commands.
-- Devices are remapped individually using simple TOML config files.
-- Automatically switch layouts based on the active window (only on Hyprland, Sway, Niri and X11 currently).
-- Works with keyboards, mice, controllers, tablets and any other device that uses `KEY`/`BTN` input events present inside `/usr/include/linux/input-event-codes.h`.
-- Also supports some common `ABS` and `REL` events, like analog stick movements and mouse scroll wheels.
-- Supports hot plugging to connect and disconnect devices on the fly.
-- Works with wired and Bluetooth devices.
-- If you connect a [supported game controller](https://github.com/cyber-sushi/makima/tree/main#tested-controllers), you can scroll or move your cursor using analog sticks, with adjustable sensitivity and deadzone.
+This fork is maintained as part of the [Plasma Deckery](https://github.com/Plasma-Deckery) project — a Steam-independent input stack for the Steam Deck in desktop mode.
 
-# Index
-- [Installation](https://github.com/cyber-sushi/makima/tree/main#installation)
-    - [Building from source](https://github.com/cyber-sushi/makima/tree/main#building-from-source)
-- [Running makima](https://github.com/cyber-sushi/makima/tree/main#running-makima)
-- [Configuration](https://github.com/cyber-sushi/makima/tree/main#configuration)
-    - [Example config files](https://github.com/cyber-sushi/makima/tree/main/examples)
-    - [Config file naming](https://github.com/cyber-sushi/makima/tree/main#config-file-naming)
-    - [Application-specific bindings](https://github.com/cyber-sushi/makima/tree/main#application-specific-bindings)
-    - [Layout hotswapping](https://github.com/cyber-sushi/makima/tree/main#layout-hotswapping)
-    - [Change bindings](https://github.com/cyber-sushi/makima/tree/main#bindings-and-settings)
-        - [Remap](https://github.com/cyber-sushi/makima/tree/main#remap)
-        - [Commands](https://github.com/cyber-sushi/makima/tree/main#commands)
-        - [Movements](https://github.com/cyber-sushi/makima/tree/main#movements)
-        - [Settings](https://github.com/cyber-sushi/makima/tree/main#settings)
-- [Tested controllers](https://github.com/cyber-sushi/makima/tree/main#tested-controllers)
-- [Troubleshooting and FAQ](https://github.com/cyber-sushi/makima/tree/main#troubleshooting-and-faq)
+---
 
-## Installation
-Makima can be installed automatically or manually. It can also be installed from the AUR.
+## What's different from upstream
 
-**To install and run Makima automatically as a systemd service:**
-- Download the executable from the [Releases page](https://github.com/cyber-sushi/makima/releases).
-- Retrieve `install.sh`, `makima.service` and _optionally_ `50-makima.rules` from this repo and put them in the same folder as the executable.
-- Make sure that `install.sh` is executable (`chmod +x ./install.sh` or right click > properties > execute as a program).
-- Run `sudo ./install.sh username` where `username` is the name of the user you're installing it for.
-- Skip the rest of the "Installation" and "Running Makima" paragraphs and go directly to "Configuration".
+### Bug fixes (submitted as upstream PRs)
 
-Arch users can instead install [makima-bin](https://aur.archlinux.org/packages/makima-bin) from the AUR, then enable `makima.service`.
+| Fix | PR | Why |
+|---|---|---|
+| `BTN_DPAD_*` keys silently ignored in config | [#57](https://github.com/cyber-sushi/makima/pull/57) | D-Pad buttons were classified as axes, making them impossible to remap |
+| `x11rb::connect()` panic on Wayland after suspend | [#58](https://github.com/cyber-sushi/makima/pull/58) | Caused the worker thread to die silently; service appeared active but processed no events |
+| Evdev fd reconnect on device read error | — | When the evdev stream returns an I/O error (e.g. USB hotplug), makima now reinitializes automatically via `tokio::select!` instead of silently stopping |
 
-**To install and run Makima manually, refer to the following sections.**
+---
 
-### Building from source
-1. Install `rustup` using your distro's package manager or refer to the [official docs](https://www.rust-lang.org/tools/install) if your distro doesn't ship `rustup`.
-2. Run `rustup default stable` which will automatically install Cargo (Rust's package manager) and the Rust toolchain.
-3. Git clone and build with:
-```
-git clone https://github.com/cyber-sushi/makima
-cd makima
-cargo build --release
-```
-Once Cargo is done compiling, you should find Makima's executable inside `~/makima/target/release/`.
+### State export → `/tmp/makima-state.json`
 
-## Running Makima
-Make sure that the executable has permissions to run as a program with `chmod +x makima` or with Right Click > Properties > "allow executing as program" or something like that, depending on your file manager.
+On every config or modifier change, makima writes a fully-resolved state snapshot to `/tmp/makima-state.json`. This allows the Deckery HUD overlay to display live button mappings without re-implementing any of makima's lookup logic.
 
-There are two recommended ways to execute Makima:
-- **Run Makima as a systemd service.**\
-Move the executable into `/usr/bin/`.\
-Grab `makima.service` from this repo and edit the `User=` line with your username.\
-Move the file into `/etc/systemd/system`, then run `systemctl daemon-reload`.\
-After this, you can start and stop Makima with `systemctl start/stop makima` or you can enable/disable it on startup with `systemctl enable/disable makima`. If you change the config files and you want the changes to take place, restart Makima with `systemctl restart makima`.
-
-> [!NOTE]
-> When running as a systemd service, Makima inherits your systemd user environment, not your shell environment (you can see it with `systemctl --user show-environment`). If you need to pass env variables to it, do so by adding them to the unit file with `Environment=VARIABLE=value`.
-
-- **Run Makima as root with `sudo -E makima`.**\
-Navigate into the directory of the executable and use `sudo -E ./makima`.\
-Alternatively, add Makima to a directory that's in `PATH`, possibly `/usr/bin` or `~/.local/bin` and simply use `sudo -E makima` from anywhere.
-
-> [!NOTE]
-> The `-E` argument is necessary because it allows Makima to inherit your user environment instead of the root environment when running with `sudo`. You can also add the `-b` argument (`sudo -Eb makima`) to detach if from the terminal and make it run in the background.
-
-## Configuration
-You can find a bunch of [example config files](https://github.com/cyber-sushi/makima/tree/main/examples) on this repo, either pick one of them or create your own from scratch.\
-Makima's config directory defaults to `$HOME/.config/makima` but can be changed through the `MAKIMA_CONFIG` environment variable (if you run Makima as a system service, add it directly to the systemd unit).\
-Each time you make changes to the config file, Makima must be restarted with `systemctl restart makima`.
-
-### Config file naming
-To associate a config file to an input device, the file name should be identical to that of the device, plus `.toml` at the end. If your device's name includes a `/`, just omit it.
-
-All config files will be parsed automatically when `makima` is launched.\
-Files that don't end with `.toml` and files that start with `.` (dotfiles) won't be parsed, so you can add a dot at the beginning of the filename to mask them from Makima.
-
-> [!TIP]
-> Example: you run `evtest` and see that your Dualshock 4 controller is named `Sony Interactive Entertainment Wireless Controller`. All you have to do is rename your config file to `Sony Interactive Entertainment Wireless Controller.toml`.
-
-### Application-specific bindings
-To apply a config file only to a specific application, just put `::<window_class>` at the end of their filename, before `.toml`.
-
-> [!TIP]
-> Example: you want your DS4 controller to have a specific set of keybindings for Firefox, name that file `Sony Interactive Entertainment Wireless Controller::firefox.toml`.\
-> To retrieve the window class of a specific application, refer to your compositor's documentation, e.g. on Hyprland type `hyprctl clients` in your terminal while that application is open.
-
-
-> [!IMPORTANT]
-> App-specific bindings are currently only supported on Hyprland, Sway, Niri, Plasma Wayland and all X11 sessions.\
-> Some applications, like Flatpaks for example, will have names like `org.mozilla.firefox`.\
-> On Wayland, make sure that the `XDG_CURRENT_DESKTOP` environment variable is set, othewise Makima won't be able to use application-specific bindings.
-> 
-> On Plasma Wayland, Makima uses `kdotool` ([Github repo](https://github.com/jinliu/kdotool) or [AUR package](https://aur.archlinux.org/packages/kdotool-git)) to retrieve the active window instead of doing so internally, which means that you also need that installed. Sorry about this, but I didn't want to hardcode JavaScript snippets inside of Makima just to communicate with KWin.
-
-> [!WARNING]
-> It's been reported that active window retrieval through `kdotool` on Plasma might introduce performance issues, if you experience problems, remove `kdotool`'s executable from `PATH` until I figure out how a solution.
-
-### Layout hotswapping
-To declare multiple layouts, similarly to app-specific bindings, put `::<int>` at the end of a config file, where `int` is an integer value between 0 and 3, representing the layout number. If not specified, Makima will assume 0.\
-When pressing the key configured in the settings through the `LAYOUT_SWITCHER` parameter, Makima will automatically cycle through the available layouts. If a layout isn't set, e.g. you're on 0 and you switch to the next layout, but number 1 isn't found, Makima will automatically skip to layout 2 and so on.\
-You can also combine layouts and per application bindings by simply putting them both in the config file name.
-
-> [!TIP]
-> Example: declare layout 2 in Nautilus by setting `Wireless Controller::2::org.gnome.Nautilus.toml` or `Wireless Controller::org.gnome.Nautilus::2.toml`.
-
-> [!NOTE]
-> Keep in mind that while bindings and commands are read from each config file independently, settings are only read from the main config file, the one with no layout and associated application specified. If such file isn't present, Makima will use the default values.
-
-## Bindings and settings
-The config file is divided into multiple sections:
-- `[remap]`, where you can rebind keys, buttons, combinations and some axis events to other keys, buttons and combinations.
-- `[commands]`, where you can rebind keys, buttons, combinations and some axis events to shell commands.
-- `[movements]`, where you can rebind keys, buttons, combinations and some axis events to cursor movements and scrolling.
-- `[settings]`, where you can configure a few settings.
-
-### **[remap]**
-```
-# Remap a key to another key
-KEY1 = ["KEY2"]
-
-# Remap a key to a key sequence
-KEY1 = ["KEY2", "KEY3", "KEY4"]
-
-# Remap a key sequence to a single key
-MODIFIER1-MODIFIER2-MODIFIER3-KEY1 = ["KEY1"]
-
-# Remap a key sequence to another key sequence
-MODIFIER1-MODIFIER2-MODIFIER3-KEY1 = ["KEY1", "KEY2", "KEY3"]
+```json
+{
+  "context": {
+    "config_stack": ["Steam Deck", "Steam Deck::konsole"],
+    "layout": 0,
+    "paused": false
+  },
+  "bindings": {
+    "BTN_SOUTH": { "action": ["KEY_ENTER"], "origin": "base" },
+    "BTN_EAST":  { "action": ["KEY_C", "KEY_LEFTCTRL"], "origin": "app:konsole" }
+  },
+  "modifier_active": {
+    "BTN_TL-BTN_GRIPR2": { "action": ["KEY_LEFTCTRL", "KEY_PAGEDOWN"], "origin": "base" }
+  },
+  "last_action": {
+    "type": "keys",
+    "value": ["KEY_ENTER"],
+    "ts": 1748383200.123
+  }
+}
 ```
 
-### **[commands]**
-```
-# Use a key to invoke a shell command
-KEY1 = ["command1"]
+- **`bindings`** — all buttons with their current action, fully resolved (per-app overrides already merged)
+- **`modifier_active`** — empty when no modifier is held; populated with the active combos while a modifier key is pressed
+- **`origin`** — where each binding comes from: `"base"` or `"app:<classname>"`
+- **`last_action`** — the most recent discrete user action with a Unix timestamp (for HUD fade-out)
 
-# Use a key to invoke a list of shell commands
-KEY1 = ["command1", "command2", "command3"]
+---
 
-# Use a key sequence to invoke a shell command
-MODIFIER1-MODIFIER2-MODIFIER3-KEY1 = ["command1"]
+### Pause / Resume IPC
 
-# Use a key sequence to invoke a list of shell commands
-MODIFIER1-MODIFIER2-MODIFIER3-KEY1 = ["command1", "command2", "command3"]
-```
+makima-deckery exposes a Unix socket at `/tmp/makima.sock` for pause/resume control:
 
-### **[movements]**
-```
-# Use a key to move the cursor in a direction
-KEY1 = "CURSOR_UP/DOWN/LEFT/RIGHT"
-
-# Use a key sequence to move the cursor in a direction
-MODIFIER1-MODIFIER2-MODIFIER3-KEY1 = "CURSOR_UP/DOWN/LEFT/RIGHT"
-
-# Use a key to scroll in a direction
-KEY1 = "SCROLL_UP/DOWN/LEFT/RIGHT"
-
-# Use a key sequence to scroll in a direction
-MODIFIER1-MODIFIER2-MODIFIER3-KEY1 = "SCROLL_UP/DOWN/LEFT/RIGHT"
+```bash
+echo "pause"  | nc -U /tmp/makima.sock   # suspend all remapping
+echo "resume" | nc -U /tmp/makima.sock   # re-enable remapping
 ```
 
-#### Movement events
-There are 8 available movements available:\
-- `CURSOR_UP`, `CURSOR_DOWN`, `CURSOR_LEFT`, `CURSOR_RIGHT`
-- `SCROLL_UP`, `SCROLL_DOWN`, `SCROLL_LEFT`, `SCROLL_RIGHT`
+When paused, all input passes through unmodified. The `paused` flag is reflected in `/tmp/makima-state.json`. Useful for temporarily bypassing remapping (e.g. when a game takes over input).
 
-> [!NOTE]
-> To make movements work, you also have to set a speed value using `CURSOR_SPEED` or `SCROLL_SPEED` in the `[settings]` section.
+---
 
-> [!NOTE]
-> It's preferable not to use CTRL and ALT as modifiers for scrolling because they'll get interpreted by the application as zoom in/out and forward/back instead of an actual scroll movement.
+## Relationship to upstream
 
-#### Key names:
-You can find the `KEY` names inside `/usr/include/linux/input-event-codes.h`, or launch `evtest` to see the events emitted by your devices.\
-Remember that keys like Ctrl and Alt have names like `KEY_LEFTCTRL`, `KEY_LEFTALT` etc. Just using `KEY_CTRL` and `KEY_ALT` will throw a parsing error because the key code does not exist.
-
-#### Axis events:
-Axis events such as scroll wheels and analog stick movements are hardcoded, currently you can use the following:
-- `SCROLL_WHEEL_UP`, `SCROLL_WHEEL_DOWN` - for a mouse's scroll wheel
-- `BTN_DPAD_UP`, `BTN_DPAD_DOWN`, `BTN_DPAD_LEFT`, `BTN_DPAD_RIGHT` - for a game controller's D-Pad
-- `ABS_Z`, `ABS_RZ` - for a game controller's triggers, respectively left and right
-- `LSTICK_UP`, `LSTICK_DOWN`, `LSTICK_LEFT`, `LSTICK_RIGHT`, `RSTICK_UP`, `RSTICK_DOWN`, `RSTICK_LEFT`, `RSTICK_RIGHT` - for a game controller's analog sticks
-- `ABS_WHEEL_CW`, `ABS_WHEEL_CCW` - for a tablet's wheel, respectively clockwise and counterclockwise
-
-Refer to the [sample config files](https://github.com/cyber-sushi/makima/tree/main/examples) for more information.
-
-#### Modifiers and custom modifiers:
-You can use as many modifiers as you want when declaring a binding, but the last key _has_ to be a non-modifier key.
-
-Non-modifier keys (e.g. `KEY_A`) can be set in place of a modifier, automatically changing the behavior of that key: when used in combination with other keys, it will only act as a modifier, but when used alone, it will retain its default functionality, although the input event will be dispatched on key-up instead of key-down.
-
-If you want a non-modifier key to act as a modifier without remapping it for that device (e.g. you need it as a modifier when used in combination with another device), you can add it to the `CUSTOM_MODIFIERS` setting. Refer to the `[settings]` section for more info.
-
-#### Modifiers across multiple devices:
-Keep in mind that if you want to use modifiers across multiple devices (e.g. `KEY_LEFTCTRL` on your keyboard and `BTN_RIGHT` on your mouse), both devices will have to be read by Makima and thus both will need a config file, even if empty. Having a config file is just a way to tell Makima "Hey, read this device!".
-
-#### Chained bindings:
-When declaring a binding, you can put a dash (`-`) in front of it (e.g. `-KEY_A = ["KEY_B"]`) to tell Makima that it's not a standalone binding and it should instead be chained at the end of another sequence.\
-Example:
-```
-# Simulate Alt-Tab: press the buttons in the first binding, then tap the right trigger to advance in the Alt-Tab menu.
-BTN_SELECT-BTN_TL2 = ["KEY_LEFTALT"]
--BTN_TR2 = ["KEY_TAB"]
-```
-
-If the key with the dash is pressed alone, its behavior will depend on the `CHAIN_ONLY` setting: if set to `"true"` (default) it will ignore the keypress and only fire if pressed together with a combination, if set to `"false"`, it will fire the designated event regardless.\
-You can declare both a `-BTN_TR2` and a `BTN_TR2` binding: in this case, the first will fire when chained and the second will fire when used alone (assuming `CHAIN_ONLY` is set to`"true"`).
-
-### **[settings]**
-#### `GRAB_DEVICE`
-Sets if Makima should have exclusivity over the device.\
-If `"true"`, no other program will read the original input of the device. If `"false"`, both the original input and the remapped input will be read by applications.
-#### `LSTICK` and `RSTICK`
-Set the function of the left and right analog sticks, respectively.\
-`"bind"` will make them available for rebinding in `[remap]` and `[commands]`, `"cursor"` will use them to move your mouse cursor, `"scroll"` will use them to scroll, `"disabled"` will disable them.
-#### `LSTICK_SENSITIVITY` and `RSTICK_SENSITIVITY`
-Set the sensitivity of your left and right analog sticks when using them to scroll or move your cursor.\
-Lower value is higher sensitivity, minimum `"1"`, suggested `"6"`. If this is set to `"0"` or if it's not set, cursor movement and scroll will be disabled.
-#### `LSTICK_DEADZONE` and `RSTICK_DEADZONE`
-Set how much your analog sticks should be tilted before their inputs are detected.\
-Particularly useful for older devices that suffer from drifting. Use a value between `"0"` and `"128"`.
-#### `INVERT_CURSOR_AXIS` and `INVERT_SCROLL_AXIS`
-Invert up/down and left/right on the analog sticks when used for cursor movement or 2D scroll.\
-Both default to `"false"`.
-#### `LSTICK_ACTIVATION_MODIFIERS` and `RSTICK_ACTIVATION_MODIFIERS`
-When using analog sticks in `cursor` or `scroll` mode, normally, they're always active. However, if you specify a list of keys or modifiers in `LSTICK_ACTIVATION_MODIFIERS` or `RSTICK_ACTIVATION_MODIFIERS`, they'll only be active when the modifiers are pressed.\
-Example:
-```
-# Only move the cursor when Select and Start are pressed
-LSTICK = "cursor"
-LSTICK_ACTIVATION_MODIFIERS = "BTN_SELECT-BTN_START"
-```
-#### `CURSOR_SPEED` and `SCROLL_SPEED`
-When using keys/buttons to move your cursor or scroll through a page, you can use this parameter to change speed.\
-Speed is measured in pixels per 5 milliseconds.\
-Must be an integer value, can be negative (it will move in the opposite direction). Defaults to `0`.
-#### `CURSOR_ACCEL` and `SCROLL_ACCEL`
-When using keys/buttons to move your cursor or scroll through a page, you can use this parameter to determine how much it takes to reach the speed set in `CURSOR_SPEED` and `SCROLL_SPEED`.\
-For example, setting a value of `"0.2"` means that every 5 milliseconds, the speed will increase by 2% of the maximum speed.\
-Must be a float value between `"0.0"` and `"1.0"`. Defaults to `1.0`.
-#### `16_BIT_AXIS`
-This is needed if you're using Xbox controllers and Switch Joy-Cons to properly calibrate the analog stick's sensitivity.\
-Set to `"true"` if you're using those controllers.
-#### `CUSTOM_MODIFIERS`
-The keys listed in this parameter will change their behavior to act as modifiers.\
-While pressed, they will act as modifiers without emitting their respective `KEY` event, possibly changing the behavior of other keys if specified in `[remap]`. On release, they will emit their default `KEY` event only if no other keystroke happened while they were pressed.\
-This is useful if you want to have a key that behaves like a modifier but can still emit its own event if pressed alone.\
-You can list multiple keys to treat as modifiers with the following syntax:\
-`CUSTOM_MODIFIERS = "KEY_A-KEY_BACKSLASH-KEY_GRAVE"`
-
-#### `STADIA`
-If you're using a Stadia controller, set this to `"true"`, otherwise you won't be able to use your right analog stick.\
-Defaults to `"false"`.
-
-#### `CHAIN_ONLY`
-When using a [chained binding](https://github.com/cyber-sushi/makima/tree/main#chained-bindings), you can choose the behavior of the key when pressed alone.\
-Set to `"true"` (default) to make it fire the event only if other modifiers are active. Set to `"false"` to make it fire its designated event regardless.
-
-#### `LAYOUT_SWITCHER`
-Set a key or combination to cycle through the available remap layouts in the config files.
-
-#### `NOTIFY_LAYOUT_SWITCH`
-If set to `"true"`, send a notification for 0.5 seconds to notify that the layout has been changed, and what it has been changed to.\
-Defaults to `"false"`.
-
-## Tested controllers
-- DualShock 2
-- DualShock 3
-- DualShock 4
-- DualSense
-- Xbox 360
-- Xbox One
-- Xbox Elite 2
-- Stadia
-- Switch Joy-Cons
-
-To add other controllers, please open an issue.
-
-## Troubleshooting and FAQ
-**Q**: My device actually shows as three different devices in evtest, do I need to create three different config files, one for each device?\
-**A**: Each device will have a certain set of features, e.g. a DS4 controller is recognized as a touchpad, a motion sensor and a controller. A mouse is usually recognized as a mouse and a keyboard (for the additional keys). Just create a config file for the devices/features that you need to remap, and ignore the others.
-
-**Q**: My controller works when using Bluetooth but not when using wired connection or vice-versa, why?\
-**A**: Some devices have a different evdev name when connected through Bluetooth, for example a `Sony Interactive Entertainment Wireless Controller` is just seen as `Wireless Controller` when connected via Bluetooth. You'll need to create a copy of the config file with that name.
-
-**Q**: Will application-specific bindings be implemented for other desktops like Gnome Wayland?\
-**A**: Gnome on Wayland requires an extension to retrieve the active window through D-Bus, which is why I haven't implemented window tracking for it. If anyone finds a better solution, I'm all for it. Regarding other compositors, feel free to open an issue and I'll look into it.
-
-**Q**: Makima says that it's unable to create a virtual device, what do I do?\
-**A**: Pick `50-makima.rules` from this repo and copy it into `/etc/udev/rules.d/`, then load the `uinput` module with `sudo modprobe uinput`. To load it automatically on boot, create `/etc/modules-load.d/uinput.conf` and write `uinput` inside.
-
-**Q**: SELinux prevents Makima's system service from running, what do I do?\
-**A**: Put `makima.service` inside `/usr/lib/systemd/system` instead of `/etc/systemd/system`, then run the following commands:
-- `sudo semanage fcontext -a -t bin_t "/usr/lib/systemd/system/makima.service"`
-- `sudo restorecon -v /usr/lib/systemd/system/makima.service`
-- `sudo semanage fcontext -a -t bin_t "/usr/bin/makima"`
-- `sudo restorecon -v /usr/bin/makima`
-
-**Q**: I have ACL set up and Makima is unable to read input events, what do I do?\
-**A**: Create a new ACL rule at `/etc/udev/rules.d/70-makima-acl.rules` with the the following content: `SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess", TAG+="seat"`
+Bug fixes are submitted to upstream as PRs. Features specific to the Deckery HUD architecture (state export, IPC) are maintained here; an upstream proposal may follow once the HUD design stabilises.
