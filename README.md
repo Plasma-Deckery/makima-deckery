@@ -23,7 +23,7 @@ This fork is maintained as part of the [Plasma Deckery](https://github.com/Plasm
 
 App-specific config files (`{device}::{window-class}.toml`) only need to declare bindings that differ from the base config — everything else is inherited at runtime via `merge_base()`. No duplication required.
 
-Window focus changes are detected event-driven via a KWin D-Bus script (`kwin_watcher`), which registers `org.makima.watcher` on the session bus and receives a callback from `workspace.windowActivated` on every focus change. No polling, no subprocess spawning.
+Window focus changes are detected event-driven via a KWin D-Bus script (`kwin_watcher`), which registers `org.makima.watcher` on the session bus and receives a callback from `workspace.windowActivated` on every focus change. This replaces the previous approach of spawning a `kdotool` subprocess on every button press to query the active window — eliminating a significant source of CPU load and latency. No polling, no subprocess spawning, no external tool dependency.
 
 Config files only need to contain their overrides:
 
