@@ -19,6 +19,28 @@ This fork is maintained as part of the [Plasma Deckery](https://github.com/Plasm
 
 ---
 
+### Per-app configs with event-driven window focus
+
+App-specific config files (`{device}::{window-class}.toml`) only need to declare bindings that differ from the base config — everything else is inherited at runtime via `merge_base()`. No duplication required.
+
+Window focus changes are detected event-driven via a KWin D-Bus script (`kwin_watcher`), which registers `org.makima.watcher` on the session bus and receives a callback from `workspace.windowActivated` on every focus change. No polling, no subprocess spawning.
+
+Config files only need to contain their overrides:
+
+```toml
+# Steam Deck::org.mozilla.firefox.toml
+[remap]
+BTN_TL-BTN_DPAD_LEFT  = ["KEY_LEFTALT", "KEY_LEFT"]   # L1+← → Back
+BTN_TL-BTN_DPAD_RIGHT = ["KEY_LEFTALT", "KEY_RIGHT"]  # L1+→ → Forward
+BTN_TL-BTN_DPAD_UP    = ["KEY_LEFTCTRL", "KEY_R"]     # L1+↑ → Reload
+
+[settings]
+CUSTOM_MODIFIERS = "BTN_TL-BTN_MODE"
+GRAB_DEVICE = "false"
+```
+
+---
+
 ### State export → `/tmp/makima-state.json`
 
 On every config or modifier change, makima writes a fully-resolved state snapshot to `/tmp/makima-state.json`. This allows the Deckery HUD overlay to display live button mappings without re-implementing any of makima's lookup logic.
@@ -26,34 +48,36 @@ On every config or modifier change, makima writes a fully-resolved state snapsho
 ```json
 {
   "context": {
-    "config_stack": ["Steam Deck"],
+    "config_stack": ["Steam Deck", "org.mozilla.firefox"],
     "layout": 0,
     "paused": false,
     "held_modifiers": ["BTN_TL"],
-    "active_buttons": ["BTN_TL", "BTN_EAST"],
-    "active_outputs": ["KEY_C", "KEY_LEFTCTRL"]
+    "active_buttons": ["BTN_TL", "BTN_DPAD_LEFT"],
+    "active_outputs": ["KEY_LEFT", "KEY_LEFTALT"]
   },
   "bindings": {
     "BTN_SOUTH": { "action": ["KEY_ENTER"], "origin": "Steam Deck" },
-    "BTN_TL-BTN_EAST": { "action": ["KEY_C", "KEY_LEFTCTRL"], "origin": "Steam Deck" }
+    "BTN_TL-BTN_DPAD_LEFT": { "action": ["KEY_LEFTALT", "KEY_LEFT"], "origin": "org.mozilla.firefox" }
   },
   "modifier_active": {
-    "BTN_EAST": { "action": ["KEY_C", "KEY_LEFTCTRL"], "origin": "Steam Deck" }
+    "BTN_DPAD_LEFT": { "action": ["KEY_LEFTALT", "KEY_LEFT"], "origin": "org.mozilla.firefox", "kind": "remap" },
+    "BTN_SOUTH":     { "action": ["KEY_ENTER"],               "origin": "Steam Deck",           "kind": "remap" }
   },
   "last_action": {
     "type": "keys",
-    "value": ["KEY_ENTER"],
+    "value": ["KEY_LEFTALT", "KEY_LEFT"],
     "ts": 1748383200.123
   }
 }
 ```
 
 - **`bindings`** — all remaps from the active config; plain buttons as `"BTN_FOO"`, combos as `"MOD-BTN_FOO"`
-- **`modifier_active`** — empty when no modifier held; while a modifier is pressed, contains every trigger reachable via that combo, keyed by trigger button
+- **`modifier_active`** — empty when no modifier held; while a modifier is pressed, contains every trigger reachable via that combo, keyed by trigger button; includes a `"kind"` field (`"remap"`, `"command"`, or `"movement"`)
 - **`held_modifiers`** — modifier buttons currently physically held
 - **`active_buttons`** — all input buttons currently held (for button highlighting in the HUD)
 - **`active_outputs`** — evdev keys currently being emitted (derived from held buttons + modifier context)
-- **`config_stack`** — inheritance chain for the active config; currently always one element (`[config.name]`); will grow once the planned `EXTENDS` feature lands
+- **`config_stack`** — active config layer chain: one entry (`["Steam Deck"]`) for the base config, two entries (`["Steam Deck", "org.mozilla.firefox"]`) when an app-specific config is active; the second entry is the window class without the base prefix
+- **`origin`** — which config layer a binding comes from: the base config name for inherited bindings, the app-specific part for overrides; lets the HUD visually distinguish base bindings from per-app additions
 - **`last_action`** — the most recent discrete user action with a Unix timestamp (for HUD fade-out)
 
 ---

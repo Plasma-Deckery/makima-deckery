@@ -6,6 +6,7 @@ use evdev::{Device, EventStream};
 use std::{env, path::Path, process::Command, sync::Arc};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
+use crate::kwin_watcher;
 use tokio_stream::StreamExt;
 
 #[derive(Debug, Default, Eq, PartialEq, Hash, Clone)]
@@ -32,7 +33,20 @@ pub struct Environment {
 pub async fn start_monitoring_udev(config_files: Vec<Config>, mut tasks: Vec<JoinHandle<()>>) {
     let environment = set_environment();
     let device_error_notify = Arc::new(Notify::new());
-    launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone());
+    let active_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::Default));
+    let window_changed: Arc<Notify> = Arc::new(Notify::new());
+
+    // Start the KWin watcher once — persists across device reinitializations.
+    if let Server::Connected(s) = &environment.server {
+        if s == "KDE" {
+            tokio::spawn(kwin_watcher::start_kwin_watcher(
+                active_client.clone(),
+                window_changed.clone(),
+            ));
+        }
+    }
+
+    launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -52,7 +66,7 @@ pub async fn start_monitoring_udev(config_files: Vec<Config>, mut tasks: Vec<Joi
                             task.abort();
                         }
                         tasks.clear();
-                        launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone());
+                        launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
                     }
                 }
             }
@@ -63,7 +77,7 @@ pub async fn start_monitoring_udev(config_files: Vec<Config>, mut tasks: Vec<Joi
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone());
+                launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
             }
         }
     }
@@ -74,6 +88,8 @@ pub fn launch_tasks(
     tasks: &mut Vec<JoinHandle<()>>,
     environment: Environment,
     device_error_notify: Arc<Notify>,
+    active_client: Arc<Mutex<Client>>,
+    window_changed: Arc<Notify>,
 ) {
     let modifiers: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Default::default()));
     let modifier_was_activated: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -143,6 +159,15 @@ pub fn launch_tasks(
                 config_list.push(config.clone());
             };
         }
+        // Merge base config into every app-specific config so they only need
+        // to declare overrides. The base is the one with default associations.
+        if let Some(base) = config_list.iter().find(|x| x.associations == Associations::default()).cloned() {
+            for config in config_list.iter_mut() {
+                if config.associations != Associations::default() {
+                    config.merge_base(&base);
+                }
+            }
+        }
         if config_list.len() > 0
             && !config_list
                 .iter()
@@ -165,6 +190,8 @@ pub fn launch_tasks(
                 modifier_was_activated.clone(),
                 environment.clone(),
                 device_error_notify.clone(),
+                active_client.clone(),
+                window_changed.clone(),
             );
             tasks.push(tokio::spawn(start_reader(reader)));
             devices_found += 1
@@ -215,20 +242,8 @@ fn set_environment() -> Environment {
         (Ok(session), Ok(desktop))
             if session == wayland && supported_compositors.contains(&desktop) =>
         {
-            let server = 'a: {
-                if desktop == String::from("KDE") {
-                    if let Err(_) = Command::new("kdotool").output() {
-                        println!(
-                            "Running on KDE but kdotool doesn't seem to be installed.\n\
-                                Won't be able to change bindings according to the active window.\n"
-                        );
-                        break 'a Server::Unsupported;
-                    }
-                }
-                println!("Running on {}, per application bindings enabled.", desktop);
-                Server::Connected(desktop)
-            };
-            server
+            println!("Running on {}, per application bindings enabled.", desktop);
+            Server::Connected(desktop)
         }
         (Ok(session), Ok(desktop)) if session == wayland => {
             println!("Warning: unsupported compositor: {}, won't be able to change bindings according to the active window.\n\

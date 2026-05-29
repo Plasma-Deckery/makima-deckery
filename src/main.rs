@@ -1,6 +1,7 @@
 mod active_client;
 mod config;
 mod event_reader;
+mod kwin_watcher;
 mod state_export;
 mod udev_monitor;
 mod virtual_devices;

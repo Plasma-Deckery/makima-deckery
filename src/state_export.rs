@@ -15,14 +15,6 @@ use serde_json;
 
 // ── Structs ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
-pub struct LastEvent {
-    pub input: String,
-    pub action: Vec<String>,
-    pub kind: String,
-    pub value: i32,
-}
-
 /// Fire-and-forget record of the last discrete user action.
 /// Written by the backend on press; never deleted by the backend.
 /// The HUD reads `ts` and fades the display after 1.5 s.
@@ -51,6 +43,21 @@ pub fn now_ts() -> f64 {
         .as_secs_f64()
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Canonical modifier order: Meta → Ctrl → Alt → Shift → everything else.
+/// Matches the standard shortcut notation used by most desktop environments.
+fn modifier_sort_key(key: &str) -> (u8, String) {
+    let rank = match key {
+        "KEY_LEFTMETA"  | "KEY_RIGHTMETA"  => 0,
+        "KEY_LEFTCTRL"  | "KEY_RIGHTCTRL"  => 1,
+        "KEY_LEFTALT"   | "KEY_RIGHTALT"   => 2,
+        "KEY_LEFTSHIFT" | "KEY_RIGHTSHIFT" => 3,
+        _ => 4,
+    };
+    (rank, key.to_owned())
+}
+
 // ── Main export function ──────────────────────────────────────────────────────
 
 pub async fn write_state(
@@ -58,10 +65,53 @@ pub async fn write_state(
     modifiers: &[Event],
     layout: u16,
     paused: bool,
-    last_event: &Option<LastEvent>,
     held_keys: &[Event],
     last_action: &Option<LastAction>,
+    config_stack: &[String],
 ) {
+    // Determine the origin name for a given trigger+combo.
+    // If this config has override_bindings (i.e. it's an app-specific config
+    // that was merged with a base), check whether the binding existed in the
+    // original override. If yes → came from this config; if no → inherited
+    // from base (config_stack[0]).
+    let base_name = config_stack.first().map(|s| s.as_str()).unwrap_or(&config.name);
+    let origin_remap = |trigger: &Event, combo: &Vec<Event>| -> &str {
+        match &config.override_bindings {
+            Some(ov) => {
+                if ov.remap.get(trigger).and_then(|m| m.get(combo)).is_some() {
+                    &config.name
+                } else {
+                    base_name
+                }
+            }
+            None => &config.name,
+        }
+    };
+    let origin_cmd = |trigger: &Event, combo: &Vec<Event>| -> &str {
+        match &config.override_bindings {
+            Some(ov) => {
+                if ov.commands.get(trigger).and_then(|m| m.get(combo)).is_some() {
+                    &config.name
+                } else {
+                    base_name
+                }
+            }
+            None => &config.name,
+        }
+    };
+    let origin_mov = |trigger: &Event, combo: &Vec<Event>| -> &str {
+        match &config.override_bindings {
+            Some(ov) => {
+                if ov.movements.get(trigger).and_then(|m| m.get(combo)).is_some() {
+                    &config.name
+                } else {
+                    base_name
+                }
+            }
+            None => &config.name,
+        }
+    };
+
     // Build bindings map: all remaps from current config.
     // Key format: "BTN_FOO" for plain bindings, "MOD-BTN_FOO" for combos.
     let mut bindings = serde_json::Map::new();
@@ -81,7 +131,7 @@ pub async fn write_state(
                 key,
                 serde_json::json!({
                     "action": action_list,
-                    "origin": config.name,
+                    "origin": origin_remap(trigger, combo),
                 }),
             );
         }
@@ -113,6 +163,7 @@ pub async fn write_state(
 
     let mut modifier_active = serde_json::Map::new();
     if !active_input_mods.is_empty() {
+        // Remap combos
         for (trigger, modifier_map) in &config.bindings.remap {
             for (combo, actions) in modifier_map {
                 if !combo.is_empty() && combo.iter().all(|m| active_input_mods.contains(m)) {
@@ -124,7 +175,42 @@ pub async fn write_state(
                         event_to_str(trigger),
                         serde_json::json!({
                             "action": action_list,
-                            "origin": config.name,
+                            "origin": origin_remap(trigger, combo),
+                            "kind": "remap",
+                        }),
+                    );
+                }
+            }
+        }
+        // Command combos (e.g. BTN_TL-BTN_DPAD_LEFT = ["qdbus ..."])
+        for (trigger, modifier_map) in &config.bindings.commands {
+            for (combo, commands) in modifier_map {
+                if !combo.is_empty() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                    let action_list: Vec<serde_json::Value> = commands
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect();
+                    modifier_active.insert(
+                        event_to_str(trigger),
+                        serde_json::json!({
+                            "action": action_list,
+                            "origin": origin_cmd(trigger, combo),
+                            "kind": "command",
+                        }),
+                    );
+                }
+            }
+        }
+        // Movement combos (e.g. LSTICK_UP = ["KEY_W"] in bind-mode)
+        for (trigger, modifier_map) in &config.bindings.movements {
+            for (combo, movement) in modifier_map {
+                if !combo.is_empty() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                    modifier_active.insert(
+                        event_to_str(trigger),
+                        serde_json::json!({
+                            "action": [format!("{:?}", movement)],
+                            "origin": origin_mov(trigger, combo),
+                            "kind": "movement",
                         }),
                     );
                 }
@@ -156,12 +242,12 @@ pub async fn write_state(
             }
         }
     }
-    active_outputs.sort();
     active_outputs.dedup();
+    active_outputs.sort_by_key(|k| modifier_sort_key(k.as_str()));
 
     let state = serde_json::json!({
         "context": {
-            "config_stack": [config.name],
+            "config_stack": config_stack,
             "layout": layout,
             "paused": paused,
             "held_modifiers": held_modifiers,
@@ -169,7 +255,6 @@ pub async fn write_state(
             "active_outputs": active_outputs,
         },
         "last_action": last_action,
-        "last_event": last_event,
         "bindings": bindings,
         "modifier_active": modifier_active,
     });

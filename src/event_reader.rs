@@ -1,7 +1,7 @@
 use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, Relative, Scroll};
-use crate::state_export::{LastAction, LastEvent};
-use crate::udev_monitor::Environment;
+use crate::state_export::LastAction;
+use crate::udev_monitor::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
 use evdev::{AbsoluteAxisType, EventStream, EventType, InputEvent, Key, RelativeAxisType};
@@ -56,7 +56,6 @@ pub struct EventReader {
     modifiers: Arc<Mutex<Vec<Event>>>,
     modifier_was_activated: Arc<Mutex<bool>>,
     paused: Arc<Mutex<bool>>,
-    last_event: Arc<Mutex<Option<LastEvent>>>,
     last_action: Arc<Mutex<Option<LastAction>>>,
     held_keys: Arc<Mutex<Vec<Event>>>,
     device_is_connected: Arc<Mutex<bool>>,
@@ -65,6 +64,8 @@ pub struct EventReader {
     current_config: Arc<Mutex<Config>>,
     environment: Environment,
     settings: Settings,
+    active_client: Arc<Mutex<Client>>,
+    window_changed: Arc<Notify>,
 }
 
 impl EventReader {
@@ -76,6 +77,8 @@ impl EventReader {
         modifier_was_activated: Arc<Mutex<bool>>,
         environment: Environment,
         device_error_notify: Arc<Notify>,
+        active_client: Arc<Mutex<Client>>,
+        window_changed: Arc<Notify>,
     ) -> Self {
         let mut position_vector: Vec<i32> = Vec::new();
         for i in [0, 0] {
@@ -88,7 +91,6 @@ impl EventReader {
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
         let active_layout: Arc<Mutex<u16>> = Arc::new(Mutex::new(0));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let last_event: Arc<Mutex<Option<LastEvent>>> = Arc::new(Mutex::new(None));
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(
@@ -341,7 +343,6 @@ impl EventReader {
             modifiers,
             modifier_was_activated,
             paused,
-            last_event,
             last_action,
             held_keys,
             device_is_connected,
@@ -350,6 +351,8 @@ impl EventReader {
             current_config,
             environment,
             settings,
+            active_client,
+            window_changed,
         }
     }
 
@@ -369,8 +372,22 @@ impl EventReader {
             self.cursor_loop(),
             self.scroll_loop(),
             self.key_cursor_loop(),
-            self.key_scroll_loop()
+            self.key_scroll_loop(),
+            self.window_changed_loop(),
         );
+    }
+
+    /// Listens for window-activation changes fired by kwin_watcher (KDE only).
+    /// For other compositors this future returns immediately.
+    async fn window_changed_loop(&self) {
+        if let Server::Connected(s) = &self.environment.server {
+            if s == "KDE" {
+                loop {
+                    self.window_changed.notified().await;
+                    self.update_config().await;
+                }
+            }
+        }
     }
 
     pub async fn event_loop(&self) {
@@ -1037,10 +1054,6 @@ impl EventReader {
         value: i32,
         send_zero: bool,
     ) {
-        // DEBUG: log every key press/release to trace BTN_MODE
-        if matches!(event, Event::Key(_)) && (value == 1 || value == 0) {
-            eprintln!("[debug] convert_event: {:?} value={}", event, value);
-        }
 
         // Track all currently held buttons so the HUD can highlight them.
         // Only KEY events are tracked (not axis/stick movements).
@@ -1087,7 +1100,7 @@ impl EventReader {
                         }
                     }
                 }
-                self.set_last_emitted(&event, &out_keys, value).await;
+                self.set_last_emitted(&event, &out_keys, value, false).await;
                 self.toggle_modifiers(event, value, &config).await;
                 return;
             }
@@ -1096,7 +1109,7 @@ impl EventReader {
 
         if let Some(map) = config.bindings.remap.get(&event) {
             if let Some(event_list) = map.get(&modifiers) {
-                self.set_last_emitted(&event, event_list, value).await;
+                self.set_last_emitted(&event, event_list, value, !modifiers.is_empty()).await;
                 self.emit_event(
                     event_list,
                     value,
@@ -1136,7 +1149,9 @@ impl EventReader {
                         if !paused {
                             self.spawn_subprocess(command_list).await
                         }
-                    };
+                    } else {
+                        self.write_state().await;
+                    }
                     return;
                 }
             }
@@ -1149,7 +1164,7 @@ impl EventReader {
                 };
             }
             if let Some(event_list) = map.get(&Vec::new()) {
-                self.set_last_emitted(&event, event_list, value).await;
+                self.set_last_emitted(&event, event_list, value, false).await;
                 self.emit_event(event_list, value, &modifiers, &config, true, false)
                     .await;
                 if send_zero {
@@ -1167,7 +1182,9 @@ impl EventReader {
                 if value == 1 {
                     self.set_last_emitted_cmd(&event, command_list).await;
                     self.spawn_subprocess(command_list).await
-                };
+                } else {
+                    self.write_state().await;
+                }
                 return;
             }
         }
@@ -1288,33 +1305,17 @@ impl EventReader {
         config: &Config,
     ) {
         if *self.paused.lock().await {
-            // Even when paused, update the state file so held_keys changes
-            // (e.g. button releases) are reflected in the HUD immediately.
-            self.write_state().await;
+            // When paused, still track modifier buttons (BTN_TL, BTN_MODE, etc.)
+            // so the HUD can display combo overlays while open.
+            // For non-modifier buttons, just write state to reflect active_buttons.
+            if config.mapped_modifiers.all.contains(&event) {
+                self.toggle_modifiers(event, value, config).await;
+            } else {
+                self.write_state().await;
+            }
             return;
         }
-        // Record passthrough key events (press and release).
-        if (value == 1 || value == 0) && default_event.event_type() == EventType::KEY {
-            let label = crate::state_export::event_to_str(&event);
-            {
-                let mut le = self.last_event.lock().await;
-                *le = Some(LastEvent {
-                    input: label.clone(),
-                    action: vec![label.clone()],
-                    kind: "passthrough".to_string(),
-                    value,
-                });
-            }
-            if value == 1 {
-                let mut la = self.last_action.lock().await;
-                *la = Some(LastAction {
-                    r#type: "keys".to_string(),
-                    value: serde_json::json!([label]),
-                    ts: crate::state_export::now_ts(),
-                });
-            }
-            // write_state is called by toggle_modifiers below.
-        }
+        // Passthrough keys are held state — last_action is only for combos and commands.
         let mut virt_dev = self.virt_dev.lock().await;
         let mut modifier_was_activated = self.modifier_was_activated.lock().await;
         if config.mapped_modifiers.all.contains(&event) && value != 2 {
@@ -1464,10 +1465,6 @@ impl EventReader {
     }
 
     async fn toggle_modifiers(&self, modifier: Event, value: i32, config: &Config) {
-        eprintln!("[debug] toggle_modifiers: {:?} value={} in_all={} in_custom={}",
-            modifier, value,
-            config.mapped_modifiers.all.contains(&modifier),
-            config.mapped_modifiers.custom.contains(&modifier));
         {
             let mut modifiers = self.modifiers.lock().await;
             if config.mapped_modifiers.all.contains(&modifier) {
@@ -1522,7 +1519,20 @@ impl EventReader {
     fn update_config(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let active_layout = self.active_layout.lock().await.clone();
-            let active_window = get_active_window(&self.environment, &self.config).await;
+            // For KDE: the window class is maintained by the kwin_watcher task
+            // (event-driven, no subprocess). For all other compositors: call
+            // get_active_window() on every button-press as before.
+            let active_window = match &self.environment.server {
+                Server::Connected(s) if s == "KDE" => {
+                    let client = self.active_client.lock().await.clone();
+                    if self.config.iter().any(|x| x.associations.client == client) {
+                        client
+                    } else {
+                        Client::Default
+                    }
+                }
+                _ => get_active_window(&self.environment, &self.config).await,
+            };
             let associations = Associations {
                 client: active_window,
                 layout: active_layout,
@@ -1576,13 +1586,6 @@ impl EventReader {
                 return;
             }
         };
-        let last_event = match tokio::time::timeout(TIMEOUT, self.last_event.lock()).await {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                eprintln!("makima: write_state: last_event lock timed out — possible deadlock");
-                return;
-            }
-        };
         let last_action = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
@@ -1597,23 +1600,28 @@ impl EventReader {
                 return;
             }
         };
-        crate::state_export::write_state(&config, &modifiers, layout, paused, &last_event, &held_keys, &last_action).await;
+        let base_name = self.config
+            .iter()
+            .find(|x| x.associations == Associations::default())
+            .map(|x| x.name.clone())
+            .unwrap_or_default();
+        let config_stack = if config.name == base_name {
+            vec![base_name.clone()]
+        } else {
+            let app_part = config.name
+                .strip_prefix(&format!("{}::", base_name))
+                .unwrap_or(&config.name)
+                .to_string();
+            vec![base_name, app_part]
+        };
+        crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack).await;
     }
 
     /// Record the actual emitted key output for the HUD last-event display.
     /// Called at the emission site (not at input time) so the action reflects
     /// what was truly sent to the virtual device.
-    async fn set_last_emitted(&self, trigger: &Event, emitted: &[Key], value: i32) {
-        {
-            let mut le = self.last_event.lock().await;
-            *le = Some(LastEvent {
-                input: crate::state_export::event_to_str(trigger),
-                action: emitted.iter().map(|k| format!("{:?}", k)).collect(),
-                kind: "remap".to_string(),
-                value,
-            });
-        }
-        if value == 1 {
+    async fn set_last_emitted(&self, _trigger: &Event, emitted: &[Key], value: i32, is_combo: bool) {
+        if is_combo && value == 1 {
             let mut la = self.last_action.lock().await;
             *la = Some(LastAction {
                 r#type: "keys".to_string(),
@@ -1627,16 +1635,7 @@ impl EventReader {
     }
 
     /// Record a spawned command as the last emitted action.
-    async fn set_last_emitted_cmd(&self, trigger: &Event, commands: &[String]) {
-        {
-            let mut le = self.last_event.lock().await;
-            *le = Some(LastEvent {
-                input: crate::state_export::event_to_str(trigger),
-                action: commands.to_vec(),
-                kind: "command".to_string(),
-                value: 1,
-            });
-        }
+    async fn set_last_emitted_cmd(&self, _trigger: &Event, commands: &[String]) {
         {
             let mut la = self.last_action.lock().await;
             *la = Some(LastAction {
@@ -1650,12 +1649,12 @@ impl EventReader {
 
     async fn start_control_socket(&self) {
         let paused         = self.paused.clone();
-        let last_event     = self.last_event.clone();
         let last_action    = self.last_action.clone();
         let current_config = self.current_config.clone();
         let modifiers      = self.modifiers.clone();
         let active_layout  = self.active_layout.clone();
         let held_keys      = self.held_keys.clone();
+        let all_configs    = self.config.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file("/tmp/makima-control.sock");
             let listener = match UnixListener::bind("/tmp/makima-control.sock") {
@@ -1667,12 +1666,12 @@ impl EventReader {
             };
             while let Ok((stream, _addr)) = listener.accept().await {
                 let paused         = paused.clone();
-                let last_event     = last_event.clone();
                 let last_action    = last_action.clone();
                 let current_config = current_config.clone();
                 let modifiers      = modifiers.clone();
                 let active_layout  = active_layout.clone();
                 let held_keys      = held_keys.clone();
+                let all_configs    = all_configs.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream.into_std().unwrap());
                     let mut line = String::new();
@@ -1698,10 +1697,6 @@ impl EventReader {
                                     TIMEOUT, active_layout.lock()).await {
                                     Ok(g) => *g, Err(_) => return,
                                 };
-                                let le = match tokio::time::timeout(
-                                    TIMEOUT, last_event.lock()).await {
-                                    Ok(g) => g.clone(), Err(_) => return,
-                                };
                                 let la = match tokio::time::timeout(
                                     TIMEOUT, last_action.lock()).await {
                                     Ok(g) => g.clone(), Err(_) => return,
@@ -1710,8 +1705,22 @@ impl EventReader {
                                     TIMEOUT, held_keys.lock()).await {
                                     Ok(g) => g.clone(), Err(_) => return,
                                 };
+                                let base_name = all_configs
+                                    .iter()
+                                    .find(|x| x.associations == Associations::default())
+                                    .map(|x| x.name.clone())
+                                    .unwrap_or_default();
+                                let stack = if config.name == base_name {
+                                    vec![base_name.clone()]
+                                } else {
+                                    let app_part = config.name
+                                        .strip_prefix(&format!("{}::", base_name))
+                                        .unwrap_or(&config.name)
+                                        .to_string();
+                                    vec![base_name, app_part]
+                                };
                                 crate::state_export::write_state(
-                                    &config, &mods, layout, is_paused, &le, &hk, &la,
+                                    &config, &mods, layout, is_paused, &hk, &la, &stack,
                                 ).await;
                             }
                             _ => {}

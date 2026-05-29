@@ -156,6 +156,11 @@ pub struct Config {
     pub name: String,
     pub associations: Associations,
     pub bindings: Bindings,
+    /// Snapshot of bindings before base was merged in.
+    /// None for the base config itself (everything is its own).
+    /// Some(overrides) for app-specific configs — used by state_export
+    /// to distinguish "came from override" vs "inherited from base".
+    pub override_bindings: Option<Bindings>,
     pub settings: HashMap<String, String>,
     pub mapped_modifiers: MappedModifiers,
 }
@@ -170,6 +175,7 @@ impl Config {
             name: file_name,
             associations,
             bindings,
+            override_bindings: None,
             settings,
             mapped_modifiers,
         }
@@ -180,9 +186,53 @@ impl Config {
             name: file_name,
             associations: Default::default(),
             bindings: Default::default(),
+            override_bindings: None,
             settings: Default::default(),
             mapped_modifiers: Default::default(),
         }
+    }
+
+    /// Merge `base` into `self` without overwriting existing entries.
+    /// Used for app-specific configs that declare only overrides — all
+    /// base bindings not present in the app config are inherited.
+    /// Note: remap is checked before commands at event time, so a remap
+    /// override silently shadows a base command for the same trigger/combo.
+    pub fn merge_base(&mut self, base: &Config) {
+        // Snapshot the override-only bindings before merging so state_export
+        // can tell which bindings are from this config vs inherited from base.
+        self.override_bindings = Some(self.bindings.clone());
+
+        for (trigger, modifier_map) in &base.bindings.remap {
+            let entry = self.bindings.remap.entry(*trigger).or_insert_with(HashMap::new);
+            for (combo, actions) in modifier_map {
+                entry.entry(combo.clone()).or_insert_with(|| actions.clone());
+            }
+        }
+        for (trigger, modifier_map) in &base.bindings.commands {
+            let entry = self.bindings.commands.entry(*trigger).or_insert_with(HashMap::new);
+            for (combo, cmds) in modifier_map {
+                entry.entry(combo.clone()).or_insert_with(|| cmds.clone());
+            }
+        }
+        for (trigger, modifier_map) in &base.bindings.movements {
+            let entry = self.bindings.movements.entry(*trigger).or_insert_with(HashMap::new);
+            for (combo, movement) in modifier_map {
+                entry.entry(combo.clone()).or_insert_with(|| *movement);
+            }
+        }
+        for key in &base.mapped_modifiers.custom {
+            if !self.mapped_modifiers.custom.contains(key) {
+                self.mapped_modifiers.custom.push(*key);
+            }
+        }
+        for (key, value) in &base.settings {
+            self.settings.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        self.mapped_modifiers.all.clear();
+        self.mapped_modifiers.all.extend(self.mapped_modifiers.default.clone());
+        self.mapped_modifiers.all.extend(self.mapped_modifiers.custom.clone());
+        self.mapped_modifiers.all.sort();
+        self.mapped_modifiers.all.dedup();
     }
 }
 
