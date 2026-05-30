@@ -56,29 +56,52 @@ On every config or modifier change, makima writes a fully-resolved state snapsho
     "active_outputs": ["KEY_LEFT", "KEY_LEFTALT"]
   },
   "bindings": {
-    "BTN_SOUTH": { "action": ["KEY_ENTER"], "origin": "Steam Deck" },
-    "BTN_TL-BTN_DPAD_LEFT": { "action": ["KEY_LEFTALT", "KEY_LEFT"], "origin": "org.mozilla.firefox" }
+    "BTN_SOUTH":          { "action": ["KEY_ENTER"],                    "kind": "remap",   "label": null,       "origin": "Steam Deck" },
+    "BTN_TL-BTN_DPAD_LEFT": { "action": ["KEY_LEFTALT", "KEY_LEFT"],   "kind": "remap",   "label": null,       "origin": "org.mozilla.firefox" },
+    "BTN_THUMBL":         { "action": ["deckery-hud-toggle"],           "kind": "command", "label": "Toggle HUD", "no_pause": true, "origin": "Steam Deck" }
   },
   "modifier_active": {
-    "BTN_DPAD_LEFT": { "action": ["KEY_LEFTALT", "KEY_LEFT"], "origin": "org.mozilla.firefox", "kind": "remap" },
-    "BTN_SOUTH":     { "action": ["KEY_ENTER"],               "origin": "Steam Deck",           "kind": "remap" }
+    "BTN_DPAD_LEFT": { "action": ["KEY_LEFTALT", "KEY_LEFT"], "kind": "remap",   "label": null,            "origin": "org.mozilla.firefox" },
+    "BTN_DPAD_UP":   { "action": ["Previous Desktop"],        "kind": "command", "label": "Previous Desktop", "origin": "Steam Deck" }
   },
   "last_action": {
-    "type": "keys",
-    "value": ["KEY_LEFTALT", "KEY_LEFT"],
-    "ts": 1748383200.123
+    "type": "command",
+    "value": "deckery-hud-toggle",
+    "ts": 1748383200.123,
+    "label": "Toggle HUD"
   }
 }
 ```
 
-- **`bindings`** — all remaps from the active config; plain buttons as `"BTN_FOO"`, combos as `"MOD-BTN_FOO"`
-- **`modifier_active`** — empty when no modifier held; while a modifier is pressed, contains every trigger reachable via that combo, keyed by trigger button; includes a `"kind"` field (`"remap"`, `"command"`, or `"movement"`)
+- **`bindings`** — all remaps and commands from the active config; plain buttons as `"BTN_FOO"`, combos as `"MOD1-MOD2-BTN_FOO"`
+- **`modifier_active`** — empty when no modifier held; when a modifier is pressed, contains every trigger reachable via the **exact** current modifier set, keyed by trigger button; uses exact matching so it never suggests a binding that would fall through to a less-specific combo at runtime
 - **`held_modifiers`** — modifier buttons currently physically held
 - **`active_buttons`** — all input buttons currently held (for button highlighting in the HUD)
 - **`active_outputs`** — evdev keys currently being emitted (derived from held buttons + modifier context)
 - **`config_stack`** — active config layer chain: one entry (`["Steam Deck"]`) for the base config, two entries (`["Steam Deck", "org.mozilla.firefox"]`) when an app-specific config is active; the second entry is the window class without the base prefix
 - **`origin`** — which config layer a binding comes from: the base config name for inherited bindings, the app-specific part for overrides; lets the HUD visually distinguish base bindings from per-app additions
-- **`last_action`** — the most recent discrete user action with a Unix timestamp (for HUD fade-out)
+- **`label`** — optional human-readable display name set via `label = "…"` in the config; present on `bindings`, `modifier_active`, and `last_action` entries
+- **`kind`** — binding type: `"remap"`, `"command"`, or `"movement"`
+- **`no_pause`** — `true` if the binding bypasses the global pause state (command bindings only)
+- **`last_action`** — the most recent discrete user action with a Unix timestamp (for HUD fade-out); carries `label` if set on the binding
+
+### Binding attributes
+
+Bindings support an extended inline-table syntax alongside the simple array form:
+
+```toml
+[remap]
+BTN_TL-BTN_NORTH = { keys = ["KEY_LEFTCTRL", "KEY_C"], label = "Copy (Ctrl+C)" }
+
+[commands]
+BTN_THUMBL = { run = ["deckery-hud-toggle"], no_pause = true, label = "Toggle HUD" }
+```
+
+| Attribute | Type | Applies to | Description |
+|---|---|---|---|
+| `keys` / `run` | array | remap / command | The action (replaces the bare array) |
+| `label` | string | both | Human-readable name exported to the HUD |
+| `no_pause` | bool | command | Execute even when makima is paused |
 
 ---
 
