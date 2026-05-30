@@ -1182,13 +1182,16 @@ impl EventReader {
             }
             if let Some(event_list) = map.get(&Vec::new()) {
                 self.set_last_emitted(&event, event_list, value, false, config.bindings.labels.get(&(event, vec![])).cloned()).await;
-                self.emit_event(event_list, value, &modifiers, &config, true, false)
+                // Fallback to base binding: no combo defined for the current modifier set.
+                // Do NOT release the held modifier keys — the modifier is already held at
+                // system level and should stay held (e.g. L1+A → Ctrl+Enter, not Enter).
+                self.emit_event(event_list, value, &modifiers, &config, false, false)
                     .await;
                 if send_zero {
                     let mut modifiers = self.modifiers.lock().await.clone();
                     modifiers.sort();
                     modifiers.dedup();
-                    self.emit_event(event_list, 0, &modifiers, &config, true, false)
+                    self.emit_event(event_list, 0, &modifiers, &config, false, false)
                         .await;
                 }
                 return;

@@ -319,6 +319,36 @@ pub async fn write_state(
     active_outputs.sort_by_key(|k| modifier_sort_key(k.as_str()));
     active_outputs.dedup();
 
+    // available_modifiers: custom modifier buttons that, if pressed next,
+    // would unlock at least one additional combo binding.
+    // A candidate modifier `m` qualifies when there exists a combo that:
+    //   - contains `m`
+    //   - contains all currently held modifiers as a subset
+    //   - is not yet fully satisfied (i.e. m ∉ active_input_mods)
+    let all_combos: Vec<&Vec<Event>> = config.bindings.remap.values()
+        .flat_map(|m| m.keys())
+        .chain(config.bindings.commands.values().flat_map(|m| m.keys()))
+        .chain(config.bindings.movements.values().flat_map(|m| m.keys()))
+        .filter(|c| !c.is_empty())
+        .collect();
+    let mut available_modifiers: Vec<String> = config.mapped_modifiers.custom
+        .iter()
+        .filter(|m| !active_input_mods.contains(m))
+        .filter(|m| {
+            // A modifier m is available if there exists a combo C where:
+            // - m ∈ C
+            // - all currently held modifiers are in C (active_input_mods ⊆ C)
+            // This means pressing m (possibly with others) could unlock a binding.
+            all_combos.iter().any(|combo| {
+                combo.contains(m)
+                    && active_input_mods.iter().all(|held| combo.contains(held))
+            })
+        })
+        .map(event_to_str)
+        .collect();
+    available_modifiers.sort();
+    available_modifiers.dedup();
+
     let state = serde_json::json!({
         "context": {
             "config_stack": config_stack,
@@ -327,6 +357,7 @@ pub async fn write_state(
             "held_modifiers": held_modifiers,
             "active_buttons": active_buttons,
             "active_outputs": active_outputs,
+            "available_modifiers": available_modifiers,
         },
         "last_action": last_action,
         "bindings": bindings,
