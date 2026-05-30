@@ -43,6 +43,9 @@ struct Settings {
     chain_only: bool,
     layout_switcher: Option<(Event, Vec<Event>)>,
     notify_layout_switch: bool,
+    /// If true, cursor/scroll loops keep running even while makima is paused.
+    /// Default: false. Set CURSOR_WHEN_PAUSED = "true" in [settings].
+    cursor_when_paused: bool,
 }
 
 pub struct EventReader {
@@ -319,6 +322,16 @@ impl EventReader {
             .parse()
             .expect("NOTIFY_LAYOUT_SWITCH can only be true or false.");
 
+        let cursor_when_paused: bool = config
+            .iter()
+            .find(|&x| x.associations == Associations::default())
+            .unwrap()
+            .settings
+            .get("CURSOR_WHEN_PAUSED")
+            .unwrap_or(&"false".to_string())
+            .parse()
+            .expect("CURSOR_WHEN_PAUSED can only be true or false.");
+
         let settings = Settings {
             lstick,
             rstick,
@@ -331,6 +344,7 @@ impl EventReader {
             chain_only,
             layout_switcher,
             notify_layout_switch,
+            cursor_when_paused,
         };
         Self {
             config,
@@ -1075,6 +1089,7 @@ impl EventReader {
         modifiers.sort();
         modifiers.dedup();
 
+
         // ── Custom modifier + remap intercept ──────────────────────────────────
         // A button that is BOTH in CUSTOM_MODIFIERS and has a base remap entry
         // acts as two things simultaneously:
@@ -1100,7 +1115,7 @@ impl EventReader {
                         }
                     }
                 }
-                self.set_last_emitted(&event, &out_keys, value, false).await;
+                self.set_last_emitted(&event, &out_keys, value, false, config.bindings.labels.get(&(event, vec![])).cloned()).await;
                 self.toggle_modifiers(event, value, &config).await;
                 return;
             }
@@ -1109,7 +1124,7 @@ impl EventReader {
 
         if let Some(map) = config.bindings.remap.get(&event) {
             if let Some(event_list) = map.get(&modifiers) {
-                self.set_last_emitted(&event, event_list, value, !modifiers.is_empty()).await;
+                self.set_last_emitted(&event, event_list, value, !modifiers.is_empty(), config.bindings.labels.get(&(event, modifiers.clone())).cloned()).await;
                 self.emit_event(
                     event_list,
                     value,
@@ -1144,9 +1159,11 @@ impl EventReader {
             }
             if let Some(map) = config.bindings.commands.get(&event) {
                 if let Some(command_list) = map.get(&modifiers) {
+                    let is_no_pause = config.bindings.no_pause.contains(&(event, modifiers.clone()))
+                        || config.bindings.no_pause.contains(&(event, vec![]));
                     if value == 1 {
-                        self.set_last_emitted_cmd(&event, command_list).await;
-                        if !paused {
+                        self.set_last_emitted_cmd(&event, command_list, config.bindings.labels.get(&(event, modifiers.clone())).cloned()).await;
+                        if !paused || is_no_pause {
                             self.spawn_subprocess(command_list).await
                         }
                     } else {
@@ -1164,7 +1181,7 @@ impl EventReader {
                 };
             }
             if let Some(event_list) = map.get(&Vec::new()) {
-                self.set_last_emitted(&event, event_list, value, false).await;
+                self.set_last_emitted(&event, event_list, value, false, config.bindings.labels.get(&(event, vec![])).cloned()).await;
                 self.emit_event(event_list, value, &modifiers, &config, true, false)
                     .await;
                 if send_zero {
@@ -1179,9 +1196,13 @@ impl EventReader {
         }
         if let Some(map) = config.bindings.commands.get(&event) {
             if let Some(command_list) = map.get(&modifiers) {
+                let is_no_pause = config.bindings.no_pause.contains(&(event, modifiers.clone()))
+                    || config.bindings.no_pause.contains(&(event, vec![]));
                 if value == 1 {
-                    self.set_last_emitted_cmd(&event, command_list).await;
-                    self.spawn_subprocess(command_list).await
+                    self.set_last_emitted_cmd(&event, command_list, config.bindings.labels.get(&(event, modifiers.clone())).cloned()).await;
+                    if !paused || is_no_pause {
+                        self.spawn_subprocess(command_list).await
+                    }
                 } else {
                     self.write_state().await;
                 }
@@ -1305,15 +1326,22 @@ impl EventReader {
         config: &Config,
     ) {
         if *self.paused.lock().await {
-            // When paused, still track modifier buttons (BTN_TL, BTN_MODE, etc.)
-            // so the HUD can display combo overlays while open.
-            // For non-modifier buttons, just write state to reflect active_buttons.
-            if config.mapped_modifiers.all.contains(&event) {
-                self.toggle_modifiers(event, value, config).await;
-            } else {
-                self.write_state().await;
+            // Check whether this exact (trigger, current-modifiers) combo has no_pause = true.
+            // If so, fall through to normal processing so the binding executes even when paused.
+            let current_mods = self.modifiers.lock().await.clone();
+            let is_no_pause = config.bindings.no_pause.contains(&(event, current_mods.clone()))
+                || config.bindings.no_pause.contains(&(event, vec![]));
+            if !is_no_pause {
+                // When paused, still track modifier buttons (BTN_TL, BTN_MODE, etc.)
+                // so the HUD can display combo overlays while open.
+                // For non-modifier buttons, just write state to reflect active_buttons.
+                if config.mapped_modifiers.all.contains(&event) {
+                    self.toggle_modifiers(event, value, config).await;
+                } else {
+                    self.write_state().await;
+                }
+                return;
             }
-            return;
         }
         // Passthrough keys are held state — last_action is only for combos and commands.
         let mut virt_dev = self.virt_dev.lock().await;
@@ -1401,9 +1429,6 @@ impl EventReader {
     }
 
     async fn spawn_subprocess(&self, command_list: &Vec<String>) {
-        if *self.paused.lock().await {
-            return;
-        }
         let mut modifier_was_activated = self.modifier_was_activated.lock().await;
         *modifier_was_activated = true;
         let (user, running_as_root) = if let Ok(sudo_user) = &self.environment.sudo_user {
@@ -1620,7 +1645,7 @@ impl EventReader {
     /// Record the actual emitted key output for the HUD last-event display.
     /// Called at the emission site (not at input time) so the action reflects
     /// what was truly sent to the virtual device.
-    async fn set_last_emitted(&self, _trigger: &Event, emitted: &[Key], value: i32, is_combo: bool) {
+    async fn set_last_emitted(&self, _trigger: &Event, emitted: &[Key], value: i32, is_combo: bool, label: Option<String>) {
         if is_combo && value == 1 {
             let mut la = self.last_action.lock().await;
             *la = Some(LastAction {
@@ -1629,19 +1654,21 @@ impl EventReader {
                     emitted.iter().map(|k| format!("{:?}", k)).collect::<Vec<_>>()
                 ),
                 ts: crate::state_export::now_ts(),
+                label,
             });
         }
         self.write_state().await;
     }
 
     /// Record a spawned command as the last emitted action.
-    async fn set_last_emitted_cmd(&self, _trigger: &Event, commands: &[String]) {
+    async fn set_last_emitted_cmd(&self, _trigger: &Event, commands: &[String], label: Option<String>) {
         {
             let mut la = self.last_action.lock().await;
             *la = Some(LastAction {
                 r#type: "command".to_string(),
                 value: serde_json::Value::String(commands.join(" ")),
                 ts: crate::state_export::now_ts(),
+                label,
             });
         }
         self.write_state().await;
@@ -1761,7 +1788,7 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            if !*self.paused.lock().await {
+                            if !*self.paused.lock().await || self.settings.cursor_when_paused {
                                 let (x_coord, y_coord) = if self.settings.invert_cursor_axis {
                                     (-stick_position[0], -stick_position[1])
                                 } else {
@@ -1815,7 +1842,7 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            if !*self.paused.lock().await {
+                            if !*self.paused.lock().await || self.settings.cursor_when_paused {
                                 let (x_coord, y_coord) = if self.settings.invert_scroll_axis {
                                     (-stick_position[0], -stick_position[1])
                                 } else {
@@ -1863,7 +1890,7 @@ impl EventReader {
                     if current_speed > speed as f32 {
                         current_speed = speed as f32
                     }
-                    if !*self.paused.lock().await {
+                    if !*self.paused.lock().await || self.settings.cursor_when_paused {
                         if cursor_movement.0 != 0 {
                             let mut virt_dev = self.virt_dev.lock().await;
                             let virtual_event_x: InputEvent = InputEvent::new_now(
@@ -1913,7 +1940,7 @@ impl EventReader {
                     if current_speed > speed as f32 {
                         current_speed = speed as f32
                     }
-                    if !*self.paused.lock().await {
+                    if !*self.paused.lock().await || self.settings.cursor_when_paused {
                         let mut virt_dev = self.virt_dev.lock().await;
                         if scroll_movement.0 != 0 {
                             let virtual_event_x: InputEvent = InputEvent::new_now(

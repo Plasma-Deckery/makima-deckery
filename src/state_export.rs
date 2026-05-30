@@ -23,6 +23,7 @@ pub struct LastAction {
     pub r#type: String,           // "keys" | "command" | "exec"
     pub value: serde_json::Value, // [KEY_*] for keys, string for command/exec
     pub ts: f64,                  // Unix timestamp (secs + fractional)
+    pub label: Option<String>,    // human-readable label, if set on the binding
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -112,7 +113,7 @@ pub async fn write_state(
         }
     };
 
-    // Build bindings map: all remaps from current config.
+    // Build bindings map: all remaps + commands from current config.
     // Key format: "BTN_FOO" for plain bindings, "MOD-BTN_FOO" for combos.
     let mut bindings = serde_json::Map::new();
     for (trigger, modifier_map) in &config.bindings.remap {
@@ -127,11 +128,40 @@ pub async fn write_state(
                 .iter()
                 .map(|k| serde_json::Value::String(format!("{:?}", k)))
                 .collect();
+            let label = config.bindings.labels.get(&(*trigger, combo.clone()));
             bindings.insert(
                 key,
                 serde_json::json!({
                     "action": action_list,
                     "origin": origin_remap(trigger, combo),
+                    "label": label,
+                    "kind": "remap",
+                }),
+            );
+        }
+    }
+    for (trigger, modifier_map) in &config.bindings.commands {
+        for (combo, cmds) in modifier_map {
+            let key = if combo.is_empty() {
+                event_to_str(trigger)
+            } else {
+                let parts: Vec<String> = combo.iter().map(event_to_str).collect();
+                format!("{}-{}", parts.join("-"), event_to_str(trigger))
+            };
+            let action_list: Vec<serde_json::Value> = cmds
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect();
+            let label = config.bindings.labels.get(&(*trigger, combo.clone()));
+            let no_pause = config.bindings.no_pause.contains(&(*trigger, combo.clone()));
+            bindings.insert(
+                key,
+                serde_json::json!({
+                    "action": action_list,
+                    "origin": origin_cmd(trigger, combo),
+                    "label": label,
+                    "kind": "command",
+                    "no_pause": no_pause,
                 }),
             );
         }
@@ -161,22 +191,32 @@ pub async fn write_state(
         .cloned()
         .collect();
 
-    let mut modifier_active = serde_json::Map::new();
+    // Track the combo length of each inserted entry so a more specific combo
+    // (longer = more modifiers) always wins over a less specific one.
+    let mut modifier_active: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut modifier_active_combo_len: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     if !active_input_mods.is_empty() {
         // Remap combos
         for (trigger, modifier_map) in &config.bindings.remap {
             for (combo, actions) in modifier_map {
-                if !combo.is_empty() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                if !combo.is_empty() && combo.len() == active_input_mods.len() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                    let key = event_to_str(trigger);
+                    if combo.len() < *modifier_active_combo_len.get(&key).unwrap_or(&0) {
+                        continue;
+                    }
                     let action_list: Vec<serde_json::Value> = actions
                         .iter()
                         .map(|k| serde_json::Value::String(format!("{:?}", k)))
                         .collect();
+                    let label = config.bindings.labels.get(&(*trigger, combo.clone()));
+                    modifier_active_combo_len.insert(key.clone(), combo.len());
                     modifier_active.insert(
-                        event_to_str(trigger),
+                        key,
                         serde_json::json!({
                             "action": action_list,
                             "origin": origin_remap(trigger, combo),
                             "kind": "remap",
+                            "label": label,
                         }),
                     );
                 }
@@ -185,17 +225,24 @@ pub async fn write_state(
         // Command combos (e.g. BTN_TL-BTN_DPAD_LEFT = ["qdbus ..."])
         for (trigger, modifier_map) in &config.bindings.commands {
             for (combo, commands) in modifier_map {
-                if !combo.is_empty() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                if !combo.is_empty() && combo.len() == active_input_mods.len() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                    let key = event_to_str(trigger);
+                    if combo.len() < *modifier_active_combo_len.get(&key).unwrap_or(&0) {
+                        continue;
+                    }
                     let action_list: Vec<serde_json::Value> = commands
                         .iter()
                         .map(|s| serde_json::Value::String(s.clone()))
                         .collect();
+                    let label = config.bindings.labels.get(&(*trigger, combo.clone()));
+                    modifier_active_combo_len.insert(key.clone(), combo.len());
                     modifier_active.insert(
-                        event_to_str(trigger),
+                        key,
                         serde_json::json!({
                             "action": action_list,
                             "origin": origin_cmd(trigger, combo),
                             "kind": "command",
+                            "label": label,
                         }),
                     );
                 }
@@ -204,13 +251,20 @@ pub async fn write_state(
         // Movement combos (e.g. LSTICK_UP = ["KEY_W"] in bind-mode)
         for (trigger, modifier_map) in &config.bindings.movements {
             for (combo, movement) in modifier_map {
-                if !combo.is_empty() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                if !combo.is_empty() && combo.len() == active_input_mods.len() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                    let key = event_to_str(trigger);
+                    if combo.len() < *modifier_active_combo_len.get(&key).unwrap_or(&0) {
+                        continue;
+                    }
+                    let label = config.bindings.labels.get(&(*trigger, combo.clone()));
+                    modifier_active_combo_len.insert(key.clone(), combo.len());
                     modifier_active.insert(
-                        event_to_str(trigger),
+                        key,
                         serde_json::json!({
                             "action": [format!("{:?}", movement)],
                             "origin": origin_mov(trigger, combo),
                             "kind": "movement",
+                            "label": label,
                         }),
                     );
                 }
@@ -232,18 +286,38 @@ pub async fn write_state(
     let mut active_outputs: Vec<String> = Vec::new();
     for held_event in held_keys {
         if let Some(modifier_map) = config.bindings.remap.get(held_event) {
-            let output = modifier_map
-                .get(&sorted_mods)
-                .or_else(|| modifier_map.get(&vec![]));
-            if let Some(keys) = output {
+            // If a combo remap exists for the current modifier set, use it.
+            if let Some(keys) = modifier_map.get(&sorted_mods) {
+                for k in keys {
+                    active_outputs.push(format!("{:?}", k));
+                }
+                continue;
+            }
+            // If a combo command or movement handles this button+modifier combination,
+            // no keys are sent — don't fall back to the base remap output.
+            if !sorted_mods.is_empty() {
+                let command_handles = config.bindings.commands
+                    .get(held_event)
+                    .and_then(|m| m.get(&sorted_mods))
+                    .is_some();
+                let movement_handles = config.bindings.movements
+                    .get(held_event)
+                    .and_then(|m| m.get(&sorted_mods))
+                    .is_some();
+                if command_handles || movement_handles {
+                    continue;
+                }
+            }
+            // No combo override — fall back to base remap (e.g. Ctrl+Up via held Ctrl).
+            if let Some(keys) = modifier_map.get(&vec![]) {
                 for k in keys {
                     active_outputs.push(format!("{:?}", k));
                 }
             }
         }
     }
-    active_outputs.dedup();
     active_outputs.sort_by_key(|k| modifier_sort_key(k.as_str()));
+    active_outputs.dedup();
 
     let state = serde_json::json!({
         "context": {
