@@ -44,7 +44,7 @@ struct Settings {
     layout_switcher: Option<(Event, Vec<Event>)>,
     notify_layout_switch: bool,
     /// If true, cursor/scroll loops keep running even while makima is paused.
-    /// Default: false. Set CURSOR_WHEN_PAUSED = "true" in [settings].
+    /// Default: true. Set CURSOR_WHEN_PAUSED = "false" in [settings] to disable.
     cursor_when_paused: bool,
 }
 
@@ -328,7 +328,7 @@ impl EventReader {
             .unwrap()
             .settings
             .get("CURSOR_WHEN_PAUSED")
-            .unwrap_or(&"false".to_string())
+            .unwrap_or(&"true".to_string())
             .parse()
             .expect("CURSOR_WHEN_PAUSED can only be true or false.");
 
@@ -1124,6 +1124,8 @@ impl EventReader {
 
         if let Some(map) = config.bindings.remap.get(&event) {
             if let Some(event_list) = map.get(&modifiers) {
+                let is_no_pause = config.bindings.no_pause.contains(&(event, modifiers.clone()))
+                    || config.bindings.no_pause.contains(&(event, vec![]));
                 self.set_last_emitted(&event, event_list, value, !modifiers.is_empty(), config.bindings.labels.get(&(event, modifiers.clone())).cloned()).await;
                 self.emit_event(
                     event_list,
@@ -1132,6 +1134,7 @@ impl EventReader {
                     &config,
                     modifiers.is_empty(),
                     !modifiers.is_empty(),
+                    is_no_pause,
                 )
                 .await;
                 if send_zero {
@@ -1145,6 +1148,7 @@ impl EventReader {
                         &config,
                         modifiers.is_empty(),
                         !modifiers.is_empty(),
+                        is_no_pause,
                     )
                     .await;
                 }
@@ -1152,7 +1156,7 @@ impl EventReader {
             }
             if let Some(event_list) = map.get(&vec![Event::Hold]) {
                 if !modifiers.is_empty() || self.settings.chain_only == false {
-                    self.emit_event(event_list, value, &modifiers, &config, false, false)
+                    self.emit_event(event_list, value, &modifiers, &config, false, false, false)
                         .await;
                     return;
                 }
@@ -1181,17 +1185,18 @@ impl EventReader {
                 };
             }
             if let Some(event_list) = map.get(&Vec::new()) {
+                let is_no_pause = config.bindings.no_pause.contains(&(event, vec![]));
                 self.set_last_emitted(&event, event_list, value, false, config.bindings.labels.get(&(event, vec![])).cloned()).await;
                 // Fallback to base binding: no combo defined for the current modifier set.
                 // Do NOT release the held modifier keys — the modifier is already held at
                 // system level and should stay held (e.g. L1+A → Ctrl+Enter, not Enter).
-                self.emit_event(event_list, value, &modifiers, &config, false, false)
+                self.emit_event(event_list, value, &modifiers, &config, false, false, is_no_pause)
                     .await;
                 if send_zero {
                     let mut modifiers = self.modifiers.lock().await.clone();
                     modifiers.sort();
                     modifiers.dedup();
-                    self.emit_event(event_list, 0, &modifiers, &config, false, false)
+                    self.emit_event(event_list, 0, &modifiers, &config, false, false, is_no_pause)
                         .await;
                 }
                 return;
@@ -1254,9 +1259,10 @@ impl EventReader {
         config: &Config,
         release_keys: bool,
         ignore_modifiers: bool,
+        no_pause: bool,
     ) {
         let paused = *self.paused.lock().await;
-        if paused {
+        if paused && !no_pause {
             return;
         }
         let mut virt_dev = self.virt_dev.lock().await;
