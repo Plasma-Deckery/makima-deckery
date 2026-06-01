@@ -224,24 +224,53 @@ impl Config {
         // can tell which bindings are from this config vs inherited from base.
         self.override_bindings = Some(self.bindings.clone());
 
-        for (trigger, modifier_map) in &base.bindings.remap {
-            let entry = self.bindings.remap.entry(*trigger).or_insert_with(HashMap::new);
+        // Base-first strategy: start from a full clone of the base bindings,
+        // then apply each override binding on top. When an override defines a
+        // binding for a given (trigger, combo), it evicts any base entry of a
+        // *different* type for that same combo before inserting — so a
+        // command→remap or remap→command type change never leaves a stale
+        // entry behind. Adding a new binding type in the future only requires
+        // one additional `remove` call per loop, not a new guard matrix.
+        let mut merged = base.bindings.clone();
+
+        for (trigger, modifier_map) in &self.bindings.remap {
             for (combo, actions) in modifier_map {
-                entry.entry(combo.clone()).or_insert_with(|| actions.clone());
+                if let Some(m) = merged.commands.get_mut(trigger)  { m.remove(combo); }
+                if let Some(m) = merged.movements.get_mut(trigger) { m.remove(combo); }
+                // Label belongs to the action: evict base label so a stale
+                // description (e.g. "Previous Desktop") never appears next to
+                // a replaced action. Override label, if any, is re-added below.
+                merged.labels.remove(&(*trigger, combo.clone()));
+                merged.remap.entry(*trigger).or_default().insert(combo.clone(), actions.clone());
             }
         }
-        for (trigger, modifier_map) in &base.bindings.commands {
-            let entry = self.bindings.commands.entry(*trigger).or_insert_with(HashMap::new);
+        for (trigger, modifier_map) in &self.bindings.commands {
             for (combo, cmds) in modifier_map {
-                entry.entry(combo.clone()).or_insert_with(|| cmds.clone());
+                if let Some(m) = merged.remap.get_mut(trigger)     { m.remove(combo); }
+                if let Some(m) = merged.movements.get_mut(trigger) { m.remove(combo); }
+                merged.labels.remove(&(*trigger, combo.clone()));
+                merged.commands.entry(*trigger).or_default().insert(combo.clone(), cmds.clone());
             }
         }
-        for (trigger, modifier_map) in &base.bindings.movements {
-            let entry = self.bindings.movements.entry(*trigger).or_insert_with(HashMap::new);
+        for (trigger, modifier_map) in &self.bindings.movements {
             for (combo, movement) in modifier_map {
-                entry.entry(combo.clone()).or_insert_with(|| *movement);
+                if let Some(m) = merged.remap.get_mut(trigger)    { m.remove(combo); }
+                if let Some(m) = merged.commands.get_mut(trigger) { m.remove(combo); }
+                merged.labels.remove(&(*trigger, combo.clone()));
+                merged.movements.entry(*trigger).or_default().insert(combo.clone(), *movement);
             }
         }
+
+        // Override no_pause and labels win; base values are already in merged.
+        for entry in &self.bindings.no_pause {
+            merged.no_pause.insert(entry.clone());
+        }
+        for (key, label) in &self.bindings.labels {
+            merged.labels.insert(key.clone(), label.clone());
+        }
+
+        self.bindings = merged;
+
         for key in &base.mapped_modifiers.custom {
             if !self.mapped_modifiers.custom.contains(key) {
                 self.mapped_modifiers.custom.push(*key);
@@ -249,13 +278,6 @@ impl Config {
         }
         for (key, value) in &base.settings {
             self.settings.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-        // Inherit no_pause and labels from base for bindings that were inherited.
-        for entry in &base.bindings.no_pause {
-            self.bindings.no_pause.insert(entry.clone());
-        }
-        for (key, label) in &base.bindings.labels {
-            self.bindings.labels.entry(key.clone()).or_insert_with(|| label.clone());
         }
         self.mapped_modifiers.all.clear();
         self.mapped_modifiers.all.extend(self.mapped_modifiers.default.clone());
@@ -613,5 +635,122 @@ pub fn parse_modifiers(settings: &HashMap<String, String>, parameter: &str) -> V
             custom_modifiers
         }
         None => Vec::new(),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::Key;
+
+    fn key(k: Key) -> Event { Event::Key(k) }
+
+    fn make_remap_bindings(entries: Vec<(Event, Vec<Event>, Vec<Key>)>) -> Bindings {
+        let mut remap: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+        for (trigger, combo, keys) in entries {
+            remap.entry(trigger).or_default().insert(combo, keys);
+        }
+        Bindings { remap, ..Default::default() }
+    }
+
+    fn make_command_bindings(entries: Vec<(Event, Vec<Event>, Vec<String>)>) -> Bindings {
+        let mut commands: HashMap<Event, HashMap<Vec<Event>, Vec<String>>> = HashMap::new();
+        for (trigger, combo, cmds) in entries {
+            commands.entry(trigger).or_default().insert(combo, cmds);
+        }
+        Bindings { commands, ..Default::default() }
+    }
+
+    fn config_with(name: &str, bindings: Bindings) -> Config {
+        Config {
+            name: name.to_string(),
+            associations: Default::default(),
+            bindings,
+            override_bindings: None,
+            settings: HashMap::new(),
+            mapped_modifiers: Default::default(),
+        }
+    }
+
+    // ── merge_base: cross-type override prevention ────────────────────────────
+
+    /// Firefox overrides BTN_TL-BTN_DPAD_UP from command (base) → remap (override).
+    /// After merge, the base command must NOT appear — only the override remap.
+    #[test]
+    fn merge_base_command_to_remap_override() {
+        let btn_tl = key(Key::BTN_TL);
+        let btn_up = key(Key::BTN_DPAD_UP);
+        let combo  = vec![btn_tl];
+
+        let base = config_with("Steam Deck", make_command_bindings(vec![
+            (btn_up, combo.clone(), vec!["previous-desktop".to_string()]),
+        ]));
+        let mut app = config_with("firefox", make_remap_bindings(vec![
+            (btn_up, combo.clone(), vec![Key::KEY_LEFTCTRL, Key::KEY_R]),
+        ]));
+
+        app.merge_base(&base);
+
+        assert!(
+            app.bindings.remap.get(&btn_up).and_then(|m| m.get(&combo)).is_some(),
+            "override remap must survive merge"
+        );
+        assert!(
+            app.bindings.commands.get(&btn_up).and_then(|m| m.get(&combo)).is_none(),
+            "base command must not leak when override defines a remap for the same combo"
+        );
+    }
+
+    /// Symmetric: override defines a command where base had a remap.
+    #[test]
+    fn merge_base_remap_to_command_override() {
+        let btn_tl = key(Key::BTN_TL);
+        let btn_up = key(Key::BTN_DPAD_UP);
+        let combo  = vec![btn_tl];
+
+        let base = config_with("Steam Deck", make_remap_bindings(vec![
+            (btn_up, combo.clone(), vec![Key::KEY_UP]),
+        ]));
+        let mut app = config_with("myapp", make_command_bindings(vec![
+            (btn_up, combo.clone(), vec!["do-something".to_string()]),
+        ]));
+
+        app.merge_base(&base);
+
+        assert!(
+            app.bindings.commands.get(&btn_up).and_then(|m| m.get(&combo)).is_some(),
+            "override command must survive merge"
+        );
+        assert!(
+            app.bindings.remap.get(&btn_up).and_then(|m| m.get(&combo)).is_none(),
+            "base remap must not leak when override defines a command for the same combo"
+        );
+    }
+
+    /// Unrelated combos from the base must still be inherited normally.
+    #[test]
+    fn merge_base_unrelated_combos_inherited() {
+        let btn_tl   = key(Key::BTN_TL);
+        let btn_up   = key(Key::BTN_DPAD_UP);
+        let btn_down = key(Key::BTN_DPAD_DOWN);
+
+        let base = config_with("Steam Deck", make_command_bindings(vec![
+            (btn_up,   vec![btn_tl], vec!["prev-desktop".to_string()]),
+            (btn_down, vec![btn_tl], vec!["next-desktop".to_string()]),
+        ]));
+        // Override only changes btn_up; btn_down must be inherited unchanged.
+        let mut app = config_with("firefox", make_remap_bindings(vec![
+            (btn_up, vec![btn_tl], vec![Key::KEY_LEFTCTRL, Key::KEY_R]),
+        ]));
+
+        app.merge_base(&base);
+
+        assert!(
+            app.bindings.commands
+                .get(&btn_down).and_then(|m| m.get(&vec![btn_tl])).is_some(),
+            "unrelated base command (btn_down) must be inherited"
+        );
     }
 }
