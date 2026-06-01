@@ -580,4 +580,209 @@ mod tests {
         assert!(keys.contains(&"BTN_NORTH".to_string()), "BTN_TL-BTN_NORTH should appear");
         assert!(!keys.contains(&"BTN_SOUTH".to_string()), "BTN_TL-BTN_TR-BTN_SOUTH must not leak in");
     }
+
+    #[test]
+    fn modifier_active_includes_commands() {
+        // Commands under a modifier should appear in modifier_active, not just remaps.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_dpad_up = key(Key::BTN_DPAD_UP);
+        let config = make_config(
+            vec![],
+            vec![(btn_dpad_up, vec![btn_tl], vec!["previous-desktop".to_string()])],
+            vec![btn_tl],
+        );
+        let state = build_state(&config, &[btn_tl], 0, false, &[], &None, &["test".to_string()]);
+        let keys = modifier_active_keys(&state);
+        assert!(keys.contains(&"BTN_DPAD_UP".to_string()));
+        assert_eq!(
+            state["modifier_active"]["BTN_DPAD_UP"]["kind"].as_str().unwrap(),
+            "command"
+        );
+    }
+
+    #[test]
+    fn modifier_active_label_propagated() {
+        // label set on a combo binding should appear in modifier_active.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_north = key(Key::BTN_NORTH);
+        let mut config = make_config(
+            vec![(btn_north, vec![btn_tl], vec![Key::KEY_LEFTCTRL, Key::KEY_C])],
+            vec![], vec![btn_tl],
+        );
+        config.bindings.labels.insert((btn_north, vec![btn_tl]), "Copy".to_string());
+        let state = build_state(&config, &[btn_tl], 0, false, &[], &None, &["test".to_string()]);
+        assert_eq!(
+            state["modifier_active"]["BTN_NORTH"]["label"].as_str().unwrap(),
+            "Copy"
+        );
+    }
+
+    // ── bindings JSON fields ──────────────────────────────────────────────────
+
+    #[test]
+    fn bindings_json_no_pause_flag() {
+        // no_pause = true on a command binding must appear in the bindings JSON.
+        let btn_thumbl = key(Key::BTN_THUMBL);
+        let mut config = make_config(
+            vec![],
+            vec![(btn_thumbl, vec![], vec!["hud-toggle".to_string()])],
+            vec![],
+        );
+        config.bindings.no_pause.insert((btn_thumbl, vec![]));
+        let state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        assert_eq!(
+            state["bindings"]["BTN_THUMBL"]["no_pause"].as_bool().unwrap(),
+            true
+        );
+    }
+
+    // ── context fields ────────────────────────────────────────────────────────
+
+    #[test]
+    fn context_active_buttons_and_held_modifiers() {
+        // active_buttons = all held input events; held_modifiers = only modifier subset.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_south = key(Key::BTN_SOUTH);
+        let config = make_config(
+            vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
+            vec![], vec![btn_tl],
+        );
+        // BTN_TL is in modifiers (held modifier); BTN_SOUTH is in held_keys.
+        let state = build_state(
+            &config,
+            &[btn_tl],
+            0, false,
+            &[btn_tl, btn_south],
+            &None,
+            &["test".to_string()],
+        );
+        let active_btns: Vec<_> = state["context"]["active_buttons"]
+            .as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        let held_mods: Vec<_> = state["context"]["held_modifiers"]
+            .as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(active_btns.contains(&"BTN_TL"));
+        assert!(active_btns.contains(&"BTN_SOUTH"));
+        assert!(held_mods.contains(&"BTN_TL"));
+        assert!(!held_mods.contains(&"BTN_SOUTH"), "BTN_SOUTH is not a modifier");
+    }
+
+    // ── active_outputs: multi-modifier combo ──────────────────────────────────
+
+    #[test]
+    fn active_outputs_multi_modifier_combo() {
+        // L1+R1+DPad_Up combo should produce its own output, not fall back to base.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_tr = key(Key::BTN_TR);
+        let btn_dpad_up = key(Key::BTN_DPAD_UP);
+        let config = make_config(
+            vec![
+                (btn_dpad_up, vec![], vec![Key::KEY_UP]),
+                (btn_dpad_up, vec![btn_tl, btn_tr], vec![Key::KEY_F1]),
+            ],
+            vec![], vec![btn_tl, btn_tr],
+        );
+        // Sort the modifier combo the same way resolve_binding expects it.
+        let mut mods = vec![btn_tl, btn_tr];
+        mods.sort();
+        let state = build_state(&config, &mods, 0, false, &[btn_dpad_up], &None, &["test".to_string()]);
+        assert_eq!(active_outputs(&state), vec!["KEY_F1"]);
+    }
+
+    // ── indirect modifier detection ───────────────────────────────────────────
+
+    #[test]
+    fn indirect_modifier_match_via_output_key() {
+        // BTN_TL is a custom modifier whose base remap is KEY_LEFTCTRL.
+        // If modifiers contains Event::Key(KEY_LEFTCTRL) instead of BTN_TL directly,
+        // BTN_TL should still be detected as an active modifier for combo resolution.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_north = key(Key::BTN_NORTH);
+        let config = make_config(
+            vec![
+                (btn_tl, vec![], vec![Key::KEY_LEFTCTRL]),  // BTN_TL → KEY_LEFTCTRL
+                (btn_north, vec![btn_tl], vec![Key::KEY_LEFTCTRL, Key::KEY_C]),
+            ],
+            vec![], vec![btn_tl],
+        );
+        // modifiers contains KEY_LEFTCTRL (the output key), not BTN_TL
+        let state = build_state(
+            &config,
+            &[Event::Key(Key::KEY_LEFTCTRL)],
+            0, false, &[], &None, &["test".to_string()],
+        );
+        // BTN_TL should be detected as active → modifier_active shows BTN_TL-BTN_NORTH combo
+        let keys = modifier_active_keys(&state);
+        assert!(keys.contains(&"BTN_NORTH".to_string()),
+            "indirect modifier detection: BTN_NORTH combo should appear when KEY_LEFTCTRL held");
+    }
+
+    // ── origin: base config vs. app-specific override ─────────────────────────
+
+    #[test]
+    fn origin_override_vs_base() {
+        // Simulate a Firefox app config layered on top of a Steam Deck base config.
+        // Inherited bindings get origin="Steam Deck"; overridden ones get origin="firefox".
+        use crate::config::{Bindings, MappedModifiers};
+        use std::collections::{HashMap, HashSet};
+
+        let btn_south = key(Key::BTN_SOUTH);
+        let btn_tl = key(Key::BTN_TL);
+        let btn_dpad_up = key(Key::BTN_DPAD_UP);
+
+        // Merged bindings: base BTN_SOUTH + overridden BTN_TL-BTN_DPAD_UP
+        let mut merged_remap: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+        merged_remap.entry(btn_south).or_default().insert(vec![], vec![Key::KEY_ENTER]);
+        merged_remap.entry(btn_dpad_up).or_default().insert(
+            vec![btn_tl], vec![Key::KEY_LEFTALT, Key::KEY_LEFT],
+        );
+
+        // override_bindings: only what the app config itself defined
+        let mut override_remap: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+        override_remap.entry(btn_dpad_up).or_default().insert(
+            vec![btn_tl], vec![Key::KEY_LEFTALT, Key::KEY_LEFT],
+        );
+
+        let config = Config {
+            name: "firefox".to_string(),
+            associations: Default::default(),
+            bindings: Bindings {
+                remap: merged_remap,
+                commands: HashMap::new(),
+                movements: HashMap::new(),
+                no_pause: HashSet::new(),
+                labels: HashMap::new(),
+            },
+            override_bindings: Some(Bindings {
+                remap: override_remap,
+                commands: HashMap::new(),
+                movements: HashMap::new(),
+                no_pause: HashSet::new(),
+                labels: HashMap::new(),
+            }),
+            settings: HashMap::new(),
+            mapped_modifiers: MappedModifiers {
+                default: vec![],
+                custom: vec![btn_tl],
+                all: vec![btn_tl],
+            },
+        };
+
+        let state = build_state(
+            &config, &[], 0, false, &[], &None,
+            &["Steam Deck".to_string(), "firefox".to_string()],
+        );
+
+        assert_eq!(
+            state["bindings"]["BTN_SOUTH"]["origin"].as_str().unwrap(),
+            "Steam Deck",
+            "inherited binding should come from base config"
+        );
+        assert_eq!(
+            state["bindings"]["BTN_TL-BTN_DPAD_UP"]["origin"].as_str().unwrap(),
+            "firefox",
+            "overridden binding should come from app config"
+        );
+    }
 }

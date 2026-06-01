@@ -354,4 +354,145 @@ mod tests {
         let result = resolve_binding(&bindings, btn_dpad_up, &[btn_tl], false);
         assert_eq!(result, ResolvedBinding::Unbound);
     }
+
+    // ── Multi-modifier combo ──────────────────────────────────────────────────
+
+    #[test]
+    fn multi_modifier_combo() {
+        let btn_tl = key_event(Key::BTN_TL);
+        let btn_tr = key_event(Key::BTN_TR);
+        let btn_dpad_up = key_event(Key::BTN_DPAD_UP);
+        let bindings = make_bindings(
+            vec![(btn_dpad_up, vec![btn_tl, btn_tr], vec![Key::KEY_UP])],
+            vec![], vec![], vec![],
+        );
+        let result = resolve_binding(&bindings, btn_dpad_up, &[btn_tl, btn_tr], false);
+        assert_eq!(result, ResolvedBinding::Keys {
+            keys: vec![Key::KEY_UP],
+            label: None,
+            no_pause: false,
+            is_combo: true,
+            is_fallback: false,
+        });
+    }
+
+    // ── Hold binding ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn hold_fires_when_modifier_held() {
+        // Hold binding fires when at least one modifier is held (chain_only=true).
+        let btn_south = key_event(Key::BTN_SOUTH);
+        let bindings = make_bindings(
+            vec![(btn_south, vec![Event::Hold], vec![Key::KEY_ENTER])],
+            vec![], vec![], vec![],
+        );
+        let result = resolve_binding(&bindings, btn_south, &[key_event(Key::BTN_TL)], true);
+        assert_eq!(result, ResolvedBinding::Hold { keys: vec![Key::KEY_ENTER] });
+    }
+
+    #[test]
+    fn hold_suppressed_chain_only_no_mods() {
+        // chain_only=true + no modifiers → Hold must not fire; falls through to Unbound.
+        let btn_south = key_event(Key::BTN_SOUTH);
+        let bindings = make_bindings(
+            vec![(btn_south, vec![Event::Hold], vec![Key::KEY_ENTER])],
+            vec![], vec![], vec![],
+        );
+        let result = resolve_binding(&bindings, btn_south, &[], true);
+        assert_eq!(result, ResolvedBinding::Unbound);
+    }
+
+    #[test]
+    fn hold_fires_chain_only_false_no_mods() {
+        // chain_only=false → Hold fires even without modifiers.
+        let btn_south = key_event(Key::BTN_SOUTH);
+        let bindings = make_bindings(
+            vec![(btn_south, vec![Event::Hold], vec![Key::KEY_ENTER])],
+            vec![], vec![], vec![],
+        );
+        let result = resolve_binding(&bindings, btn_south, &[], false);
+        assert_eq!(result, ResolvedBinding::Hold { keys: vec![Key::KEY_ENTER] });
+    }
+
+    // ── Movement binding ──────────────────────────────────────────────────────
+
+    #[test]
+    fn movement_base_binding() {
+        use crate::config::{Cursor, Relative};
+        let trigger = key_event(Key::BTN_SOUTH);
+        let movement = Relative::Cursor(Cursor::CURSOR_UP);
+        let mut movements = HashMap::new();
+        movements.entry(trigger).or_insert_with(HashMap::new).insert(vec![], movement);
+        let bindings = Bindings {
+            remap: HashMap::new(),
+            commands: HashMap::new(),
+            movements,
+            no_pause: std::collections::HashSet::new(),
+            labels: HashMap::new(),
+        };
+        let result = resolve_binding(&bindings, trigger, &[], false);
+        assert_eq!(result, ResolvedBinding::Movement { movement, is_combo: false });
+    }
+
+    #[test]
+    fn movement_combo() {
+        use crate::config::{Cursor, Relative};
+        let trigger = key_event(Key::BTN_SOUTH);
+        let btn_tl = key_event(Key::BTN_TL);
+        let movement = Relative::Cursor(Cursor::CURSOR_RIGHT);
+        let mut movements = HashMap::new();
+        movements.entry(trigger).or_insert_with(HashMap::new).insert(vec![btn_tl], movement);
+        let bindings = Bindings {
+            remap: HashMap::new(),
+            commands: HashMap::new(),
+            movements,
+            no_pause: std::collections::HashSet::new(),
+            labels: HashMap::new(),
+        };
+        let result = resolve_binding(&bindings, trigger, &[btn_tl], false);
+        assert_eq!(result, ResolvedBinding::Movement { movement, is_combo: true });
+    }
+
+    // ── Top-level command (no remap block for this event) ─────────────────────
+
+    #[test]
+    fn top_level_command_no_remap_block() {
+        // Event is not in bindings.remap at all — command must still be found (step 6).
+        let btn_thumbl = key_event(Key::BTN_THUMBL);
+        let bindings = make_bindings(
+            vec![],  // no remap entry for btn_thumbl
+            vec![(btn_thumbl, vec![], vec!["hud-toggle".to_string()])],
+            vec![], vec![],
+        );
+        let result = resolve_binding(&bindings, btn_thumbl, &[], false);
+        assert_eq!(result, ResolvedBinding::Command {
+            commands: vec!["hud-toggle".to_string()],
+            label: None,
+            no_pause: false,
+            is_combo: false,
+        });
+    }
+
+    // ── Command under remap block takes priority over base remap fallback ──────
+
+    #[test]
+    fn command_under_remap_beats_fallback() {
+        // Event IS in bindings.remap (base mapping) AND has a combo command.
+        // With the combo modifier held, the command (step 3) must win over the
+        // base remap fallback (step 5).
+        let btn_dpad_up = key_event(Key::BTN_DPAD_UP);
+        let btn_tl = key_event(Key::BTN_TL);
+        let bindings = make_bindings(
+            vec![(btn_dpad_up, vec![], vec![Key::KEY_UP])],
+            vec![(btn_dpad_up, vec![btn_tl], vec!["previous-desktop".to_string()])],
+            vec![], vec![],
+        );
+        let result = resolve_binding(&bindings, btn_dpad_up, &[btn_tl], false);
+        assert_eq!(result, ResolvedBinding::Command {
+            commands: vec!["previous-desktop".to_string()],
+            label: None,
+            no_pause: false,
+            is_combo: true,
+        });
+    }
 }
