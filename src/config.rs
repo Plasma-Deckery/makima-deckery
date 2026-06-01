@@ -224,51 +224,53 @@ impl Config {
         // can tell which bindings are from this config vs inherited from base.
         self.override_bindings = Some(self.bindings.clone());
 
-        for (trigger, modifier_map) in &base.bindings.remap {
+        // Base-first strategy: start from a full clone of the base bindings,
+        // then apply each override binding on top. When an override defines a
+        // binding for a given (trigger, combo), it evicts any base entry of a
+        // *different* type for that same combo before inserting — so a
+        // command→remap or remap→command type change never leaves a stale
+        // entry behind. Adding a new binding type in the future only requires
+        // one additional `remove` call per loop, not a new guard matrix.
+        let mut merged = base.bindings.clone();
+
+        for (trigger, modifier_map) in &self.bindings.remap {
             for (combo, actions) in modifier_map {
-                // Don't inherit base remap if override already handles this
-                // trigger+combo as a command or movement.
-                let already_command = self.bindings.commands
-                    .get(trigger).and_then(|m| m.get(combo)).is_some();
-                let already_movement = self.bindings.movements
-                    .get(trigger).and_then(|m| m.get(combo)).is_some();
-                if !already_command && !already_movement {
-                    self.bindings.remap
-                        .entry(*trigger).or_insert_with(HashMap::new)
-                        .entry(combo.clone()).or_insert_with(|| actions.clone());
-                }
+                if let Some(m) = merged.commands.get_mut(trigger)  { m.remove(combo); }
+                if let Some(m) = merged.movements.get_mut(trigger) { m.remove(combo); }
+                // Label belongs to the action: evict base label so a stale
+                // description (e.g. "Previous Desktop") never appears next to
+                // a replaced action. Override label, if any, is re-added below.
+                merged.labels.remove(&(*trigger, combo.clone()));
+                merged.remap.entry(*trigger).or_default().insert(combo.clone(), actions.clone());
             }
         }
-        for (trigger, modifier_map) in &base.bindings.commands {
+        for (trigger, modifier_map) in &self.bindings.commands {
             for (combo, cmds) in modifier_map {
-                // Don't inherit base command if override already handles this
-                // trigger+combo as a remap or movement.
-                let already_remap = self.bindings.remap
-                    .get(trigger).and_then(|m| m.get(combo)).is_some();
-                let already_movement = self.bindings.movements
-                    .get(trigger).and_then(|m| m.get(combo)).is_some();
-                if !already_remap && !already_movement {
-                    self.bindings.commands
-                        .entry(*trigger).or_insert_with(HashMap::new)
-                        .entry(combo.clone()).or_insert_with(|| cmds.clone());
-                }
+                if let Some(m) = merged.remap.get_mut(trigger)     { m.remove(combo); }
+                if let Some(m) = merged.movements.get_mut(trigger) { m.remove(combo); }
+                merged.labels.remove(&(*trigger, combo.clone()));
+                merged.commands.entry(*trigger).or_default().insert(combo.clone(), cmds.clone());
             }
         }
-        for (trigger, modifier_map) in &base.bindings.movements {
+        for (trigger, modifier_map) in &self.bindings.movements {
             for (combo, movement) in modifier_map {
-                // Don't inherit base movement if override already handles this
-                // trigger+combo as a remap or command.
-                let already_remap = self.bindings.remap
-                    .get(trigger).and_then(|m| m.get(combo)).is_some();
-                let already_command = self.bindings.commands
-                    .get(trigger).and_then(|m| m.get(combo)).is_some();
-                if !already_remap && !already_command {
-                    self.bindings.movements
-                        .entry(*trigger).or_insert_with(HashMap::new)
-                        .entry(combo.clone()).or_insert_with(|| *movement);
-                }
+                if let Some(m) = merged.remap.get_mut(trigger)    { m.remove(combo); }
+                if let Some(m) = merged.commands.get_mut(trigger) { m.remove(combo); }
+                merged.labels.remove(&(*trigger, combo.clone()));
+                merged.movements.entry(*trigger).or_default().insert(combo.clone(), *movement);
             }
         }
+
+        // Override no_pause and labels win; base values are already in merged.
+        for entry in &self.bindings.no_pause {
+            merged.no_pause.insert(entry.clone());
+        }
+        for (key, label) in &self.bindings.labels {
+            merged.labels.insert(key.clone(), label.clone());
+        }
+
+        self.bindings = merged;
+
         for key in &base.mapped_modifiers.custom {
             if !self.mapped_modifiers.custom.contains(key) {
                 self.mapped_modifiers.custom.push(*key);
@@ -276,13 +278,6 @@ impl Config {
         }
         for (key, value) in &base.settings {
             self.settings.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-        // Inherit no_pause and labels from base for bindings that were inherited.
-        for entry in &base.bindings.no_pause {
-            self.bindings.no_pause.insert(entry.clone());
-        }
-        for (key, label) in &base.bindings.labels {
-            self.bindings.labels.entry(key.clone()).or_insert_with(|| label.clone());
         }
         self.mapped_modifiers.all.clear();
         self.mapped_modifiers.all.extend(self.mapped_modifiers.default.clone());

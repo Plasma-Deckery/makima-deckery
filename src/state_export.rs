@@ -791,6 +791,117 @@ mod tests {
         );
     }
 
+    // ── label lifecycle across merge ─────────────────────────────────────────
+
+    /// When an override replaces a binding, the base label must not appear —
+    /// "Previous Desktop" should not label a Reload action.
+    #[test]
+    fn override_clears_base_label() {
+        let btn_tl = key(Key::BTN_TL);
+        let btn_up = key(Key::BTN_DPAD_UP);
+        let combo  = vec![btn_tl];
+
+        let mut base_bindings = {
+            let mut cmds: HashMap<Event, HashMap<Vec<Event>, Vec<String>>> = HashMap::new();
+            cmds.entry(btn_up).or_default()
+                .insert(combo.clone(), vec!["previous-desktop".to_string()]);
+            crate::config::Bindings { commands: cmds, ..Default::default() }
+        };
+        base_bindings.labels.insert((btn_up, combo.clone()), "Previous Desktop".to_string());
+
+        let base = Config {
+            name: "Steam Deck".to_string(),
+            associations: Default::default(),
+            bindings: base_bindings,
+            override_bindings: None,
+            settings: HashMap::new(),
+            mapped_modifiers: crate::config::MappedModifiers {
+                custom: vec![btn_tl], all: vec![btn_tl], default: vec![],
+            },
+        };
+
+        // Override replaces with a remap, no label defined.
+        let mut app_remap: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+        app_remap.entry(btn_up).or_default()
+            .insert(combo.clone(), vec![Key::KEY_LEFTCTRL, Key::KEY_R]);
+        let mut app = Config {
+            name: "firefox".to_string(),
+            associations: Default::default(),
+            bindings: crate::config::Bindings { remap: app_remap, ..Default::default() },
+            override_bindings: None,
+            settings: HashMap::new(),
+            mapped_modifiers: Default::default(),
+        };
+
+        app.merge_base(&base);
+
+        let state = build_state(
+            &app, &[btn_tl], 0, false, &[], &None,
+            &["Steam Deck".to_string(), "firefox".to_string()],
+        );
+
+        // label must be null, not "Previous Desktop"
+        assert!(
+            state["modifier_active"]["BTN_DPAD_UP"]["label"].is_null(),
+            "stale base label must not appear after action is overridden"
+        );
+    }
+
+    /// When an override defines its own label, it appears in place of the base label.
+    #[test]
+    fn override_label_replaces_base_label() {
+        let btn_tl = key(Key::BTN_TL);
+        let btn_up = key(Key::BTN_DPAD_UP);
+        let combo  = vec![btn_tl];
+
+        let mut base_bindings = {
+            let mut cmds: HashMap<Event, HashMap<Vec<Event>, Vec<String>>> = HashMap::new();
+            cmds.entry(btn_up).or_default()
+                .insert(combo.clone(), vec!["previous-desktop".to_string()]);
+            crate::config::Bindings { commands: cmds, ..Default::default() }
+        };
+        base_bindings.labels.insert((btn_up, combo.clone()), "Previous Desktop".to_string());
+
+        let base = Config {
+            name: "Steam Deck".to_string(),
+            associations: Default::default(),
+            bindings: base_bindings,
+            override_bindings: None,
+            settings: HashMap::new(),
+            mapped_modifiers: crate::config::MappedModifiers {
+                custom: vec![btn_tl], all: vec![btn_tl], default: vec![],
+            },
+        };
+
+        // Override replaces with a remap AND defines its own label.
+        let mut app_remap: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+        app_remap.entry(btn_up).or_default()
+            .insert(combo.clone(), vec![Key::KEY_LEFTCTRL, Key::KEY_R]);
+        let mut app_bindings = crate::config::Bindings { remap: app_remap, ..Default::default() };
+        app_bindings.labels.insert((btn_up, combo.clone()), "Reload".to_string());
+        let mut app = Config {
+            name: "firefox".to_string(),
+            associations: Default::default(),
+            bindings: app_bindings,
+            override_bindings: None,
+            settings: HashMap::new(),
+            mapped_modifiers: Default::default(),
+        };
+
+        app.merge_base(&base);
+
+        let state = build_state(
+            &app, &[btn_tl], 0, false, &[], &None,
+            &["Steam Deck".to_string(), "firefox".to_string()],
+        );
+
+        assert_eq!(
+            state["modifier_active"]["BTN_DPAD_UP"]["label"].as_str(),
+            Some("Reload"),
+            "override label must appear in modifier_active"
+        );
+    }
+
     // ── origin: base config vs. app-specific override ─────────────────────────
 
     #[test]
