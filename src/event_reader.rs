@@ -1,5 +1,6 @@
 use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, Relative, Scroll};
+use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::udev_monitor::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
@@ -1122,110 +1123,48 @@ impl EventReader {
         }
         // ───────────────────────────────────────────────────────────────────────
 
-        if let Some(map) = config.bindings.remap.get(&event) {
-            if let Some(event_list) = map.get(&modifiers) {
-                let is_no_pause = config.bindings.no_pause.contains(&(event, modifiers.clone()))
-                    || config.bindings.no_pause.contains(&(event, vec![]));
-                self.set_last_emitted(&event, event_list, value, !modifiers.is_empty(), config.bindings.labels.get(&(event, modifiers.clone())).cloned()).await;
-                self.emit_event(
-                    event_list,
-                    value,
-                    &modifiers,
-                    &config,
-                    modifiers.is_empty(),
-                    !modifiers.is_empty(),
-                    is_no_pause,
-                )
-                .await;
+        match resolve_binding(&config.bindings, event, &modifiers, self.settings.chain_only) {
+            ResolvedBinding::Keys { keys, label, no_pause, is_combo, is_fallback } => {
+                // release_keys: release held modifier output keys before emitting.
+                //   true  → base binding with no modifiers held (normal press)
+                //   false → combo or fallback; modifier keys must stay held
+                // ignore_modifiers: don't re-emit modifier output keys after the action.
+                //   true  → explicit combo (modifier was "consumed" by the combo)
+                //   false → fallback or base binding (modifier remains independent)
+                let release_keys    = !is_combo && !is_fallback;
+                let ignore_modifiers = is_combo;
+                self.set_last_emitted(&event, &keys, value, is_combo, label).await;
+                self.emit_event(&keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
                 if send_zero {
                     let mut modifiers = self.modifiers.lock().await.clone();
                     modifiers.sort();
                     modifiers.dedup();
-                    self.emit_event(
-                        event_list,
-                        0,
-                        &modifiers,
-                        &config,
-                        modifiers.is_empty(),
-                        !modifiers.is_empty(),
-                        is_no_pause,
-                    )
-                    .await;
+                    self.emit_event(&keys, 0, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
                 }
                 return;
             }
-            if let Some(event_list) = map.get(&vec![Event::Hold]) {
-                if !modifiers.is_empty() || self.settings.chain_only == false {
-                    self.emit_event(event_list, value, &modifiers, &config, false, false, false)
-                        .await;
-                    return;
-                }
-            }
-            if let Some(map) = config.bindings.commands.get(&event) {
-                if let Some(command_list) = map.get(&modifiers) {
-                    let is_no_pause = config.bindings.no_pause.contains(&(event, modifiers.clone()))
-                        || config.bindings.no_pause.contains(&(event, vec![]));
-                    if value == 1 {
-                        self.set_last_emitted_cmd(&event, command_list, config.bindings.labels.get(&(event, modifiers.clone())).cloned()).await;
-                        if !paused || is_no_pause {
-                            self.spawn_subprocess(command_list).await
-                        }
-                    } else {
-                        self.write_state().await;
-                    }
-                    return;
-                }
-            }
-            if let Some(map) = config.bindings.movements.get(&event) {
-                if let Some(movement) = map.get(&modifiers) {
-                    if value <= 1 {
-                        self.emit_movement(movement, value).await;
-                    }
-                    return;
-                };
-            }
-            if let Some(event_list) = map.get(&Vec::new()) {
-                let is_no_pause = config.bindings.no_pause.contains(&(event, vec![]));
-                self.set_last_emitted(&event, event_list, value, false, config.bindings.labels.get(&(event, vec![])).cloned()).await;
-                // Fallback to base binding: no combo defined for the current modifier set.
-                // Do NOT release the held modifier keys — the modifier is already held at
-                // system level and should stay held (e.g. L1+A → Ctrl+Enter, not Enter).
-                self.emit_event(event_list, value, &modifiers, &config, false, false, is_no_pause)
-                    .await;
-                if send_zero {
-                    let mut modifiers = self.modifiers.lock().await.clone();
-                    modifiers.sort();
-                    modifiers.dedup();
-                    self.emit_event(event_list, 0, &modifiers, &config, false, false, is_no_pause)
-                        .await;
-                }
+            ResolvedBinding::Hold { keys } => {
+                self.emit_event(&keys, value, &modifiers, &config, false, false, false).await;
                 return;
             }
-        }
-        if let Some(map) = config.bindings.commands.get(&event) {
-            if let Some(command_list) = map.get(&modifiers) {
-                let is_no_pause = config.bindings.no_pause.contains(&(event, modifiers.clone()))
-                    || config.bindings.no_pause.contains(&(event, vec![]));
+            ResolvedBinding::Command { commands, label, no_pause, .. } => {
                 if value == 1 {
-                    self.set_last_emitted_cmd(&event, command_list, config.bindings.labels.get(&(event, modifiers.clone())).cloned()).await;
-                    if !paused || is_no_pause {
-                        self.spawn_subprocess(command_list).await
+                    self.set_last_emitted_cmd(&event, &commands, label).await;
+                    if !paused || no_pause {
+                        self.spawn_subprocess(&commands).await;
                     }
                 } else {
                     self.write_state().await;
                 }
                 return;
             }
-        }
-        if let Some(map) = config.bindings.movements.get(&event) {
-            if let Some(movement) = map.get(&modifiers) {
-                if value <= 1 {
-                    if !paused {
-                        self.emit_movement(movement, value).await;
-                    }
+            ResolvedBinding::Movement { movement, .. } => {
+                if value <= 1 && !paused {
+                    self.emit_movement(&movement, value).await;
                 }
                 return;
-            };
+            }
+            ResolvedBinding::Unbound => {}
         }
         if let Some(map) = &self.settings.layout_switcher {
             if map.0 == event && map.1 == modifiers && value == 1 {
