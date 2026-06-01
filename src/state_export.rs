@@ -718,6 +718,79 @@ mod tests {
             "indirect modifier detection: BTN_NORTH combo should appear when KEY_LEFTCTRL held");
     }
 
+    // ── override: command→remap type change doesn't leak base command ─────────
+
+    #[test]
+    fn override_remap_hides_base_command() {
+        // Base: BTN_TL-BTN_DPAD_UP = command "previous-desktop"
+        // Override (firefox): BTN_TL-BTN_DPAD_UP = remap [KEY_LEFTCTRL, KEY_R]
+        //
+        // After merge_base(), modifier_active must show the remap, NOT the command.
+        // Before the fix, merge_base() let both coexist; the command loop in
+        // build_state then overwrote the remap entry in modifier_active.
+        let btn_tl     = key(Key::BTN_TL);
+        let btn_dpad_up = key(Key::BTN_DPAD_UP);
+        let combo       = vec![btn_tl];
+
+        // Base config: BTN_TL-BTN_DPAD_UP → command
+        let base = {
+            let mut commands: HashMap<Event, HashMap<Vec<Event>, Vec<String>>> = HashMap::new();
+            commands.entry(btn_dpad_up).or_default()
+                .insert(combo.clone(), vec!["previous-desktop".to_string()]);
+            Config {
+                name: "Steam Deck".to_string(),
+                associations: Default::default(),
+                bindings: crate::config::Bindings {
+                    commands,
+                    ..Default::default()
+                },
+                override_bindings: None,
+                settings: HashMap::new(),
+                mapped_modifiers: crate::config::MappedModifiers {
+                    default: vec![],
+                    custom: vec![btn_tl],
+                    all: vec![btn_tl],
+                },
+            }
+        };
+
+        // App config: BTN_TL-BTN_DPAD_UP → remap (overrides base command)
+        let mut app = {
+            let mut remap: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+            remap.entry(btn_dpad_up).or_default()
+                .insert(combo.clone(), vec![Key::KEY_LEFTCTRL, Key::KEY_R]);
+            Config {
+                name: "firefox".to_string(),
+                associations: Default::default(),
+                bindings: crate::config::Bindings {
+                    remap,
+                    ..Default::default()
+                },
+                override_bindings: None,
+                settings: HashMap::new(),
+                mapped_modifiers: Default::default(),
+            }
+        };
+
+        // This is the actual code path that runs at runtime.
+        app.merge_base(&base);
+
+        let state = build_state(
+            &app, &[btn_tl], 0, false, &[], &None,
+            &["Steam Deck".to_string(), "firefox".to_string()],
+        );
+
+        assert_eq!(
+            state["modifier_active"]["BTN_DPAD_UP"]["kind"].as_str().unwrap(),
+            "remap",
+            "modifier_active must show the override remap, not the inherited command"
+        );
+        assert_eq!(
+            state["modifier_active"]["BTN_DPAD_UP"]["action"][0].as_str().unwrap(),
+            "KEY_LEFTCTRL",
+        );
+    }
+
     // ── origin: base config vs. app-specific override ─────────────────────────
 
     #[test]

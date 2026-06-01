@@ -225,21 +225,48 @@ impl Config {
         self.override_bindings = Some(self.bindings.clone());
 
         for (trigger, modifier_map) in &base.bindings.remap {
-            let entry = self.bindings.remap.entry(*trigger).or_insert_with(HashMap::new);
             for (combo, actions) in modifier_map {
-                entry.entry(combo.clone()).or_insert_with(|| actions.clone());
+                // Don't inherit base remap if override already handles this
+                // trigger+combo as a command or movement.
+                let already_command = self.bindings.commands
+                    .get(trigger).and_then(|m| m.get(combo)).is_some();
+                let already_movement = self.bindings.movements
+                    .get(trigger).and_then(|m| m.get(combo)).is_some();
+                if !already_command && !already_movement {
+                    self.bindings.remap
+                        .entry(*trigger).or_insert_with(HashMap::new)
+                        .entry(combo.clone()).or_insert_with(|| actions.clone());
+                }
             }
         }
         for (trigger, modifier_map) in &base.bindings.commands {
-            let entry = self.bindings.commands.entry(*trigger).or_insert_with(HashMap::new);
             for (combo, cmds) in modifier_map {
-                entry.entry(combo.clone()).or_insert_with(|| cmds.clone());
+                // Don't inherit base command if override already handles this
+                // trigger+combo as a remap or movement.
+                let already_remap = self.bindings.remap
+                    .get(trigger).and_then(|m| m.get(combo)).is_some();
+                let already_movement = self.bindings.movements
+                    .get(trigger).and_then(|m| m.get(combo)).is_some();
+                if !already_remap && !already_movement {
+                    self.bindings.commands
+                        .entry(*trigger).or_insert_with(HashMap::new)
+                        .entry(combo.clone()).or_insert_with(|| cmds.clone());
+                }
             }
         }
         for (trigger, modifier_map) in &base.bindings.movements {
-            let entry = self.bindings.movements.entry(*trigger).or_insert_with(HashMap::new);
             for (combo, movement) in modifier_map {
-                entry.entry(combo.clone()).or_insert_with(|| *movement);
+                // Don't inherit base movement if override already handles this
+                // trigger+combo as a remap or command.
+                let already_remap = self.bindings.remap
+                    .get(trigger).and_then(|m| m.get(combo)).is_some();
+                let already_command = self.bindings.commands
+                    .get(trigger).and_then(|m| m.get(combo)).is_some();
+                if !already_remap && !already_command {
+                    self.bindings.movements
+                        .entry(*trigger).or_insert_with(HashMap::new)
+                        .entry(combo.clone()).or_insert_with(|| *movement);
+                }
             }
         }
         for key in &base.mapped_modifiers.custom {
@@ -613,5 +640,122 @@ pub fn parse_modifiers(settings: &HashMap<String, String>, parameter: &str) -> V
             custom_modifiers
         }
         None => Vec::new(),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::Key;
+
+    fn key(k: Key) -> Event { Event::Key(k) }
+
+    fn make_remap_bindings(entries: Vec<(Event, Vec<Event>, Vec<Key>)>) -> Bindings {
+        let mut remap: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+        for (trigger, combo, keys) in entries {
+            remap.entry(trigger).or_default().insert(combo, keys);
+        }
+        Bindings { remap, ..Default::default() }
+    }
+
+    fn make_command_bindings(entries: Vec<(Event, Vec<Event>, Vec<String>)>) -> Bindings {
+        let mut commands: HashMap<Event, HashMap<Vec<Event>, Vec<String>>> = HashMap::new();
+        for (trigger, combo, cmds) in entries {
+            commands.entry(trigger).or_default().insert(combo, cmds);
+        }
+        Bindings { commands, ..Default::default() }
+    }
+
+    fn config_with(name: &str, bindings: Bindings) -> Config {
+        Config {
+            name: name.to_string(),
+            associations: Default::default(),
+            bindings,
+            override_bindings: None,
+            settings: HashMap::new(),
+            mapped_modifiers: Default::default(),
+        }
+    }
+
+    // ── merge_base: cross-type override prevention ────────────────────────────
+
+    /// Firefox overrides BTN_TL-BTN_DPAD_UP from command (base) → remap (override).
+    /// After merge, the base command must NOT appear — only the override remap.
+    #[test]
+    fn merge_base_command_to_remap_override() {
+        let btn_tl = key(Key::BTN_TL);
+        let btn_up = key(Key::BTN_DPAD_UP);
+        let combo  = vec![btn_tl];
+
+        let base = config_with("Steam Deck", make_command_bindings(vec![
+            (btn_up, combo.clone(), vec!["previous-desktop".to_string()]),
+        ]));
+        let mut app = config_with("firefox", make_remap_bindings(vec![
+            (btn_up, combo.clone(), vec![Key::KEY_LEFTCTRL, Key::KEY_R]),
+        ]));
+
+        app.merge_base(&base);
+
+        assert!(
+            app.bindings.remap.get(&btn_up).and_then(|m| m.get(&combo)).is_some(),
+            "override remap must survive merge"
+        );
+        assert!(
+            app.bindings.commands.get(&btn_up).and_then(|m| m.get(&combo)).is_none(),
+            "base command must not leak when override defines a remap for the same combo"
+        );
+    }
+
+    /// Symmetric: override defines a command where base had a remap.
+    #[test]
+    fn merge_base_remap_to_command_override() {
+        let btn_tl = key(Key::BTN_TL);
+        let btn_up = key(Key::BTN_DPAD_UP);
+        let combo  = vec![btn_tl];
+
+        let base = config_with("Steam Deck", make_remap_bindings(vec![
+            (btn_up, combo.clone(), vec![Key::KEY_UP]),
+        ]));
+        let mut app = config_with("myapp", make_command_bindings(vec![
+            (btn_up, combo.clone(), vec!["do-something".to_string()]),
+        ]));
+
+        app.merge_base(&base);
+
+        assert!(
+            app.bindings.commands.get(&btn_up).and_then(|m| m.get(&combo)).is_some(),
+            "override command must survive merge"
+        );
+        assert!(
+            app.bindings.remap.get(&btn_up).and_then(|m| m.get(&combo)).is_none(),
+            "base remap must not leak when override defines a command for the same combo"
+        );
+    }
+
+    /// Unrelated combos from the base must still be inherited normally.
+    #[test]
+    fn merge_base_unrelated_combos_inherited() {
+        let btn_tl   = key(Key::BTN_TL);
+        let btn_up   = key(Key::BTN_DPAD_UP);
+        let btn_down = key(Key::BTN_DPAD_DOWN);
+
+        let base = config_with("Steam Deck", make_command_bindings(vec![
+            (btn_up,   vec![btn_tl], vec!["prev-desktop".to_string()]),
+            (btn_down, vec![btn_tl], vec!["next-desktop".to_string()]),
+        ]));
+        // Override only changes btn_up; btn_down must be inherited unchanged.
+        let mut app = config_with("firefox", make_remap_bindings(vec![
+            (btn_up, vec![btn_tl], vec![Key::KEY_LEFTCTRL, Key::KEY_R]),
+        ]));
+
+        app.merge_base(&base);
+
+        assert!(
+            app.bindings.commands
+                .get(&btn_down).and_then(|m| m.get(&vec![btn_tl])).is_some(),
+            "unrelated base command (btn_down) must be inherited"
+        );
     }
 }
