@@ -8,6 +8,7 @@
 // all Arc/Mutex locking and passes plain values here.
 
 use crate::config::Event;
+use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::Config;
 use evdev::Key;
 use serde::Serialize;
@@ -59,9 +60,13 @@ fn modifier_sort_key(key: &str) -> (u8, String) {
     (rank, key.to_owned())
 }
 
-// ── Main export function ──────────────────────────────────────────────────────
+// ── Pure state builder ────────────────────────────────────────────────────────
 
-pub async fn write_state(
+/// Build the full state snapshot as a JSON value.
+///
+/// Pure and side-effect-free — no I/O. Extracted from write_state so it can
+/// be called from unit tests without touching the filesystem.
+pub fn build_state(
     config: &Config,
     modifiers: &[Event],
     layout: u16,
@@ -69,7 +74,7 @@ pub async fn write_state(
     held_keys: &[Event],
     last_action: &Option<LastAction>,
     config_stack: &[String],
-) {
+) -> serde_json::Value {
     // Determine the origin name for a given trigger+combo.
     // If this config has override_bindings (i.e. it's an app-specific config
     // that was merged with a base), check whether the binding existed in the
@@ -278,42 +283,27 @@ pub async fn write_state(
     let active_buttons: Vec<String> = held_keys.iter().map(event_to_str).collect();
 
     // active_outputs: the union of all evdev output keys currently being held,
-    // derived from held_keys + current modifier context.
+    // derived from held_keys + current modifier context via resolve_binding().
     // Used by the HUD to highlight active system-level keys in the center strip.
+    let chain_only = config.settings
+        .get("CHAIN_ONLY")
+        .map(|v| v == "true")
+        .unwrap_or(true);
     let mut sorted_mods = modifiers.to_vec();
     sorted_mods.sort();
     sorted_mods.dedup();
     let mut active_outputs: Vec<String> = Vec::new();
     for held_event in held_keys {
-        if let Some(modifier_map) = config.bindings.remap.get(held_event) {
-            // If a combo remap exists for the current modifier set, use it.
-            if let Some(keys) = modifier_map.get(&sorted_mods) {
-                for k in keys {
-                    active_outputs.push(format!("{:?}", k));
-                }
-                continue;
-            }
-            // If a combo command or movement handles this button+modifier combination,
-            // no keys are sent — don't fall back to the base remap output.
-            if !sorted_mods.is_empty() {
-                let command_handles = config.bindings.commands
-                    .get(held_event)
-                    .and_then(|m| m.get(&sorted_mods))
-                    .is_some();
-                let movement_handles = config.bindings.movements
-                    .get(held_event)
-                    .and_then(|m| m.get(&sorted_mods))
-                    .is_some();
-                if command_handles || movement_handles {
-                    continue;
-                }
-            }
-            // No combo override — fall back to base remap (e.g. Ctrl+Up via held Ctrl).
-            if let Some(keys) = modifier_map.get(&vec![]) {
-                for k in keys {
+        match resolve_binding(&config.bindings, *held_event, &sorted_mods, chain_only) {
+            ResolvedBinding::Keys { keys, .. } => {
+                for k in &keys {
                     active_outputs.push(format!("{:?}", k));
                 }
             }
+            // Command or movement handles this event — no key output.
+            ResolvedBinding::Command { .. } | ResolvedBinding::Movement { .. } => {}
+            // Hold binding or unbound — no keys to add.
+            ResolvedBinding::Hold { .. } | ResolvedBinding::Unbound => {}
         }
     }
     active_outputs.sort_by_key(|k| modifier_sort_key(k.as_str()));
@@ -335,10 +325,6 @@ pub async fn write_state(
         .iter()
         .filter(|m| !active_input_mods.contains(m))
         .filter(|m| {
-            // A modifier m is available if there exists a combo C where:
-            // - m ∈ C
-            // - all currently held modifiers are in C (active_input_mods ⊆ C)
-            // This means pressing m (possibly with others) could unlock a binding.
             all_combos.iter().any(|combo| {
                 combo.contains(m)
                     && active_input_mods.iter().all(|held| combo.contains(held))
@@ -349,7 +335,7 @@ pub async fn write_state(
     available_modifiers.sort();
     available_modifiers.dedup();
 
-    let state = serde_json::json!({
+    serde_json::json!({
         "context": {
             "config_stack": config_stack,
             "layout": layout,
@@ -362,7 +348,21 @@ pub async fn write_state(
         "last_action": last_action,
         "bindings": bindings,
         "modifier_active": modifier_active,
-    });
+    })
+}
+
+// ── Main export function ──────────────────────────────────────────────────────
+
+pub async fn write_state(
+    config: &Config,
+    modifiers: &[Event],
+    layout: u16,
+    paused: bool,
+    held_keys: &[Event],
+    last_action: &Option<LastAction>,
+    config_stack: &[String],
+) {
+    let state = build_state(config, modifiers, layout, paused, held_keys, last_action, config_stack);
 
     let tmp_path = "/tmp/makima-state.json.tmp";
     let final_path = "/tmp/makima-state.json";
@@ -373,5 +373,211 @@ pub async fn write_state(
             }
         }
         Err(e) => eprintln!("makima: state export failed: {}", e),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Bindings, Event, MappedModifiers};
+    use crate::Config;
+    use evdev::Key;
+    use std::collections::{HashMap, HashSet};
+
+    fn key(k: Key) -> Event { Event::Key(k) }
+
+    /// Build a minimal Config with the given bindings and custom modifiers.
+    fn make_config(
+        remap: Vec<(Event, Vec<Event>, Vec<Key>)>,
+        commands: Vec<(Event, Vec<Event>, Vec<String>)>,
+        custom_modifiers: Vec<Event>,
+    ) -> Config {
+        let mut remap_map: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+        for (trigger, combo, keys) in remap {
+            remap_map.entry(trigger).or_default().insert(combo, keys);
+        }
+        let mut cmd_map: HashMap<Event, HashMap<Vec<Event>, Vec<String>>> = HashMap::new();
+        for (trigger, combo, cmds) in commands {
+            cmd_map.entry(trigger).or_default().insert(combo, cmds);
+        }
+        let all_mods = custom_modifiers.clone();
+        Config {
+            name: "test".to_string(),
+            associations: Default::default(),
+            bindings: Bindings {
+                remap: remap_map,
+                commands: cmd_map,
+                movements: HashMap::new(),
+                no_pause: HashSet::new(),
+                labels: HashMap::new(),
+            },
+            override_bindings: None,
+            settings: HashMap::new(),
+            mapped_modifiers: MappedModifiers {
+                default: vec![],
+                custom: custom_modifiers,
+                all: all_mods,
+            },
+        }
+    }
+
+    fn active_outputs(state: &serde_json::Value) -> Vec<String> {
+        state["context"]["active_outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn available_modifiers(state: &serde_json::Value) -> Vec<String> {
+        state["context"]["available_modifiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn modifier_active_keys(state: &serde_json::Value) -> Vec<String> {
+        state["modifier_active"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    // ── active_outputs ────────────────────────────────────────────────────────
+
+    #[test]
+    fn active_outputs_base_remap() {
+        // BTN_SOUTH → KEY_ENTER, no modifiers held.
+        let config = make_config(
+            vec![(key(Key::BTN_SOUTH), vec![], vec![Key::KEY_ENTER])],
+            vec![], vec![],
+        );
+        let state = build_state(&config, &[], 0, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()]);
+        assert_eq!(active_outputs(&state), vec!["KEY_ENTER"]);
+    }
+
+    #[test]
+    fn active_outputs_combo_remap() {
+        // BTN_TL-BTN_NORTH → [KEY_LEFTCTRL, KEY_C]. BTN_TL held as modifier.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_north = key(Key::BTN_NORTH);
+        let config = make_config(
+            vec![(btn_north, vec![btn_tl], vec![Key::KEY_LEFTCTRL, Key::KEY_C])],
+            vec![], vec![btn_tl],
+        );
+        // modifiers = [BTN_TL], held_keys = [BTN_NORTH]
+        let state = build_state(&config, &[btn_tl], 0, false, &[btn_north], &None, &["test".to_string()]);
+        // KEY_LEFTCTRL sorts before KEY_C
+        assert_eq!(active_outputs(&state), vec!["KEY_LEFTCTRL", "KEY_C"]);
+    }
+
+    #[test]
+    fn active_outputs_fallback_remap() {
+        // BTN_SOUTH has base remap KEY_ENTER but no BTN_TL combo.
+        // Holding BTN_TL should fall back to KEY_ENTER (the Ctrl+Enter scenario).
+        let btn_tl = key(Key::BTN_TL);
+        let btn_south = key(Key::BTN_SOUTH);
+        let config = make_config(
+            vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
+            vec![], vec![btn_tl],
+        );
+        let state = build_state(&config, &[btn_tl], 0, false, &[btn_south], &None, &["test".to_string()]);
+        assert_eq!(active_outputs(&state), vec!["KEY_ENTER"]);
+    }
+
+    #[test]
+    fn active_outputs_command_suppresses_remap() {
+        // BTN_DPAD_UP has base remap KEY_UP, but BTN_TL-BTN_DPAD_UP is a command.
+        // When BTN_TL held + BTN_DPAD_UP pressed, no key output (command takes over).
+        let btn_tl = key(Key::BTN_TL);
+        let btn_dpad_up = key(Key::BTN_DPAD_UP);
+        let config = make_config(
+            vec![(btn_dpad_up, vec![], vec![Key::KEY_UP])],
+            vec![(btn_dpad_up, vec![btn_tl], vec!["previous-desktop".to_string()])],
+            vec![btn_tl],
+        );
+        let state = build_state(&config, &[btn_tl], 0, false, &[btn_dpad_up], &None, &["test".to_string()]);
+        assert_eq!(active_outputs(&state), Vec::<String>::new());
+    }
+
+    #[test]
+    fn active_outputs_unbound_is_empty() {
+        let config = make_config(vec![], vec![], vec![]);
+        let state = build_state(&config, &[], 0, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()]);
+        assert_eq!(active_outputs(&state), Vec::<String>::new());
+    }
+
+    // ── available_modifiers ───────────────────────────────────────────────────
+
+    #[test]
+    fn available_modifiers_shows_both_when_none_held() {
+        // Config has BTN_TL and BTN_TR combos. With no mods held, both should appear.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_tr = key(Key::BTN_TR);
+        let btn_north = key(Key::BTN_NORTH);
+        let config = make_config(
+            vec![
+                (btn_north, vec![btn_tl], vec![Key::KEY_LEFTCTRL, Key::KEY_C]),
+                (btn_north, vec![btn_tr], vec![Key::KEY_F5]),
+            ],
+            vec![], vec![btn_tl, btn_tr],
+        );
+        let state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        let mut avail = available_modifiers(&state);
+        avail.sort();
+        assert!(avail.contains(&"BTN_TL".to_string()));
+        assert!(avail.contains(&"BTN_TR".to_string()));
+    }
+
+    #[test]
+    fn available_modifiers_filters_satisfied() {
+        // BTN_TL held. BTN_TL-only combos are now active (satisfied).
+        // BTN_TR has a BTN_TL-BTN_TR combo → should still appear as available.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_tr = key(Key::BTN_TR);
+        let btn_north = key(Key::BTN_NORTH);
+        let btn_south = key(Key::BTN_SOUTH);
+        let config = make_config(
+            vec![
+                (btn_north, vec![btn_tl], vec![Key::KEY_LEFTCTRL, Key::KEY_C]),
+                (btn_south, vec![btn_tl, btn_tr], vec![Key::KEY_F1]),
+            ],
+            vec![], vec![btn_tl, btn_tr],
+        );
+        // BTN_TL is active_input_mod → filtered out of available_modifiers.
+        // BTN_TR qualifies because BTN_TL-BTN_TR-BTN_SOUTH exists and BTN_TL ⊆ that combo.
+        let state = build_state(&config, &[btn_tl], 0, false, &[], &None, &["test".to_string()]);
+        let avail = available_modifiers(&state);
+        assert!(!avail.contains(&"BTN_TL".to_string()), "BTN_TL is already active");
+        assert!(avail.contains(&"BTN_TR".to_string()), "BTN_TR unlocks a BTN_TL+BTN_TR combo");
+    }
+
+    // ── modifier_active ───────────────────────────────────────────────────────
+
+    #[test]
+    fn modifier_active_exact_match_only() {
+        // BTN_TL held. Should show BTN_TL combos but NOT BTN_TL-BTN_TR combos.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_tr = key(Key::BTN_TR);
+        let btn_north = key(Key::BTN_NORTH);
+        let btn_south = key(Key::BTN_SOUTH);
+        let config = make_config(
+            vec![
+                (btn_north, vec![btn_tl], vec![Key::KEY_LEFTCTRL, Key::KEY_C]),
+                (btn_south, vec![btn_tl, btn_tr], vec![Key::KEY_F1]),
+            ],
+            vec![], vec![btn_tl, btn_tr],
+        );
+        let state = build_state(&config, &[btn_tl], 0, false, &[], &None, &["test".to_string()]);
+        let keys = modifier_active_keys(&state);
+        assert!(keys.contains(&"BTN_NORTH".to_string()), "BTN_TL-BTN_NORTH should appear");
+        assert!(!keys.contains(&"BTN_SOUTH".to_string()), "BTN_TL-BTN_TR-BTN_SOUTH must not leak in");
     }
 }
