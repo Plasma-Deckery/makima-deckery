@@ -1267,7 +1267,12 @@ impl EventReader {
         }
         let mut virt_dev = self.virt_dev.lock().await;
         let mut modifier_was_activated = self.modifier_was_activated.lock().await;
-        if release_keys && value != 2 {
+        if release_keys && value != 2 && !modifiers.is_empty() {
+            // Only release previous modifier outputs when there are actually modifiers
+            // held. With an empty modifier set there is nothing to clean up, and
+            // iterating released_keys(&[]) would spuriously release system modifier
+            // keys (e.g. KEY_LEFTSHIFT from a back-paddle remap) that happen to share
+            // their key code with a base remap output.
             let released_keys: Vec<Key> = self.released_keys(&modifiers, &config).await;
             for key in released_keys {
                 if config.mapped_modifiers.all.contains(&Event::Key(key)) {
@@ -1302,8 +1307,15 @@ impl EventReader {
         }
         for key in event_list {
             if release_keys && value != 2 {
-                self.toggle_modifiers(Event::Key(*key), value, &config)
-                    .await;
+                // Only track CUSTOM_MODIFIERS in self.modifiers — not system modifier
+                // keys like KEY_LEFTSHIFT/CTRL/ALT that appear as remap outputs.
+                // Tracking system modifiers corrupts the modifier state and breaks
+                // subsequent combo lookups (e.g. pressing Shift after a combo would
+                // leave KEY_LEFTSHIFT stuck in self.modifiers).
+                if config.mapped_modifiers.custom.contains(&Event::Key(*key)) {
+                    self.toggle_modifiers(Event::Key(*key), value, &config)
+                        .await;
+                }
             }
             if config.mapped_modifiers.custom.contains(&Event::Key(*key)) {
                 if value == 0 && !*modifier_was_activated {
