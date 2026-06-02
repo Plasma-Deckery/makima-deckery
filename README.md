@@ -56,6 +56,34 @@ GRAB_DEVICE = "false"
 
 ---
 
+### Trackpad emulation as system touchpads
+
+With `LPAD = "trackpad"` or `RPAD = "trackpad"` in the config, makima translates the raw Steam Deck trackpad axes into proper Linux multi-touch events and exposes them as standard uinput touchpad devices — `Deckery Left Trackpad` and `Deckery Right Trackpad`.
+
+The Steam Deck kernel driver (`hid-steam`) delivers trackpad data as absolute axes on the gamepad device:
+
+```
+ABS_HAT0X / ABS_HAT0Y  →  left trackpad position  (−32767 … +32767)
+ABS_HAT1X / ABS_HAT1Y  →  right trackpad position
+BTN_THUMB              →  left trackpad physical click
+BTN_THUMB2             →  right trackpad physical click
+```
+
+makima translates these to `ABS_MT_POSITION_X/Y` + `BTN_TOUCH` + `BTN_TOOL_FINGER` frames on the virtual device, with Y-axis corrected to libinput convention (hardware reports up as negative; the virtual device flips this). Once the virtual device exists, libinput takes over completely — KDE touchpad settings, tap-to-click, edge scroll, pointer acceleration, and tools like `libinput-gestures` all work without any additional configuration.
+
+```toml
+[settings]
+LPAD = "trackpad"   # creates "Deckery Left Trackpad" virtual MT device
+RPAD = "trackpad"   # creates "Deckery Right Trackpad" virtual MT device
+# LPAD = "disabled" # default — no virtual device, but position is still tracked in state.json
+```
+
+Trackpad position, touch state, and press state are always tracked and exported to `state.json` regardless of the mode setting — the HUD can visualize trackpad input even when `"disabled"`.
+
+> **Note:** Full Steam independence requires suppressing the kernel driver's Lizard Mode (its built-in mouse/scroll fallback). While Steam is running it handles this automatically. Makima-native Lizard Mode suppression is planned for Phase 2 (`GRAB_DEVICE = "true"`).
+
+---
+
 ### State export → `/tmp/makima-state.json`
 
 On every config or modifier change, makima writes a fully-resolved state snapshot to `/tmp/makima-state.json`. This allows the Deckery HUD overlay to display live button mappings without re-implementing any of makima's lookup logic.
