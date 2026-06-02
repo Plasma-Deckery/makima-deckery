@@ -483,6 +483,10 @@ impl EventReader {
         // avoiding spurious re-emits on SYNs caused by other axes (stick, triggers, etc.)
         let mut lpad_dirty = false;
         let mut rpad_dirty = false;
+        // Rate-limit state.json writes from trackpad movement to ~60 Hz.
+        let mut last_trackpad_state_write = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(17))
+            .unwrap_or(std::time::Instant::now());
         while let Some(event_result) = stream.next().await {
             let event = match event_result {
                 Ok(e) => e,
@@ -1149,6 +1153,7 @@ impl EventReader {
                     // but only when new HAT data actually arrived (dirty flag).
                     // Without this guard, every SYN from sticks/triggers would re-emit the
                     // trackpad position, confusing libinput's velocity calculation.
+                    let pad_changed = lpad_dirty || rpad_dirty;
                     if lpad_dirty {
                         lpad_dirty = false;
                         let (x, y) = *self.lpad_position.lock().await;
@@ -1158,6 +1163,11 @@ impl EventReader {
                         rpad_dirty = false;
                         let (x, y) = *self.rpad_position.lock().await;
                         self.emit_trackpad_event(false, x, y, None).await;
+                    }
+                    // Write state.json on trackpad movement, rate-limited to ~60 Hz.
+                    if pad_changed && last_trackpad_state_write.elapsed().as_millis() >= 16 {
+                        last_trackpad_state_write = std::time::Instant::now();
+                        self.write_state().await;
                     }
                 }
                 _ => self.emit_default_event(event).await,
