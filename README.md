@@ -3,11 +3,26 @@
 > **Deckery-specific fork of [cyber-sushi/makima](https://github.com/cyber-sushi/makima).**
 > For installation, configuration and general usage see the [upstream README](https://github.com/cyber-sushi/makima#readme).
 
-This fork is maintained as part of the [Plasma Deckery](https://github.com/Plasma-Deckery) project — a Steam-independent input stack for the Steam Deck in desktop mode.
+This fork is maintained as part of the [Plasma Deckery](https://github.com/Plasma-Deckery) project — a Steam-independent input stack for the Steam Deck in desktop mode. The scope of makima is extended here to meet the requirements of a handheld device: hardware-specific input translation, live UI integration, and analog sensor export.
 
 ---
 
 ## What's different from upstream
+
+Quick overview — details in the sections below:
+
+- **Bug fixes** — D-Pad remapping, x11rb Wayland crash, evdev reconnect on device error (all submitted as upstream PRs)
+- **kdotool replaced** — window focus detected event-driven via KWin D-Bus script; no subprocess spawning on every button press
+- **Per-app configs with inheritance** — app overrides only declare what differs; everything else is merged from the base config at runtime
+- **Binding attributes** — `label`, `no_pause` as inline-table syntax on any binding
+- **State export** → `/tmp/makima-state.json` — fully-resolved binding map, modifier state, active buttons, last action; written atomically on every relevant event
+- **Analog state export** — sticks, trackpads, IMU normalized to −1…+1 and written at up to 60 Hz; deduplicated so only changed values trigger a write; toggled via IPC
+- **Trackpad MT translation** — `ABS_HAT0/1 X/Y` → virtual uinput multi-touch device; enables libinput gesture recognition when `LPAD/RPAD = "trackpad"`
+- **Pause / Resume IPC** — Unix socket at `/tmp/makima-control.sock`; paused state reflected in `state.json`
+- **Steam Deck keycodes** — `BTN_GRIPL`, `BTN_GRIPR`, `BTN_GRIPL2`, `BTN_GRIPR2` for the back paddles (patched `evdev` crate)
+- **Unit test suite** — 69 tests covering resolver, state export, analog helpers, and config parsing
+
+---
 
 ### Bug fixes (submitted as upstream PRs)
 
@@ -107,11 +122,13 @@ BTN_THUMBL = { run = ["deckery-hud-toggle"], no_pause = true, label = "Toggle HU
 
 ### Pause / Resume IPC
 
-makima-deckery exposes a Unix socket at `/tmp/makima.sock` for pause/resume control:
+makima-deckery exposes a Unix socket at `/tmp/makima-control.sock` for runtime control:
 
 ```bash
-echo "pause"  | nc -U /tmp/makima.sock   # suspend all remapping
-echo "resume" | nc -U /tmp/makima.sock   # re-enable remapping
+echo "pause"               | socat - UNIX-CONNECT:/tmp/makima-control.sock
+echo "resume"              | socat - UNIX-CONNECT:/tmp/makima-control.sock
+echo "analog-state-export on"  | socat - UNIX-CONNECT:/tmp/makima-control.sock
+echo "analog-state-export off" | socat - UNIX-CONNECT:/tmp/makima-control.sock
 ```
 
 When paused, all input passes through unmodified. The `paused` flag is reflected in `/tmp/makima-state.json`. The primary use case is **HUD dry-run mode**: the overlay can show the full binding map without any remapping actually taking effect — useful for exploring layouts without triggering actions.
