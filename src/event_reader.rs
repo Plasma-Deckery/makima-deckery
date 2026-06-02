@@ -62,11 +62,23 @@ pub struct EventReader {
     virt_dev: Arc<Mutex<VirtualDevices>>,
     lstick_position: Arc<Mutex<Vec<i32>>>,
     rstick_position: Arc<Mutex<Vec<i32>>>,
-    /// Last known position of left trackpad: (x, y). (0,0) = no finger.
+    /// Raw hardware position of left stick (ABS_X, ABS_Y), always tracked regardless of mode.
+    lstick_raw: Arc<Mutex<(i32, i32)>>,
+    /// Raw hardware position of right stick (ABS_RX, ABS_RY), always tracked regardless of mode.
+    rstick_raw: Arc<Mutex<(i32, i32)>>,
+    /// Raw analog value of L2 trigger (ABS_Z), range 0..32767.
+    ltrigger_raw: Arc<Mutex<i32>>,
+    /// Raw analog value of R2 trigger (ABS_RZ), range 0..32767.
+    rtrigger_raw: Arc<Mutex<i32>>,
+    /// Last written analog snapshot (rounded to 3 dp). Skips write when unchanged.
+    /// Order: [lstick_x, lstick_y, rstick_x, rstick_y,
+    ///          lpad_x, lpad_y, rpad_x, rpad_y, ltrigger, rtrigger]
+    analog_snapshot: Arc<Mutex<[f32; 10]>>,
+    /// Last known position of left trackpad: (x, y). (0,0) = no finger. Always tracked.
     lpad_position: Arc<Mutex<(i32, i32)>>,
     /// Whether the left trackpad is currently physically pressed (BTN_THUMB).
     lpad_pressed: Arc<Mutex<bool>>,
-    /// Last known position of right trackpad: (x, y). (0,0) = no finger.
+    /// Last known position of right trackpad: (x, y). (0,0) = no finger. Always tracked.
     rpad_position: Arc<Mutex<(i32, i32)>>,
     /// Whether the right trackpad is currently physically pressed (BTN_THUMB2).
     rpad_pressed: Arc<Mutex<bool>>,
@@ -105,6 +117,11 @@ impl EventReader {
         }
         let lstick_position = Arc::new(Mutex::new(position_vector.clone()));
         let rstick_position = Arc::new(Mutex::new(position_vector.clone()));
+        let lstick_raw = Arc::new(Mutex::new((0i32, 0i32)));
+        let rstick_raw = Arc::new(Mutex::new((0i32, 0i32)));
+        let ltrigger_raw = Arc::new(Mutex::new(0i32));
+        let rtrigger_raw = Arc::new(Mutex::new(0i32));
+        let analog_snapshot = Arc::new(Mutex::new([f32::NAN; 10]));
         let lpad_position = Arc::new(Mutex::new((0i32, 0i32)));
         let lpad_pressed = Arc::new(Mutex::new(false));
         let rpad_position = Arc::new(Mutex::new((0i32, 0i32)));
@@ -391,6 +408,11 @@ impl EventReader {
             virt_dev,
             lstick_position,
             rstick_position,
+            lstick_raw,
+            rstick_raw,
+            ltrigger_raw,
+            rtrigger_raw,
+            analog_snapshot,
             lpad_position,
             lpad_pressed,
             rpad_position,
@@ -487,7 +509,12 @@ impl EventReader {
         // Transitions always force an immediate state.json write, bypassing the rate limit.
         let mut lpad_was_touching = false;
         let mut rpad_was_touching = false;
-        // Rate-limit state.json writes from trackpad movement to ~60 Hz.
+        // Dirty flags for stick axes — set whenever ABS_X/Y or ABS_RX/RY arrive.
+        let mut lstick_dirty = false;
+        let mut rstick_dirty = false;
+        // Dirty flag for trigger axes (ABS_Z, ABS_RZ).
+        let mut trigger_dirty = false;
+        // Rate-limit state.json writes from trackpad/stick movement to ~60 Hz.
         let mut last_trackpad_state_write = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_millis(17))
             .unwrap_or(std::time::Instant::now());
@@ -528,6 +555,7 @@ impl EventReader {
                         *self.lpad_pressed.lock().await = pressed;
                         let pos = *self.lpad_position.lock().await;
                         self.emit_trackpad_event(true, pos.0, pos.1, Some(pressed)).await;
+                        self.write_state().await;
                     }
                     // Right trackpad physical click → forward to rpad MT device.
                     Key::BTN_THUMB2 if self.settings.rpad.function == "trackpad" => {
@@ -535,6 +563,7 @@ impl EventReader {
                         *self.rpad_pressed.lock().await = pressed;
                         let pos = *self.rpad_position.lock().await;
                         self.emit_trackpad_event(false, pos.0, pos.1, Some(pressed)).await;
+                        self.write_state().await;
                     }
                     _ => {
                         self.convert_event(
@@ -591,10 +620,11 @@ impl EventReader {
                 }
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
                 (_, _, AbsoluteAxisType::ABS_HAT0X, _) => {
+                    // Always track raw position for state export.
+                    self.lpad_position.lock().await.0 = event.value() as i32;
+                    lpad_dirty = true;
                     if self.settings.lpad.function == "trackpad" {
-                        // Left trackpad X — store position only; emit happens on SYN_REPORT.
-                        self.lpad_position.lock().await.0 = event.value() as i32;
-                        lpad_dirty = true;
+                        // Trackpad mode: emit to virtual MT device on SYN_REPORT (dirty flag set above).
                     } else {
                         // D-pad hat switch (non-Steam-Deck controllers).
                         match event.value() {
@@ -637,10 +667,11 @@ impl EventReader {
                     }
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT0Y, _) => {
+                    // Always track raw position for state export.
+                    self.lpad_position.lock().await.1 = event.value() as i32;
+                    lpad_dirty = true;
                     if self.settings.lpad.function == "trackpad" {
-                        // Left trackpad Y — store position only; emit happens on SYN_REPORT.
-                        self.lpad_position.lock().await.1 = event.value() as i32;
-                        lpad_dirty = true;
+                        // Trackpad mode: emit to virtual MT device on SYN_REPORT (dirty flag set above).
                     } else {
                         // D-pad hat switch (non-Steam-Deck controllers).
                         match event.value() {
@@ -683,17 +714,19 @@ impl EventReader {
                     }
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT1X, _) => {
-                    if self.settings.rpad.function == "trackpad" {
-                        // Right trackpad X — store position only; emit happens on SYN_REPORT.
-                        self.rpad_position.lock().await.0 = event.value() as i32;
-                        rpad_dirty = true;
+                    // Always track raw position for state export.
+                    self.rpad_position.lock().await.0 = event.value() as i32;
+                    rpad_dirty = true;
+                    if self.settings.rpad.function != "trackpad" {
+                        // Non-trackpad mode: nothing extra to do.
                     }
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT1Y, _) => {
-                    if self.settings.rpad.function == "trackpad" {
-                        // Right trackpad Y — store position only; emit happens on SYN_REPORT.
-                        self.rpad_position.lock().await.1 = event.value() as i32;
-                        rpad_dirty = true;
+                    // Always track raw position for state export.
+                    self.rpad_position.lock().await.1 = event.value() as i32;
+                    rpad_dirty = true;
+                    if self.settings.rpad.function != "trackpad" {
+                        // Non-trackpad mode: nothing extra to do.
                     }
                 }
                 (
@@ -701,7 +734,15 @@ impl EventReader {
                     _,
                     AbsoluteAxisType::ABS_X | AbsoluteAxisType::ABS_Y,
                     false,
-                ) => match self.settings.lstick.function.as_str() {
+                ) => {
+                    // Always store raw hardware value for state export, regardless of mode.
+                    {
+                        let raw = event.value() as i32;
+                        let mut lr = self.lstick_raw.lock().await;
+                        if event.code() == 0 { lr.0 = raw; } else { lr.1 = raw; }
+                        lstick_dirty = true;
+                    }
+                    match self.settings.lstick.function.as_str() {
                     "cursor" | "scroll" => {
                         let axis_value = self
                             .get_axis_value(&event, &self.settings.lstick.deadzone)
@@ -825,13 +866,23 @@ impl EventReader {
                         }
                     }
                     _ => {}
+                    } // end match lstick function
                 },
                 (
                     EventType::ABSOLUTE,
                     _,
                     AbsoluteAxisType::ABS_RX | AbsoluteAxisType::ABS_RY,
                     false,
-                ) => match self.settings.rstick.function.as_str() {
+                ) => {
+                    // Always store raw hardware value for state export, regardless of mode.
+                    {
+                        let raw = event.value() as i32;
+                        let mut rr = self.rstick_raw.lock().await;
+                        // ABS_RX = code 3, ABS_RY = code 4
+                        if event.code() == 3 { rr.0 = raw; } else { rr.1 = raw; }
+                        rstick_dirty = true;
+                    }
+                    match self.settings.rstick.function.as_str() {
                     "cursor" | "scroll" => {
                         let axis_value = self
                             .get_axis_value(&event, &self.settings.rstick.deadzone)
@@ -959,8 +1010,11 @@ impl EventReader {
                         }
                     }
                     _ => {}
+                    } // end match rstick function
                 },
                 (EventType::ABSOLUTE, _, AbsoluteAxisType::ABS_Z, false) => {
+                    *self.ltrigger_raw.lock().await = event.value() as i32;
+                    trigger_dirty = true;
                     if !self.settings.stadia {
                         match (event.value(), triggers_values.0) {
                             (0, 1) => {
@@ -1052,6 +1106,8 @@ impl EventReader {
                     }
                 }
                 (EventType::ABSOLUTE, _, AbsoluteAxisType::ABS_RZ, false) => {
+                    *self.rtrigger_raw.lock().await = event.value() as i32;
+                    trigger_dirty = true;
                     if !self.settings.stadia {
                         match (event.value(), triggers_values.1) {
                             (0, 1) => {
@@ -1168,10 +1224,14 @@ impl EventReader {
                         let (x, y) = *self.rpad_position.lock().await;
                         self.emit_trackpad_event(false, x, y, None).await;
                     }
-                    // Write state.json on trackpad movement, rate-limited to ~60 Hz.
+                    // Write state.json on trackpad/stick movement, rate-limited to ~60 Hz.
                     // Touch transitions (lift / touch-down) bypass the rate limit so
                     // touching=false is always written promptly when the finger leaves.
-                    if pad_changed {
+                    let stick_changed = lstick_dirty || rstick_dirty || trigger_dirty;
+                    if lstick_dirty { lstick_dirty = false; }
+                    if rstick_dirty { rstick_dirty = false; }
+                    if trigger_dirty { trigger_dirty = false; }
+                    if pad_changed || stick_changed {
                         let lpad_pos = *self.lpad_position.lock().await;
                         let rpad_pos = *self.rpad_position.lock().await;
                         let lpad_touching = lpad_pos.0 != 0 || lpad_pos.1 != 0;
@@ -1182,7 +1242,7 @@ impl EventReader {
                         rpad_was_touching = rpad_touching;
                         if touch_transition || last_trackpad_state_write.elapsed().as_millis() >= 16 {
                             last_trackpad_state_write = std::time::Instant::now();
-                            self.write_state().await;
+                            self.write_state_analog().await;
                         }
                     }
                 }
@@ -1715,6 +1775,14 @@ impl EventReader {
     }
 
     async fn write_state(&self) {
+        self.write_state_inner(false).await;
+    }
+
+    async fn write_state_analog(&self) {
+        self.write_state_inner(true).await;
+    }
+
+    async fn write_state_inner(&self, analog_triggered: bool) {
         // Each lock acquisition is guarded by a timeout so that a deadlock
         // (same task trying to re-acquire a lock it already holds) surfaces
         // immediately in the journal instead of silently freezing makima.
@@ -1777,27 +1845,84 @@ impl EventReader {
                 .to_string();
             vec![base_name, app_part]
         };
+        // All analog values are normalized to -1.0..+1.0 so the frontend needs no
+        // knowledge of hardware axis ranges or internal scaling factors.
+        const AXIS_SCALE: f32 = 32767.0;
+        #[inline] fn r3(v: f32) -> f32 { (v * 1000.0).round() / 1000.0 }
         let lpad_pos = *self.lpad_position.lock().await;
         let lpad_pressed = *self.lpad_pressed.lock().await;
         let rpad_pos = *self.rpad_position.lock().await;
         let rpad_pressed = *self.rpad_pressed.lock().await;
+        let lpad_x = r3(lpad_pos.0 as f32 / AXIS_SCALE);
+        let lpad_y = r3(lpad_pos.1 as f32 / AXIS_SCALE);
+        let rpad_x = r3(rpad_pos.0 as f32 / AXIS_SCALE);
+        let rpad_y = r3(rpad_pos.1 as f32 / AXIS_SCALE);
+        let lstick_raw = *self.lstick_raw.lock().await;
+        let rstick_raw = *self.rstick_raw.lock().await;
+        let ltrigger_raw = *self.ltrigger_raw.lock().await;
+        let rtrigger_raw = *self.rtrigger_raw.lock().await;
+        // deadzone * 200 is the internal threshold in hardware units; normalize to -1..+1.
+        let lstick_dz = r3((self.settings.lstick.deadzone * 200) as f32 / AXIS_SCALE);
+        let rstick_dz = r3((self.settings.rstick.deadzone * 200) as f32 / AXIS_SCALE);
+        let lstick_x = r3(lstick_raw.0 as f32 / AXIS_SCALE);
+        let lstick_y = r3(-lstick_raw.1 as f32 / AXIS_SCALE); // negate: hardware up = negative ABS_Y
+        let rstick_x = r3(rstick_raw.0 as f32 / AXIS_SCALE);
+        let rstick_y = r3(-rstick_raw.1 as f32 / AXIS_SCALE); // negate: hardware up = negative ABS_Y
+        let lt_value = r3((ltrigger_raw as f32 / AXIS_SCALE).clamp(0.0, 1.0));
+        let rt_value = r3((rtrigger_raw as f32 / AXIS_SCALE).clamp(0.0, 1.0));
+        // For analog-triggered writes (SYN_REPORT): skip if all rounded values unchanged.
+        // For button-triggered writes: always write, but invalidate the snapshot so the
+        // next analog write goes through even if analog values haven't moved.
+        let new_snap: [f32; 10] = [
+            lstick_x, lstick_y, rstick_x, rstick_y,
+            lpad_x, lpad_y, rpad_x, rpad_y,
+            lt_value, rt_value,
+        ];
+        {
+            let mut snap = self.analog_snapshot.lock().await;
+            if analog_triggered && *snap == new_snap {
+                return;
+            }
+            *snap = new_snap;
+        }
         let trackpads = serde_json::json!({
             "lpad": {
                 "mode": self.settings.lpad.function,
-                "x": lpad_pos.0,
-                "y": lpad_pos.1,
+                "x": lpad_x,
+                "y": lpad_y,
                 "touching": lpad_pos.0 != 0 || lpad_pos.1 != 0,
                 "pressed": lpad_pressed,
             },
             "rpad": {
                 "mode": self.settings.rpad.function,
-                "x": rpad_pos.0,
-                "y": rpad_pos.1,
+                "x": rpad_x,
+                "y": rpad_y,
                 "touching": rpad_pos.0 != 0 || rpad_pos.1 != 0,
                 "pressed": rpad_pressed,
             },
         });
-        crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack, trackpads).await;
+        let sticks = serde_json::json!({
+            "lstick": {
+                "mode": self.settings.lstick.function,
+                "x": lstick_x,
+                "y": lstick_y,
+                "deadzone": lstick_dz,
+                "active": lstick_x.abs() > lstick_dz || lstick_y.abs() > lstick_dz,
+            },
+            "rstick": {
+                "mode": self.settings.rstick.function,
+                "x": rstick_x,
+                "y": rstick_y,
+                "deadzone": rstick_dz,
+                "active": rstick_x.abs() > rstick_dz || rstick_y.abs() > rstick_dz,
+            },
+        });
+        // Triggers: normalize 0..32767 → 0.0..1.0. pressed mirrors makima's own threshold (value != 0).
+        let triggers = serde_json::json!({
+            "l2": { "value": lt_value, "pressed": ltrigger_raw != 0 },
+            "r2": { "value": rt_value, "pressed": rtrigger_raw != 0 },
+        });
+        crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack, trackpads, sticks, triggers).await;
     }
 
     /// Record the actual emitted key output for the HUD last-event display.
@@ -1906,6 +2031,8 @@ impl EventReader {
                                 };
                                 crate::state_export::write_state(
                                     &config, &mods, layout, is_paused, &hk, &la, &stack,
+                                    serde_json::Value::Null,
+                                    serde_json::Value::Null,
                                     serde_json::Value::Null,
                                 ).await;
                             }
