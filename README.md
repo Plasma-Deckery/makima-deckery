@@ -58,6 +58,8 @@ GRAB_DEVICE = "false"
 
 ### Trackpad emulation as system touchpads
 
+The Steam Deck trackpads are capable input surfaces, but the raw `ABS_HAT` events they produce are invisible to gesture tools — they expect standard Linux multi-touch devices. By translating the trackpad data into proper MT events and exposing virtual uinput devices, makima makes both pads visible to tools like `libinput-gestures` or `fusuma`. This is the prerequisite for defining custom gestures per pad (swipe zones, tap areas, circular scroll) without having to implement gesture recognition inside makima itself.
+
 With `LPAD = "trackpad"` or `RPAD = "trackpad"` in the config, makima translates the raw Steam Deck trackpad axes into proper Linux multi-touch events and exposes them as standard uinput touchpad devices — `Deckery Left Trackpad` and `Deckery Right Trackpad`.
 
 The Steam Deck kernel driver (`hid-steam`) delivers trackpad data as absolute axes on the gamepad device:
@@ -69,7 +71,7 @@ BTN_THUMB              →  left trackpad physical click
 BTN_THUMB2             →  right trackpad physical click
 ```
 
-makima translates these to `ABS_MT_POSITION_X/Y` + `BTN_TOUCH` + `BTN_TOOL_FINGER` frames on the virtual device, with Y-axis corrected to libinput convention (hardware reports up as negative; the virtual device flips this). Once the virtual device exists, libinput takes over completely — KDE touchpad settings, tap-to-click, edge scroll, pointer acceleration, and tools like `libinput-gestures` all work without any additional configuration.
+makima translates these to `ABS_MT_POSITION_X/Y` + `BTN_TOUCH` + `BTN_TOOL_FINGER` frames on the virtual device, with Y-axis corrected to libinput convention (hardware reports up as negative; the virtual device flips this). Once the virtual device exists, gesture tools like `libinput-gestures` or `fusuma` can read it and map swipes, taps, and zones to arbitrary actions — independently configurable per pad.
 
 ```toml
 [settings]
