@@ -422,11 +422,13 @@ impl EventReader {
                 .unwrap()
                 .name
         );
-        // Enable virtual trackpad devices now that we're in async context.
-        self.virt_dev.lock().await.enable_trackpads(
-            self.settings.lpad.function == "trackpad",
-            self.settings.rpad.function == "trackpad",
-        );
+        // Virtual trackpad devices disabled: state tracking (position, touch, press)
+        // is active and exported to state.json, but no uinput MT devices are created
+        // and no events are forwarded. Re-enable once Y-axis behaviour is resolved.
+        // self.virt_dev.lock().await.enable_trackpads(
+        //     self.settings.lpad.function == "trackpad",
+        //     self.settings.rpad.function == "trackpad",
+        // );
         self.write_state().await;
         self.start_control_socket().await;
         tokio::join!(
