@@ -444,13 +444,13 @@ impl EventReader {
                 .unwrap()
                 .name
         );
-        // Virtual trackpad devices disabled: state tracking (position, touch, press)
-        // is active and exported to state.json, but no uinput MT devices are created
-        // and no events are forwarded. Re-enable once Y-axis behaviour is resolved.
-        // self.virt_dev.lock().await.enable_trackpads(
-        //     self.settings.lpad.function == "trackpad",
-        //     self.settings.rpad.function == "trackpad",
-        // );
+        // Enable virtual trackpad MT devices if mode == "trackpad".
+        // When mode == "disabled" (default), no device is created and no events forwarded;
+        // state tracking (position, touch, press → state.json) remains active either way.
+        self.virt_dev.lock().await.enable_trackpads(
+            self.settings.lpad.function == "trackpad",
+            self.settings.rpad.function == "trackpad",
+        );
         self.write_state().await;
         self.start_control_socket().await;
         tokio::join!(
