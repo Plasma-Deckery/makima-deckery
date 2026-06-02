@@ -483,6 +483,10 @@ impl EventReader {
         // avoiding spurious re-emits on SYNs caused by other axes (stick, triggers, etc.)
         let mut lpad_dirty = false;
         let mut rpad_dirty = false;
+        // Track previous touching state to detect transitions (lift/touch-down).
+        // Transitions always force an immediate state.json write, bypassing the rate limit.
+        let mut lpad_was_touching = false;
+        let mut rpad_was_touching = false;
         // Rate-limit state.json writes from trackpad movement to ~60 Hz.
         let mut last_trackpad_state_write = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_millis(17))
@@ -1165,9 +1169,21 @@ impl EventReader {
                         self.emit_trackpad_event(false, x, y, None).await;
                     }
                     // Write state.json on trackpad movement, rate-limited to ~60 Hz.
-                    if pad_changed && last_trackpad_state_write.elapsed().as_millis() >= 16 {
-                        last_trackpad_state_write = std::time::Instant::now();
-                        self.write_state().await;
+                    // Touch transitions (lift / touch-down) bypass the rate limit so
+                    // touching=false is always written promptly when the finger leaves.
+                    if pad_changed {
+                        let lpad_pos = *self.lpad_position.lock().await;
+                        let rpad_pos = *self.rpad_position.lock().await;
+                        let lpad_touching = lpad_pos.0 != 0 || lpad_pos.1 != 0;
+                        let rpad_touching = rpad_pos.0 != 0 || rpad_pos.1 != 0;
+                        let touch_transition = lpad_touching != lpad_was_touching
+                            || rpad_touching != rpad_was_touching;
+                        lpad_was_touching = lpad_touching;
+                        rpad_was_touching = rpad_touching;
+                        if touch_transition || last_trackpad_state_write.elapsed().as_millis() >= 16 {
+                            last_trackpad_state_write = std::time::Instant::now();
+                            self.write_state().await;
+                        }
                     }
                 }
                 _ => self.emit_default_event(event).await,
