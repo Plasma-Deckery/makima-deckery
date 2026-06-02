@@ -1,4 +1,5 @@
 mod active_client;
+mod analog;
 mod config;
 mod event_reader;
 mod kwin_watcher;

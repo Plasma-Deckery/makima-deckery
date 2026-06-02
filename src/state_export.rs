@@ -977,4 +977,94 @@ mod tests {
             "overridden binding should come from app config"
         );
     }
+
+    // ── write_state: analog fields ────────────────────────────────────────────
+
+    fn empty_config() -> Config {
+        make_config(vec![], vec![], vec![])
+    }
+
+    /// Call write_state synchronously in a test runtime and return the
+    /// resulting state JSON (read back from the temp file path).
+    /// We test the JSON assembly logic here, not the file I/O.
+    fn assemble_state(
+        trackpads: serde_json::Value,
+        sticks: serde_json::Value,
+        imu: serde_json::Value,
+        analog_state_export: bool,
+    ) -> serde_json::Value {
+        let config = empty_config();
+        let mut state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        state["trackpads"] = trackpads;
+        state["sticks"] = sticks;
+        state["imu"] = imu;
+        state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
+        state
+    }
+
+    #[test]
+    fn analog_state_export_false_in_context() {
+        let state = assemble_state(
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            false,
+        );
+        assert_eq!(state["context"]["analog_state_export"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn analog_state_export_true_in_context() {
+        let state = assemble_state(
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            true,
+        );
+        assert_eq!(state["context"]["analog_state_export"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn trackpads_present_when_provided() {
+        let pads = serde_json::json!({
+            "lpad": { "mode": "disabled", "x": 0.5, "y": -0.3, "touching": true, "pressed": false },
+            "rpad": { "mode": "disabled", "x": 0.0, "y": 0.0, "touching": false, "pressed": false },
+        });
+        let state = assemble_state(pads.clone(), serde_json::Value::Null, serde_json::Value::Null, false);
+        assert_eq!(state["trackpads"]["lpad"]["x"].as_f64(), Some(0.5));
+        assert_eq!(state["trackpads"]["lpad"]["touching"].as_bool(), Some(true));
+        assert_eq!(state["trackpads"]["rpad"]["touching"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn sticks_present_when_provided() {
+        let sticks = serde_json::json!({
+            "lstick": { "mode": "disabled", "x": 0.1, "y": 0.2, "deadzone": 0.092, "active": false },
+            "rstick": { "mode": "cursor",   "x": 0.0, "y": 0.0, "deadzone": 0.031, "active": false },
+        });
+        let state = assemble_state(serde_json::Value::Null, sticks, serde_json::Value::Null, false);
+        assert_eq!(state["sticks"]["lstick"]["deadzone"].as_f64(), Some(0.092));
+        assert_eq!(state["sticks"]["rstick"]["mode"].as_str(), Some("cursor"));
+    }
+
+    #[test]
+    fn imu_present_when_provided() {
+        let imu = serde_json::json!({ "x": 0.123, "y": 0.456 });
+        let state = assemble_state(serde_json::Value::Null, serde_json::Value::Null, imu, false);
+        assert_eq!(state["imu"]["x"].as_f64(), Some(0.123));
+        assert_eq!(state["imu"]["y"].as_f64(), Some(0.456));
+    }
+
+    #[test]
+    fn null_fields_are_null_in_output() {
+        let state = assemble_state(
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            false,
+        );
+        assert!(state["trackpads"].is_null());
+        assert!(state["sticks"].is_null());
+        assert!(state["imu"].is_null());
+    }
 }

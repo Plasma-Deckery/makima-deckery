@@ -1854,29 +1854,24 @@ impl EventReader {
                 .to_string();
             vec![base_name, app_part]
         };
-        // All analog values are normalized to -1.0..+1.0 so the frontend needs no
-        // knowledge of hardware axis ranges or internal scaling factors.
-        const AXIS_SCALE: f32 = 32767.0;
-        #[inline] fn r3(v: f32) -> f32 { (v * 1000.0).round() / 1000.0 }
         let lpad_pos = *self.lpad_position.lock().await;
         let lpad_pressed = *self.lpad_pressed.lock().await;
         let rpad_pos = *self.rpad_position.lock().await;
         let rpad_pressed = *self.rpad_pressed.lock().await;
-        let lpad_x = r3(lpad_pos.0 as f32 / AXIS_SCALE);
-        let lpad_y = r3(lpad_pos.1 as f32 / AXIS_SCALE);
-        let rpad_x = r3(rpad_pos.0 as f32 / AXIS_SCALE);
-        let rpad_y = r3(rpad_pos.1 as f32 / AXIS_SCALE);
+        let lpad_x = crate::analog::normalize(lpad_pos.0);
+        let lpad_y = crate::analog::normalize(lpad_pos.1);
+        let rpad_x = crate::analog::normalize(rpad_pos.0);
+        let rpad_y = crate::analog::normalize(rpad_pos.1);
         let lstick_raw = *self.lstick_raw.lock().await;
         let rstick_raw = *self.rstick_raw.lock().await;
         let imu_raw = *self.imu_raw.lock().await;
         let analog_state_export = *self.analog_state_export.lock().await;
-        // deadzone * 200 is the internal threshold in hardware units; normalize to -1..+1.
-        let lstick_dz = r3((self.settings.lstick.deadzone * 200) as f32 / AXIS_SCALE);
-        let rstick_dz = r3((self.settings.rstick.deadzone * 200) as f32 / AXIS_SCALE);
-        let lstick_x = r3(lstick_raw.0 as f32 / AXIS_SCALE);
-        let lstick_y = r3(-lstick_raw.1 as f32 / AXIS_SCALE); // negate: hardware up = negative ABS_Y
-        let rstick_x = r3(rstick_raw.0 as f32 / AXIS_SCALE);
-        let rstick_y = r3(-rstick_raw.1 as f32 / AXIS_SCALE); // negate: hardware up = negative ABS_Y
+        let lstick_dz = crate::analog::normalize_dz(self.settings.lstick.deadzone);
+        let rstick_dz = crate::analog::normalize_dz(self.settings.rstick.deadzone);
+        let lstick_x = crate::analog::normalize(lstick_raw.0);
+        let lstick_y = crate::analog::normalize_y(lstick_raw.1); // negated: hardware up = negative ABS_Y
+        let rstick_x = crate::analog::normalize(rstick_raw.0);
+        let rstick_y = crate::analog::normalize_y(rstick_raw.1); // negated: hardware up = negative ABS_Y
         // For analog-triggered writes (SYN_REPORT): skip if all rounded values unchanged.
         // For button-triggered writes: always write, but invalidate the snapshot so the
         // next analog write goes through even if analog values haven't moved.
@@ -1896,14 +1891,14 @@ impl EventReader {
                 "mode": self.settings.lpad.function,
                 "x": lpad_x,
                 "y": lpad_y,
-                "touching": lpad_pos.0 != 0 || lpad_pos.1 != 0,
+                "touching": crate::analog::is_touching(lpad_pos.0, lpad_pos.1),
                 "pressed": lpad_pressed,
             },
             "rpad": {
                 "mode": self.settings.rpad.function,
                 "x": rpad_x,
                 "y": rpad_y,
-                "touching": rpad_pos.0 != 0 || rpad_pos.1 != 0,
+                "touching": crate::analog::is_touching(rpad_pos.0, rpad_pos.1),
                 "pressed": rpad_pressed,
             },
         });
@@ -1913,20 +1908,20 @@ impl EventReader {
                 "x": lstick_x,
                 "y": lstick_y,
                 "deadzone": lstick_dz,
-                "active": lstick_x.abs() > lstick_dz || lstick_y.abs() > lstick_dz,
+                "active": crate::analog::is_active(lstick_x, lstick_y, lstick_dz),
             },
             "rstick": {
                 "mode": self.settings.rstick.function,
                 "x": rstick_x,
                 "y": rstick_y,
                 "deadzone": rstick_dz,
-                "active": rstick_x.abs() > rstick_dz || rstick_y.abs() > rstick_dz,
+                "active": crate::analog::is_active(rstick_x, rstick_y, rstick_dz),
             },
         });
         // IMU: normalize 0..32767 → 0.0..1.0 (unsigned range).
         let imu = serde_json::json!({
-            "x": r3(imu_raw.0 as f32 / AXIS_SCALE),
-            "y": r3(imu_raw.1 as f32 / AXIS_SCALE),
+            "x": crate::analog::normalize(imu_raw.0),
+            "y": crate::analog::normalize(imu_raw.1),
         });
         crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack, trackpads, sticks, imu, analog_state_export).await;
     }
