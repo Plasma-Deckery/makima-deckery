@@ -64,8 +64,12 @@ pub struct EventReader {
     rstick_position: Arc<Mutex<Vec<i32>>>,
     /// Last known position of left trackpad: (x, y). (0,0) = no finger.
     lpad_position: Arc<Mutex<(i32, i32)>>,
+    /// Whether the left trackpad is currently physically pressed (BTN_THUMB).
+    lpad_pressed: Arc<Mutex<bool>>,
     /// Last known position of right trackpad: (x, y). (0,0) = no finger.
     rpad_position: Arc<Mutex<(i32, i32)>>,
+    /// Whether the right trackpad is currently physically pressed (BTN_THUMB2).
+    rpad_pressed: Arc<Mutex<bool>>,
     cursor_movement: Arc<Mutex<(i32, i32)>>,
     scroll_movement: Arc<Mutex<(i32, i32)>>,
     modifiers: Arc<Mutex<Vec<Event>>>,
@@ -102,7 +106,9 @@ impl EventReader {
         let lstick_position = Arc::new(Mutex::new(position_vector.clone()));
         let rstick_position = Arc::new(Mutex::new(position_vector.clone()));
         let lpad_position = Arc::new(Mutex::new((0i32, 0i32)));
+        let lpad_pressed = Arc::new(Mutex::new(false));
         let rpad_position = Arc::new(Mutex::new((0i32, 0i32)));
+        let rpad_pressed = Arc::new(Mutex::new(false));
         let cursor_movement = Arc::new(Mutex::new((0, 0)));
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -386,7 +392,9 @@ impl EventReader {
             lstick_position,
             rstick_position,
             lpad_position,
+            lpad_pressed,
             rpad_position,
+            rpad_pressed,
             cursor_movement,
             scroll_movement,
             modifiers,
@@ -506,13 +514,17 @@ impl EventReader {
                     }
                     // Left trackpad physical click → forward to lpad MT device.
                     Key::BTN_THUMB if self.settings.lpad.function == "trackpad" => {
+                        let pressed = event.value() != 0;
+                        *self.lpad_pressed.lock().await = pressed;
                         let pos = *self.lpad_position.lock().await;
-                        self.emit_trackpad_event(true, pos.0, pos.1, Some(event.value() != 0)).await;
+                        self.emit_trackpad_event(true, pos.0, pos.1, Some(pressed)).await;
                     }
                     // Right trackpad physical click → forward to rpad MT device.
                     Key::BTN_THUMB2 if self.settings.rpad.function == "trackpad" => {
+                        let pressed = event.value() != 0;
+                        *self.rpad_pressed.lock().await = pressed;
                         let pos = *self.rpad_position.lock().await;
-                        self.emit_trackpad_event(false, pos.0, pos.1, Some(event.value() != 0)).await;
+                        self.emit_trackpad_event(false, pos.0, pos.1, Some(pressed)).await;
                     }
                     _ => {
                         self.convert_event(
@@ -1737,7 +1749,27 @@ impl EventReader {
                 .to_string();
             vec![base_name, app_part]
         };
-        crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack).await;
+        let lpad_pos = *self.lpad_position.lock().await;
+        let lpad_pressed = *self.lpad_pressed.lock().await;
+        let rpad_pos = *self.rpad_position.lock().await;
+        let rpad_pressed = *self.rpad_pressed.lock().await;
+        let trackpads = serde_json::json!({
+            "lpad": {
+                "mode": self.settings.lpad.function,
+                "x": lpad_pos.0,
+                "y": lpad_pos.1,
+                "touching": lpad_pos.0 != 0 || lpad_pos.1 != 0,
+                "pressed": lpad_pressed,
+            },
+            "rpad": {
+                "mode": self.settings.rpad.function,
+                "x": rpad_pos.0,
+                "y": rpad_pos.1,
+                "touching": rpad_pos.0 != 0 || rpad_pos.1 != 0,
+                "pressed": rpad_pressed,
+            },
+        });
+        crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack, trackpads).await;
     }
 
     /// Record the actual emitted key output for the HUD last-event display.
@@ -1846,6 +1878,7 @@ impl EventReader {
                                 };
                                 crate::state_export::write_state(
                                     &config, &mods, layout, is_paused, &hk, &la, &stack,
+                                    serde_json::Value::Null,
                                 ).await;
                             }
                             _ => {}

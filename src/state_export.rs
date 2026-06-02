@@ -361,8 +361,10 @@ pub async fn write_state(
     held_keys: &[Event],
     last_action: &Option<LastAction>,
     config_stack: &[String],
+    trackpads: serde_json::Value,
 ) {
-    let state = build_state(config, modifiers, layout, paused, held_keys, last_action, config_stack);
+    let mut state = build_state(config, modifiers, layout, paused, held_keys, last_action, config_stack);
+    state["trackpads"] = trackpads;
 
     let tmp_path = "/tmp/makima-state.json.tmp";
     let final_path = "/tmp/makima-state.json";
