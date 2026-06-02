@@ -12,13 +12,12 @@ This fork is maintained as part of the [Plasma Deckery](https://github.com/Plasm
 Quick overview — details in the sections below:
 
 - **Bug fixes** — D-Pad remapping, x11rb Wayland crash, evdev reconnect on device error (all submitted as upstream PRs)
-- **kdotool replaced** — window focus detected event-driven via KWin D-Bus script; no subprocess spawning on every button press
+- **kdotool replaced** — window focus is detected event-driven via a KWin D-Bus script instead of spawning a subprocess on every button press; significantly more efficient
 - **Per-app configs with inheritance** — app overrides only declare what differs; everything else is merged from the base config at runtime
-- **Binding attributes** — `label`, `no_pause` as inline-table syntax on any binding
-- **State export** → `/tmp/makima-state.json` — fully-resolved binding map, modifier state, active buttons, last action; written atomically on every relevant event
-- **Analog state export** — sticks, trackpads, IMU normalized to −1…+1 and written at up to 60 Hz; deduplicated so only changed values trigger a write; toggled via IPC
-- **Trackpad MT translation** — `ABS_HAT0/1 X/Y` → virtual uinput multi-touch device; enables libinput gesture recognition when `LPAD/RPAD = "trackpad"`
-- **Pause / Resume IPC** — Unix socket at `/tmp/makima-control.sock`; paused state reflected in `state.json`
+- **Binding attributes** — extended configuration options per binding: human-readable display names and execution control flags
+- **State export** → `/tmp/makima-state.json` — all state needed for a real-time button preview HUD: active bindings, modifier context, currently held buttons, last executed action, and analog sensor values (sticks, trackpads, IMU)
+- **Trackpad MT translation** — both trackpads are emulated as standard system touchpad devices, activating existing trackpad gesture recognition tools on the left and right pad
+- **Pause / Resume IPC** — the service can be paused and resumed at any time via a Unix socket; useful for HUD dry-run mode where the overlay previews bindings without any remapping taking effect
 - **Steam Deck keycodes** — `BTN_GRIPL`, `BTN_GRIPR`, `BTN_GRIPL2`, `BTN_GRIPR2` for the back paddles (patched `evdev` crate)
 - **Unit test suite** — 69 tests covering resolver, state export, analog helpers, and config parsing
 
