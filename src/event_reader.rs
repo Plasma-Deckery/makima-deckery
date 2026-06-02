@@ -27,6 +27,11 @@ struct Stick {
     activation_modifiers: Vec<Event>,
 }
 
+struct Pad {
+    /// "disabled" or "trackpad"
+    function: String,
+}
+
 struct Movement {
     speed: i32,
     acceleration: f32,
@@ -35,6 +40,8 @@ struct Movement {
 struct Settings {
     lstick: Stick,
     rstick: Stick,
+    lpad: Pad,
+    rpad: Pad,
     invert_cursor_axis: bool,
     invert_scroll_axis: bool,
     axis_16_bit: bool,
@@ -55,6 +62,10 @@ pub struct EventReader {
     virt_dev: Arc<Mutex<VirtualDevices>>,
     lstick_position: Arc<Mutex<Vec<i32>>>,
     rstick_position: Arc<Mutex<Vec<i32>>>,
+    /// Last known position of left trackpad: (x, y). (0,0) = no finger.
+    lpad_position: Arc<Mutex<(i32, i32)>>,
+    /// Last known position of right trackpad: (x, y). (0,0) = no finger.
+    rpad_position: Arc<Mutex<(i32, i32)>>,
     cursor_movement: Arc<Mutex<(i32, i32)>>,
     scroll_movement: Arc<Mutex<(i32, i32)>>,
     modifiers: Arc<Mutex<Vec<Event>>>,
@@ -90,6 +101,8 @@ impl EventReader {
         }
         let lstick_position = Arc::new(Mutex::new(position_vector.clone()));
         let rstick_position = Arc::new(Mutex::new(position_vector.clone()));
+        let lpad_position = Arc::new(Mutex::new((0i32, 0i32)));
+        let rpad_position = Arc::new(Mutex::new((0i32, 0i32)));
         let cursor_movement = Arc::new(Mutex::new((0, 0)));
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -333,9 +346,28 @@ impl EventReader {
             .parse()
             .expect("CURSOR_WHEN_PAUSED can only be true or false.");
 
+        let base_cfg = config
+            .iter()
+            .find(|&x| x.associations == Associations::default())
+            .unwrap();
+        let lpad_function = base_cfg
+            .settings
+            .get("LPAD")
+            .cloned()
+            .unwrap_or_else(|| "disabled".to_string());
+        let rpad_function = base_cfg
+            .settings
+            .get("RPAD")
+            .cloned()
+            .unwrap_or_else(|| "disabled".to_string());
+        let lpad = Pad { function: lpad_function };
+        let rpad = Pad { function: rpad_function };
+
         let settings = Settings {
             lstick,
             rstick,
+            lpad,
+            rpad,
             invert_cursor_axis,
             invert_scroll_axis,
             axis_16_bit,
@@ -353,6 +385,8 @@ impl EventReader {
             virt_dev,
             lstick_position,
             rstick_position,
+            lpad_position,
+            rpad_position,
             cursor_movement,
             scroll_movement,
             modifiers,
@@ -379,6 +413,11 @@ impl EventReader {
                 .find(|&x| x.associations == Associations::default())
                 .unwrap()
                 .name
+        );
+        // Enable virtual trackpad devices now that we're in async context.
+        self.virt_dev.lock().await.enable_trackpads(
+            self.settings.lpad.function == "trackpad",
+            self.settings.rpad.function == "trackpad",
         );
         self.write_state().await;
         self.start_control_socket().await;
@@ -429,6 +468,11 @@ impl EventReader {
             }
         }
         let mut had_device_error = false;
+        // Dirty flags: set when HAT axis data arrives, cleared after emitting on SYN_REPORT.
+        // This ensures we only forward trackpad events when new data actually arrived,
+        // avoiding spurious re-emits on SYNs caused by other axes (stick, triggers, etc.)
+        let mut lpad_dirty = false;
+        let mut rpad_dirty = false;
         while let Some(event_result) = stream.next().await {
             let event = match event_result {
                 Ok(e) => e,
@@ -459,6 +503,16 @@ impl EventReader {
                         if is_tablet =>
                     {
                         pen_events.push(event)
+                    }
+                    // Left trackpad physical click → forward to lpad MT device.
+                    Key::BTN_THUMB if self.settings.lpad.function == "trackpad" => {
+                        let pos = *self.lpad_position.lock().await;
+                        self.emit_trackpad_event(true, pos.0, pos.1, Some(event.value() != 0)).await;
+                    }
+                    // Right trackpad physical click → forward to rpad MT device.
+                    Key::BTN_THUMB2 if self.settings.rpad.function == "trackpad" => {
+                        let pos = *self.rpad_position.lock().await;
+                        self.emit_trackpad_event(false, pos.0, pos.1, Some(event.value() != 0)).await;
                     }
                     _ => {
                         self.convert_event(
@@ -515,82 +569,110 @@ impl EventReader {
                 }
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
                 (_, _, AbsoluteAxisType::ABS_HAT0X, _) => {
-                    match event.value() {
-                        -1 => {
-                            self.convert_event(event, Event::Axis(Axis::BTN_DPAD_LEFT), 1, false)
-                                .await;
-                            dpad_values.0 = -1;
-                        }
-                        1 => {
-                            self.convert_event(event, Event::Axis(Axis::BTN_DPAD_RIGHT), 1, false)
-                                .await;
-                            dpad_values.0 = 1;
-                        }
-                        0 => {
-                            match dpad_values.0 {
-                                -1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::BTN_DPAD_LEFT),
-                                        0,
-                                        false,
-                                    )
-                                    .await
-                                }
-                                1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::BTN_DPAD_RIGHT),
-                                        0,
-                                        false,
-                                    )
-                                    .await
-                                }
-                                _ => {}
+                    if self.settings.lpad.function == "trackpad" {
+                        // Left trackpad X — store position only; emit happens on SYN_REPORT.
+                        self.lpad_position.lock().await.0 = event.value() as i32;
+                        lpad_dirty = true;
+                    } else {
+                        // D-pad hat switch (non-Steam-Deck controllers).
+                        match event.value() {
+                            -1 => {
+                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_LEFT), 1, false)
+                                    .await;
+                                dpad_values.0 = -1;
                             }
-                            dpad_values.0 = 0;
+                            1 => {
+                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_RIGHT), 1, false)
+                                    .await;
+                                dpad_values.0 = 1;
+                            }
+                            0 => {
+                                match dpad_values.0 {
+                                    -1 => {
+                                        self.convert_event(
+                                            event,
+                                            Event::Axis(Axis::BTN_DPAD_LEFT),
+                                            0,
+                                            false,
+                                        )
+                                        .await
+                                    }
+                                    1 => {
+                                        self.convert_event(
+                                            event,
+                                            Event::Axis(Axis::BTN_DPAD_RIGHT),
+                                            0,
+                                            false,
+                                        )
+                                        .await
+                                    }
+                                    _ => {}
+                                }
+                                dpad_values.0 = 0;
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    };
+                    }
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT0Y, _) => {
-                    match event.value() {
-                        -1 => {
-                            self.convert_event(event, Event::Axis(Axis::BTN_DPAD_UP), 1, false)
-                                .await;
-                            dpad_values.1 = -1;
-                        }
-                        1 => {
-                            self.convert_event(event, Event::Axis(Axis::BTN_DPAD_DOWN), 1, false)
-                                .await;
-                            dpad_values.1 = 1;
-                        }
-                        0 => {
-                            match dpad_values.1 {
-                                -1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::BTN_DPAD_UP),
-                                        0,
-                                        false,
-                                    )
-                                    .await
-                                }
-                                1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::BTN_DPAD_DOWN),
-                                        0,
-                                        false,
-                                    )
-                                    .await
-                                }
-                                _ => {}
+                    if self.settings.lpad.function == "trackpad" {
+                        // Left trackpad Y — store position only; emit happens on SYN_REPORT.
+                        self.lpad_position.lock().await.1 = event.value() as i32;
+                        lpad_dirty = true;
+                    } else {
+                        // D-pad hat switch (non-Steam-Deck controllers).
+                        match event.value() {
+                            -1 => {
+                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_UP), 1, false)
+                                    .await;
+                                dpad_values.1 = -1;
                             }
-                            dpad_values.1 = 0;
+                            1 => {
+                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_DOWN), 1, false)
+                                    .await;
+                                dpad_values.1 = 1;
+                            }
+                            0 => {
+                                match dpad_values.1 {
+                                    -1 => {
+                                        self.convert_event(
+                                            event,
+                                            Event::Axis(Axis::BTN_DPAD_UP),
+                                            0,
+                                            false,
+                                        )
+                                        .await
+                                    }
+                                    1 => {
+                                        self.convert_event(
+                                            event,
+                                            Event::Axis(Axis::BTN_DPAD_DOWN),
+                                            0,
+                                            false,
+                                        )
+                                        .await
+                                    }
+                                    _ => {}
+                                }
+                                dpad_values.1 = 0;
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    };
+                    }
+                }
+                (_, _, AbsoluteAxisType::ABS_HAT1X, _) => {
+                    if self.settings.rpad.function == "trackpad" {
+                        // Right trackpad X — store position only; emit happens on SYN_REPORT.
+                        self.rpad_position.lock().await.0 = event.value() as i32;
+                        rpad_dirty = true;
+                    }
+                }
+                (_, _, AbsoluteAxisType::ABS_HAT1Y, _) => {
+                    if self.settings.rpad.function == "trackpad" {
+                        // Right trackpad Y — store position only; emit happens on SYN_REPORT.
+                        self.rpad_position.lock().await.1 = event.value() as i32;
+                        rpad_dirty = true;
+                    }
                 }
                 (
                     EventType::ABSOLUTE,
@@ -1048,6 +1130,22 @@ impl EventReader {
                         pen_events.clear()
                     }
                 }
+                (EventType::SYNCHRONIZATION, _, _, _) => {
+                    // SYN_REPORT: emit complete, consistent trackpad state once per frame,
+                    // but only when new HAT data actually arrived (dirty flag).
+                    // Without this guard, every SYN from sticks/triggers would re-emit the
+                    // trackpad position, confusing libinput's velocity calculation.
+                    if lpad_dirty {
+                        lpad_dirty = false;
+                        let (x, y) = *self.lpad_position.lock().await;
+                        self.emit_trackpad_event(true, x, y, None).await;
+                    }
+                    if rpad_dirty {
+                        rpad_dirty = false;
+                        let (x, y) = *self.rpad_position.lock().await;
+                        self.emit_trackpad_event(false, x, y, None).await;
+                    }
+                }
                 _ => self.emit_default_event(event).await,
             }
         }
@@ -1435,6 +1533,46 @@ impl EventReader {
                 }
             }
         }
+    }
+
+    /// Emit a single multi-touch frame for a trackpad to its virtual uinput device.
+    /// `is_left`: true = lpad, false = rpad.
+    /// `x, y`: raw coordinates (0,0 means finger lifted).
+    /// `click`: physical press state (BTN_LEFT).
+    async fn emit_trackpad_event(&self, is_left: bool, x: i32, y: i32, click: Option<bool>) {
+        let mut vd = self.virt_dev.lock().await;
+        let dev = if is_left { vd.lpad.as_mut() } else { vd.rpad.as_mut() };
+        let dev = match dev {
+            Some(d) => d,
+            None => return,
+        };
+        // Negate Y: Steam Deck hardware Y increases upward, libinput expects Y increasing downward.
+        let y = -y;
+        let touching = x != 0 || y != 0;
+        // BTN_TOUCH + BTN_TOOL_FINGER
+        dev.emit(&[InputEvent::new_now(EventType::KEY, Key::BTN_TOUCH.code(), touching as i32)]).ok();
+        dev.emit(&[InputEvent::new_now(EventType::KEY, Key::BTN_TOOL_FINGER.code(), touching as i32)]).ok();
+        if touching {
+            // Axis numbers from include/uapi/linux/input-event-codes.h:
+            // ABS_MT_SLOT = 0x2f = 47, ABS_MT_TRACKING_ID = 0x39 = 57
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 47, 0)]).ok();  // ABS_MT_SLOT = 0
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 57, 1)]).ok();  // ABS_MT_TRACKING_ID
+            // ABS_MT_POSITION_X = 0x35 = 53, ABS_MT_POSITION_Y = 0x36 = 54
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 53, x)]).ok();
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 54, y)]).ok();
+            // Single-touch compat axes
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 0, x)]).ok();
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 1, y)]).ok();
+        } else {
+            // Lift: invalidate MT tracking id
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 47, 0)]).ok();  // ABS_MT_SLOT
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 57, -1)]).ok(); // ABS_MT_TRACKING_ID = -1
+        }
+        if let Some(pressed) = click {
+            dev.emit(&[InputEvent::new_now(EventType::KEY, Key::BTN_LEFT.code(), pressed as i32)]).ok();
+        }
+        // SYN_REPORT
+        dev.emit(&[InputEvent::new_now(EventType::SYNCHRONIZATION, 0, 0)]).ok();
     }
 
     async fn get_axis_value(&self, event: &InputEvent, deadzone: &i32) -> i32 {
