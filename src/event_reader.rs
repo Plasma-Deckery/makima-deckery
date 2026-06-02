@@ -27,6 +27,11 @@ struct Stick {
     activation_modifiers: Vec<Event>,
 }
 
+struct Pad {
+    /// "disabled" or "trackpad"
+    function: String,
+}
+
 struct Movement {
     speed: i32,
     acceleration: f32,
@@ -35,6 +40,8 @@ struct Movement {
 struct Settings {
     lstick: Stick,
     rstick: Stick,
+    lpad: Pad,
+    rpad: Pad,
     invert_cursor_axis: bool,
     invert_scroll_axis: bool,
     axis_16_bit: bool,
@@ -55,6 +62,26 @@ pub struct EventReader {
     virt_dev: Arc<Mutex<VirtualDevices>>,
     lstick_position: Arc<Mutex<Vec<i32>>>,
     rstick_position: Arc<Mutex<Vec<i32>>>,
+    /// Raw hardware position of left stick (ABS_X, ABS_Y), always tracked regardless of mode.
+    lstick_raw: Arc<Mutex<(i32, i32)>>,
+    /// Raw hardware position of right stick (ABS_RX, ABS_RY), always tracked regardless of mode.
+    rstick_raw: Arc<Mutex<(i32, i32)>>,
+    /// Last written analog snapshot (rounded to 3 dp). Skips write when unchanged.
+    /// Order: [lstick_x, lstick_y, rstick_x, rstick_y, lpad_x, lpad_y, rpad_x, rpad_y]
+    analog_snapshot: Arc<Mutex<[f32; 8]>>,
+    /// Last known position of left trackpad: (x, y). (0,0) = no finger. Always tracked.
+    lpad_position: Arc<Mutex<(i32, i32)>>,
+    /// Whether the left trackpad is currently physically pressed (BTN_THUMB).
+    lpad_pressed: Arc<Mutex<bool>>,
+    /// Last known position of right trackpad: (x, y). (0,0) = no finger. Always tracked.
+    rpad_position: Arc<Mutex<(i32, i32)>>,
+    /// Whether the right trackpad is currently physically pressed (BTN_THUMB2).
+    rpad_pressed: Arc<Mutex<bool>>,
+    /// Raw IMU values (ABS_HAT2X, ABS_HAT2Y) — gyroscope/accelerometer, range 0..32767.
+    imu_raw: Arc<Mutex<(i32, i32)>>,
+    /// When false, write_state_analog() is a no-op — no 60 Hz analog writes to state.json.
+    /// The UI sends "analog on"/"analog off" via the IPC socket to control this.
+    analog_state_export: Arc<Mutex<bool>>,
     cursor_movement: Arc<Mutex<(i32, i32)>>,
     scroll_movement: Arc<Mutex<(i32, i32)>>,
     modifiers: Arc<Mutex<Vec<Event>>>,
@@ -90,6 +117,15 @@ impl EventReader {
         }
         let lstick_position = Arc::new(Mutex::new(position_vector.clone()));
         let rstick_position = Arc::new(Mutex::new(position_vector.clone()));
+        let lstick_raw = Arc::new(Mutex::new((0i32, 0i32)));
+        let rstick_raw = Arc::new(Mutex::new((0i32, 0i32)));
+        let imu_raw = Arc::new(Mutex::new((0i32, 0i32)));
+        let analog_state_export = Arc::new(Mutex::new(false));
+        let analog_snapshot = Arc::new(Mutex::new([f32::NAN; 8]));
+        let lpad_position = Arc::new(Mutex::new((0i32, 0i32)));
+        let lpad_pressed = Arc::new(Mutex::new(false));
+        let rpad_position = Arc::new(Mutex::new((0i32, 0i32)));
+        let rpad_pressed = Arc::new(Mutex::new(false));
         let cursor_movement = Arc::new(Mutex::new((0, 0)));
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -333,9 +369,28 @@ impl EventReader {
             .parse()
             .expect("CURSOR_WHEN_PAUSED can only be true or false.");
 
+        let base_cfg = config
+            .iter()
+            .find(|&x| x.associations == Associations::default())
+            .unwrap();
+        let lpad_function = base_cfg
+            .settings
+            .get("LPAD")
+            .cloned()
+            .unwrap_or_else(|| "disabled".to_string());
+        let rpad_function = base_cfg
+            .settings
+            .get("RPAD")
+            .cloned()
+            .unwrap_or_else(|| "disabled".to_string());
+        let lpad = Pad { function: lpad_function };
+        let rpad = Pad { function: rpad_function };
+
         let settings = Settings {
             lstick,
             rstick,
+            lpad,
+            rpad,
             invert_cursor_axis,
             invert_scroll_axis,
             axis_16_bit,
@@ -353,6 +408,15 @@ impl EventReader {
             virt_dev,
             lstick_position,
             rstick_position,
+            lstick_raw,
+            rstick_raw,
+            imu_raw,
+            analog_state_export,
+            analog_snapshot,
+            lpad_position,
+            lpad_pressed,
+            rpad_position,
+            rpad_pressed,
             cursor_movement,
             scroll_movement,
             modifiers,
@@ -379,6 +443,13 @@ impl EventReader {
                 .find(|&x| x.associations == Associations::default())
                 .unwrap()
                 .name
+        );
+        // Enable virtual trackpad MT devices if mode == "trackpad".
+        // When mode == "disabled" (default), no device is created and no events forwarded;
+        // state tracking (position, touch, press → state.json) remains active either way.
+        self.virt_dev.lock().await.enable_trackpads(
+            self.settings.lpad.function == "trackpad",
+            self.settings.rpad.function == "trackpad",
         );
         self.write_state().await;
         self.start_control_socket().await;
@@ -429,6 +500,24 @@ impl EventReader {
             }
         }
         let mut had_device_error = false;
+        // Dirty flags: set when HAT axis data arrives, cleared after emitting on SYN_REPORT.
+        // This ensures we only forward trackpad events when new data actually arrived,
+        // avoiding spurious re-emits on SYNs caused by other axes (stick, triggers, etc.)
+        let mut lpad_dirty = false;
+        let mut rpad_dirty = false;
+        // Track previous touching state to detect transitions (lift/touch-down).
+        // Transitions always force an immediate state.json write, bypassing the rate limit.
+        let mut lpad_was_touching = false;
+        let mut rpad_was_touching = false;
+        // Dirty flags for stick axes — set whenever ABS_X/Y or ABS_RX/RY arrive.
+        let mut lstick_dirty = false;
+        let mut rstick_dirty = false;
+        // Dirty flag for IMU axes (ABS_HAT2X/Y).
+        let mut imu_dirty = false;
+        // Rate-limit state.json writes from trackpad/stick movement to ~60 Hz.
+        let mut last_trackpad_state_write = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(17))
+            .unwrap_or(std::time::Instant::now());
         while let Some(event_result) = stream.next().await {
             let event = match event_result {
                 Ok(e) => e,
@@ -459,6 +548,22 @@ impl EventReader {
                         if is_tablet =>
                     {
                         pen_events.push(event)
+                    }
+                    // Left trackpad physical click → forward to lpad MT device.
+                    Key::BTN_THUMB if self.settings.lpad.function == "trackpad" => {
+                        let pressed = event.value() != 0;
+                        *self.lpad_pressed.lock().await = pressed;
+                        let pos = *self.lpad_position.lock().await;
+                        self.emit_trackpad_event(true, pos.0, pos.1, Some(pressed)).await;
+                        self.write_state().await;
+                    }
+                    // Right trackpad physical click → forward to rpad MT device.
+                    Key::BTN_THUMB2 if self.settings.rpad.function == "trackpad" => {
+                        let pressed = event.value() != 0;
+                        *self.rpad_pressed.lock().await = pressed;
+                        let pos = *self.rpad_position.lock().await;
+                        self.emit_trackpad_event(false, pos.0, pos.1, Some(pressed)).await;
+                        self.write_state().await;
                     }
                     _ => {
                         self.convert_event(
@@ -515,89 +620,139 @@ impl EventReader {
                 }
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
                 (_, _, AbsoluteAxisType::ABS_HAT0X, _) => {
-                    match event.value() {
-                        -1 => {
-                            self.convert_event(event, Event::Axis(Axis::BTN_DPAD_LEFT), 1, false)
-                                .await;
-                            dpad_values.0 = -1;
-                        }
-                        1 => {
-                            self.convert_event(event, Event::Axis(Axis::BTN_DPAD_RIGHT), 1, false)
-                                .await;
-                            dpad_values.0 = 1;
-                        }
-                        0 => {
-                            match dpad_values.0 {
-                                -1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::BTN_DPAD_LEFT),
-                                        0,
-                                        false,
-                                    )
-                                    .await
-                                }
-                                1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::BTN_DPAD_RIGHT),
-                                        0,
-                                        false,
-                                    )
-                                    .await
-                                }
-                                _ => {}
+                    // Always track raw position for state export.
+                    self.lpad_position.lock().await.0 = event.value() as i32;
+                    lpad_dirty = true;
+                    if self.settings.lpad.function == "trackpad" {
+                        // Trackpad mode: emit to virtual MT device on SYN_REPORT (dirty flag set above).
+                    } else {
+                        // D-pad hat switch (non-Steam-Deck controllers).
+                        match event.value() {
+                            -1 => {
+                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_LEFT), 1, false)
+                                    .await;
+                                dpad_values.0 = -1;
                             }
-                            dpad_values.0 = 0;
+                            1 => {
+                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_RIGHT), 1, false)
+                                    .await;
+                                dpad_values.0 = 1;
+                            }
+                            0 => {
+                                match dpad_values.0 {
+                                    -1 => {
+                                        self.convert_event(
+                                            event,
+                                            Event::Axis(Axis::BTN_DPAD_LEFT),
+                                            0,
+                                            false,
+                                        )
+                                        .await
+                                    }
+                                    1 => {
+                                        self.convert_event(
+                                            event,
+                                            Event::Axis(Axis::BTN_DPAD_RIGHT),
+                                            0,
+                                            false,
+                                        )
+                                        .await
+                                    }
+                                    _ => {}
+                                }
+                                dpad_values.0 = 0;
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    };
+                    }
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT0Y, _) => {
-                    match event.value() {
-                        -1 => {
-                            self.convert_event(event, Event::Axis(Axis::BTN_DPAD_UP), 1, false)
-                                .await;
-                            dpad_values.1 = -1;
-                        }
-                        1 => {
-                            self.convert_event(event, Event::Axis(Axis::BTN_DPAD_DOWN), 1, false)
-                                .await;
-                            dpad_values.1 = 1;
-                        }
-                        0 => {
-                            match dpad_values.1 {
-                                -1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::BTN_DPAD_UP),
-                                        0,
-                                        false,
-                                    )
-                                    .await
-                                }
-                                1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::BTN_DPAD_DOWN),
-                                        0,
-                                        false,
-                                    )
-                                    .await
-                                }
-                                _ => {}
+                    // Always track raw position for state export.
+                    self.lpad_position.lock().await.1 = event.value() as i32;
+                    lpad_dirty = true;
+                    if self.settings.lpad.function == "trackpad" {
+                        // Trackpad mode: emit to virtual MT device on SYN_REPORT (dirty flag set above).
+                    } else {
+                        // D-pad hat switch (non-Steam-Deck controllers).
+                        match event.value() {
+                            -1 => {
+                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_UP), 1, false)
+                                    .await;
+                                dpad_values.1 = -1;
                             }
-                            dpad_values.1 = 0;
+                            1 => {
+                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_DOWN), 1, false)
+                                    .await;
+                                dpad_values.1 = 1;
+                            }
+                            0 => {
+                                match dpad_values.1 {
+                                    -1 => {
+                                        self.convert_event(
+                                            event,
+                                            Event::Axis(Axis::BTN_DPAD_UP),
+                                            0,
+                                            false,
+                                        )
+                                        .await
+                                    }
+                                    1 => {
+                                        self.convert_event(
+                                            event,
+                                            Event::Axis(Axis::BTN_DPAD_DOWN),
+                                            0,
+                                            false,
+                                        )
+                                        .await
+                                    }
+                                    _ => {}
+                                }
+                                dpad_values.1 = 0;
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    };
+                    }
+                }
+                (_, _, AbsoluteAxisType::ABS_HAT1X, _) => {
+                    // Always track raw position for state export.
+                    self.rpad_position.lock().await.0 = event.value() as i32;
+                    rpad_dirty = true;
+                    if self.settings.rpad.function != "trackpad" {
+                        // Non-trackpad mode: nothing extra to do.
+                    }
+                }
+                (_, _, AbsoluteAxisType::ABS_HAT1Y, _) => {
+                    // Always track raw position for state export.
+                    self.rpad_position.lock().await.1 = event.value() as i32;
+                    rpad_dirty = true;
+                    if self.settings.rpad.function != "trackpad" {
+                        // Non-trackpad mode: nothing extra to do.
+                    }
+                }
+                // IMU (gyroscope/accelerometer): ABS_HAT2X/Y, range 0..32767.
+                // Stored for state export; not forwarded.
+                (_, _, AbsoluteAxisType::ABS_HAT2X, _) => {
+                    self.imu_raw.lock().await.0 = event.value() as i32;
+                    imu_dirty = true;
+                }
+                (_, _, AbsoluteAxisType::ABS_HAT2Y, _) => {
+                    self.imu_raw.lock().await.1 = event.value() as i32;
+                    imu_dirty = true;
                 }
                 (
                     EventType::ABSOLUTE,
                     _,
                     AbsoluteAxisType::ABS_X | AbsoluteAxisType::ABS_Y,
                     false,
-                ) => match self.settings.lstick.function.as_str() {
+                ) => {
+                    // Always store raw hardware value for state export, regardless of mode.
+                    {
+                        let raw = event.value() as i32;
+                        let mut lr = self.lstick_raw.lock().await;
+                        if event.code() == 0 { lr.0 = raw; } else { lr.1 = raw; }
+                        lstick_dirty = true;
+                    }
+                    match self.settings.lstick.function.as_str() {
                     "cursor" | "scroll" => {
                         let axis_value = self
                             .get_axis_value(&event, &self.settings.lstick.deadzone)
@@ -721,13 +876,23 @@ impl EventReader {
                         }
                     }
                     _ => {}
+                    } // end match lstick function
                 },
                 (
                     EventType::ABSOLUTE,
                     _,
                     AbsoluteAxisType::ABS_RX | AbsoluteAxisType::ABS_RY,
                     false,
-                ) => match self.settings.rstick.function.as_str() {
+                ) => {
+                    // Always store raw hardware value for state export, regardless of mode.
+                    {
+                        let raw = event.value() as i32;
+                        let mut rr = self.rstick_raw.lock().await;
+                        // ABS_RX = code 3, ABS_RY = code 4
+                        if event.code() == 3 { rr.0 = raw; } else { rr.1 = raw; }
+                        rstick_dirty = true;
+                    }
+                    match self.settings.rstick.function.as_str() {
                     "cursor" | "scroll" => {
                         let axis_value = self
                             .get_axis_value(&event, &self.settings.rstick.deadzone)
@@ -855,6 +1020,7 @@ impl EventReader {
                         }
                     }
                     _ => {}
+                    } // end match rstick function
                 },
                 (EventType::ABSOLUTE, _, AbsoluteAxisType::ABS_Z, false) => {
                     if !self.settings.stadia {
@@ -1046,6 +1212,44 @@ impl EventReader {
                         let mut virt_dev = self.virt_dev.lock().await;
                         virt_dev.abs.emit(&pen_events).unwrap();
                         pen_events.clear()
+                    }
+                }
+                (EventType::SYNCHRONIZATION, _, _, _) => {
+                    // SYN_REPORT: emit complete, consistent trackpad state once per frame,
+                    // but only when new HAT data actually arrived (dirty flag).
+                    // Without this guard, every SYN from sticks/triggers would re-emit the
+                    // trackpad position, confusing libinput's velocity calculation.
+                    let pad_changed = lpad_dirty || rpad_dirty;
+                    if lpad_dirty {
+                        lpad_dirty = false;
+                        let (x, y) = *self.lpad_position.lock().await;
+                        self.emit_trackpad_event(true, x, y, None).await;
+                    }
+                    if rpad_dirty {
+                        rpad_dirty = false;
+                        let (x, y) = *self.rpad_position.lock().await;
+                        self.emit_trackpad_event(false, x, y, None).await;
+                    }
+                    // Write state.json on trackpad/stick movement, rate-limited to ~60 Hz.
+                    // Touch transitions (lift / touch-down) bypass the rate limit so
+                    // touching=false is always written promptly when the finger leaves.
+                    let stick_changed = lstick_dirty || rstick_dirty || imu_dirty;
+                    if lstick_dirty { lstick_dirty = false; }
+                    if rstick_dirty { rstick_dirty = false; }
+                    if imu_dirty { imu_dirty = false; }
+                    if pad_changed || stick_changed {
+                        let lpad_pos = *self.lpad_position.lock().await;
+                        let rpad_pos = *self.rpad_position.lock().await;
+                        let lpad_touching = lpad_pos.0 != 0 || lpad_pos.1 != 0;
+                        let rpad_touching = rpad_pos.0 != 0 || rpad_pos.1 != 0;
+                        let touch_transition = lpad_touching != lpad_was_touching
+                            || rpad_touching != rpad_was_touching;
+                        lpad_was_touching = lpad_touching;
+                        rpad_was_touching = rpad_touching;
+                        if touch_transition || last_trackpad_state_write.elapsed().as_millis() >= 16 {
+                            last_trackpad_state_write = std::time::Instant::now();
+                            self.write_state_analog().await;
+                        }
                     }
                 }
                 _ => self.emit_default_event(event).await,
@@ -1437,6 +1641,46 @@ impl EventReader {
         }
     }
 
+    /// Emit a single multi-touch frame for a trackpad to its virtual uinput device.
+    /// `is_left`: true = lpad, false = rpad.
+    /// `x, y`: raw coordinates (0,0 means finger lifted).
+    /// `click`: physical press state (BTN_LEFT).
+    async fn emit_trackpad_event(&self, is_left: bool, x: i32, y: i32, click: Option<bool>) {
+        let mut vd = self.virt_dev.lock().await;
+        let dev = if is_left { vd.lpad.as_mut() } else { vd.rpad.as_mut() };
+        let dev = match dev {
+            Some(d) => d,
+            None => return,
+        };
+        // Negate Y: Steam Deck hardware Y increases upward, libinput expects Y increasing downward.
+        let y = -y;
+        let touching = x != 0 || y != 0;
+        // BTN_TOUCH + BTN_TOOL_FINGER
+        dev.emit(&[InputEvent::new_now(EventType::KEY, Key::BTN_TOUCH.code(), touching as i32)]).ok();
+        dev.emit(&[InputEvent::new_now(EventType::KEY, Key::BTN_TOOL_FINGER.code(), touching as i32)]).ok();
+        if touching {
+            // Axis numbers from include/uapi/linux/input-event-codes.h:
+            // ABS_MT_SLOT = 0x2f = 47, ABS_MT_TRACKING_ID = 0x39 = 57
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 47, 0)]).ok();  // ABS_MT_SLOT = 0
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 57, 1)]).ok();  // ABS_MT_TRACKING_ID
+            // ABS_MT_POSITION_X = 0x35 = 53, ABS_MT_POSITION_Y = 0x36 = 54
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 53, x)]).ok();
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 54, y)]).ok();
+            // Single-touch compat axes
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 0, x)]).ok();
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 1, y)]).ok();
+        } else {
+            // Lift: invalidate MT tracking id
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 47, 0)]).ok();  // ABS_MT_SLOT
+            dev.emit(&[InputEvent::new_now(EventType::ABSOLUTE, 57, -1)]).ok(); // ABS_MT_TRACKING_ID = -1
+        }
+        if let Some(pressed) = click {
+            dev.emit(&[InputEvent::new_now(EventType::KEY, Key::BTN_LEFT.code(), pressed as i32)]).ok();
+        }
+        // SYN_REPORT
+        dev.emit(&[InputEvent::new_now(EventType::SYNCHRONIZATION, 0, 0)]).ok();
+    }
+
     async fn get_axis_value(&self, event: &InputEvent, deadzone: &i32) -> i32 {
         let distance_from_center: i32 = match self.settings.axis_16_bit {
             false => (event.value() as i32 - 128) * 200,
@@ -1537,6 +1781,17 @@ impl EventReader {
     }
 
     async fn write_state(&self) {
+        self.write_state_inner(false).await;
+    }
+
+    async fn write_state_analog(&self) {
+        if !*self.analog_state_export.lock().await {
+            return;
+        }
+        self.write_state_inner(true).await;
+    }
+
+    async fn write_state_inner(&self, analog_triggered: bool) {
         // Each lock acquisition is guarded by a timeout so that a deadlock
         // (same task trying to re-acquire a lock it already holds) surfaces
         // immediately in the journal instead of silently freezing makima.
@@ -1599,7 +1854,76 @@ impl EventReader {
                 .to_string();
             vec![base_name, app_part]
         };
-        crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack).await;
+        let lpad_pos = *self.lpad_position.lock().await;
+        let lpad_pressed = *self.lpad_pressed.lock().await;
+        let rpad_pos = *self.rpad_position.lock().await;
+        let rpad_pressed = *self.rpad_pressed.lock().await;
+        let lpad_x = crate::analog::normalize(lpad_pos.0);
+        let lpad_y = crate::analog::normalize(lpad_pos.1);
+        let rpad_x = crate::analog::normalize(rpad_pos.0);
+        let rpad_y = crate::analog::normalize(rpad_pos.1);
+        let lstick_raw = *self.lstick_raw.lock().await;
+        let rstick_raw = *self.rstick_raw.lock().await;
+        let imu_raw = *self.imu_raw.lock().await;
+        let analog_state_export = *self.analog_state_export.lock().await;
+        let lstick_dz = crate::analog::normalize_dz(self.settings.lstick.deadzone);
+        let rstick_dz = crate::analog::normalize_dz(self.settings.rstick.deadzone);
+        let lstick_x = crate::analog::normalize(lstick_raw.0);
+        let lstick_y = crate::analog::normalize_y(lstick_raw.1); // negated: hardware up = negative ABS_Y
+        let rstick_x = crate::analog::normalize(rstick_raw.0);
+        let rstick_y = crate::analog::normalize_y(rstick_raw.1); // negated: hardware up = negative ABS_Y
+        // For analog-triggered writes (SYN_REPORT): skip if all rounded values unchanged.
+        // For button-triggered writes: always write, but invalidate the snapshot so the
+        // next analog write goes through even if analog values haven't moved.
+        let new_snap: [f32; 8] = [
+            lstick_x, lstick_y, rstick_x, rstick_y,
+            lpad_x, lpad_y, rpad_x, rpad_y,
+        ];
+        {
+            let mut snap = self.analog_snapshot.lock().await;
+            if analog_triggered && *snap == new_snap {
+                return;
+            }
+            *snap = new_snap;
+        }
+        let trackpads = serde_json::json!({
+            "lpad": {
+                "mode": self.settings.lpad.function,
+                "x": lpad_x,
+                "y": lpad_y,
+                "touching": crate::analog::is_touching(lpad_pos.0, lpad_pos.1),
+                "pressed": lpad_pressed,
+            },
+            "rpad": {
+                "mode": self.settings.rpad.function,
+                "x": rpad_x,
+                "y": rpad_y,
+                "touching": crate::analog::is_touching(rpad_pos.0, rpad_pos.1),
+                "pressed": rpad_pressed,
+            },
+        });
+        let sticks = serde_json::json!({
+            "lstick": {
+                "mode": self.settings.lstick.function,
+                "x": lstick_x,
+                "y": lstick_y,
+                "deadzone": lstick_dz,
+                "active": crate::analog::is_active(lstick_x, lstick_y, lstick_dz),
+            },
+            "rstick": {
+                "mode": self.settings.rstick.function,
+                "x": rstick_x,
+                "y": rstick_y,
+                "deadzone": rstick_dz,
+                "active": crate::analog::is_active(rstick_x, rstick_y, rstick_dz),
+            },
+        });
+        // IMU: normalize 0..32767 → 0.0..1.0 (unsigned range).
+        let imu = serde_json::json!({
+            "x": crate::analog::normalize(imu_raw.0),
+            "y": crate::analog::normalize(imu_raw.1),
+        });
+        crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack, trackpads, sticks, imu, analog_state_export).await;
     }
 
     /// Record the actual emitted key output for the HUD last-event display.
@@ -1635,13 +1959,14 @@ impl EventReader {
     }
 
     async fn start_control_socket(&self) {
-        let paused         = self.paused.clone();
-        let last_action    = self.last_action.clone();
-        let current_config = self.current_config.clone();
-        let modifiers      = self.modifiers.clone();
-        let active_layout  = self.active_layout.clone();
-        let held_keys      = self.held_keys.clone();
-        let all_configs    = self.config.clone();
+        let paused          = self.paused.clone();
+        let last_action     = self.last_action.clone();
+        let current_config  = self.current_config.clone();
+        let modifiers       = self.modifiers.clone();
+        let active_layout   = self.active_layout.clone();
+        let held_keys       = self.held_keys.clone();
+        let all_configs     = self.config.clone();
+        let analog_state_export  = self.analog_state_export.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file("/tmp/makima-control.sock");
             let listener = match UnixListener::bind("/tmp/makima-control.sock") {
@@ -1652,13 +1977,14 @@ impl EventReader {
                 }
             };
             while let Ok((stream, _addr)) = listener.accept().await {
-                let paused         = paused.clone();
-                let last_action    = last_action.clone();
-                let current_config = current_config.clone();
-                let modifiers      = modifiers.clone();
-                let active_layout  = active_layout.clone();
-                let held_keys      = held_keys.clone();
-                let all_configs    = all_configs.clone();
+                let paused          = paused.clone();
+                let last_action     = last_action.clone();
+                let current_config  = current_config.clone();
+                let modifiers       = modifiers.clone();
+                let active_layout   = active_layout.clone();
+                let held_keys       = held_keys.clone();
+                let all_configs     = all_configs.clone();
+                let analog_state_export  = analog_state_export.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream.into_std().unwrap());
                     let mut line = String::new();
@@ -1708,7 +2034,14 @@ impl EventReader {
                                 };
                                 crate::state_export::write_state(
                                     &config, &mods, layout, is_paused, &hk, &la, &stack,
+                                    serde_json::Value::Null,
+                                    serde_json::Value::Null,
+                                    serde_json::Value::Null,
+                                    false,
                                 ).await;
+                            }
+                            "analog-state-export on" | "analog-state-export off" => {
+                                *analog_state_export.lock().await = cmd == "analog-state-export on";
                             }
                             _ => {}
                         }

@@ -3,11 +3,26 @@
 > **Deckery-specific fork of [cyber-sushi/makima](https://github.com/cyber-sushi/makima).**
 > For installation, configuration and general usage see the [upstream README](https://github.com/cyber-sushi/makima#readme).
 
-This fork is maintained as part of the [Plasma Deckery](https://github.com/Plasma-Deckery) project — a Steam-independent input stack for the Steam Deck in desktop mode.
+This fork is maintained as part of the [Plasma Deckery](https://github.com/Plasma-Deckery) project — a Steam-independent input stack for the Steam Deck in desktop mode. The scope of makima is extended here to meet the requirements of a handheld device: hardware-specific input translation, live UI integration, and analog sensor export.
 
 ---
 
 ## What's different from upstream
+
+Quick overview — details in the sections below:
+
+- **Bug fixes** — D-Pad remapping, x11rb Wayland crash, evdev reconnect on device error (all submitted as upstream PRs)
+- **kdotool replaced** — window focus detected event-driven via KWin D-Bus script; no subprocess spawning on every button press
+- **Per-app configs with inheritance** — app overrides only declare what differs; everything else is merged from the base config at runtime
+- **Binding attributes** — `label`, `no_pause` as inline-table syntax on any binding
+- **State export** → `/tmp/makima-state.json` — fully-resolved binding map, modifier state, active buttons, last action; written atomically on every relevant event
+- **Analog state export** — sticks, trackpads, IMU normalized to −1…+1 and written at up to 60 Hz; deduplicated so only changed values trigger a write; toggled via IPC
+- **Trackpad MT translation** — `ABS_HAT0/1 X/Y` → virtual uinput multi-touch device; enables libinput gesture recognition when `LPAD/RPAD = "trackpad"`
+- **Pause / Resume IPC** — Unix socket at `/tmp/makima-control.sock`; paused state reflected in `state.json`
+- **Steam Deck keycodes** — `BTN_GRIPL`, `BTN_GRIPR`, `BTN_GRIPL2`, `BTN_GRIPR2` for the back paddles (patched `evdev` crate)
+- **Unit test suite** — 69 tests covering resolver, state export, analog helpers, and config parsing
+
+---
 
 ### Bug fixes (submitted as upstream PRs)
 
@@ -38,6 +53,36 @@ BTN_TL-BTN_DPAD_UP    = ["KEY_LEFTCTRL", "KEY_R"]     # L1+↑ → Reload
 CUSTOM_MODIFIERS = "BTN_TL-BTN_MODE"
 GRAB_DEVICE = "false"
 ```
+
+---
+
+### Trackpad emulation as system touchpads
+
+The Steam Deck trackpads are capable input surfaces, but the raw `ABS_HAT` events they produce are invisible to gesture tools — they expect standard Linux multi-touch devices. By translating the trackpad data into proper MT events and exposing virtual uinput devices, makima makes both pads visible to tools like `libinput-gestures` or `fusuma`. This is the prerequisite for defining custom gestures per pad (swipe zones, tap areas, circular scroll) without having to implement gesture recognition inside makima itself.
+
+With `LPAD = "trackpad"` or `RPAD = "trackpad"` in the config, makima translates the raw Steam Deck trackpad axes into proper Linux multi-touch events and exposes them as standard uinput touchpad devices — `Deckery Left Trackpad` and `Deckery Right Trackpad`.
+
+The Steam Deck kernel driver (`hid-steam`) delivers trackpad data as absolute axes on the gamepad device:
+
+```
+ABS_HAT0X / ABS_HAT0Y  →  left trackpad position  (−32767 … +32767)
+ABS_HAT1X / ABS_HAT1Y  →  right trackpad position
+BTN_THUMB              →  left trackpad physical click
+BTN_THUMB2             →  right trackpad physical click
+```
+
+makima translates these to `ABS_MT_POSITION_X/Y` + `BTN_TOUCH` + `BTN_TOOL_FINGER` frames on the virtual device, with Y-axis corrected to libinput convention (hardware reports up as negative; the virtual device flips this). Once the virtual device exists, gesture tools like `libinput-gestures` or `fusuma` can read it and map swipes, taps, and zones to arbitrary actions — independently configurable per pad.
+
+```toml
+[settings]
+LPAD = "trackpad"   # creates "Deckery Left Trackpad" virtual MT device
+RPAD = "trackpad"   # creates "Deckery Right Trackpad" virtual MT device
+# LPAD = "disabled" # default — no virtual device, but position is still tracked in state.json
+```
+
+Trackpad position, touch state, and press state are always tracked and exported to `state.json` regardless of the mode setting — the HUD can visualize trackpad input even when `"disabled"`.
+
+> **Note:** Full Steam independence requires suppressing the kernel driver's Lizard Mode (its built-in mouse/scroll fallback). While Steam is running it handles this automatically. Makima-native Lizard Mode suppression is planned for Phase 2 (`GRAB_DEVICE = "true"`).
 
 ---
 
@@ -107,11 +152,13 @@ BTN_THUMBL = { run = ["deckery-hud-toggle"], no_pause = true, label = "Toggle HU
 
 ### Pause / Resume IPC
 
-makima-deckery exposes a Unix socket at `/tmp/makima.sock` for pause/resume control:
+makima-deckery exposes a Unix socket at `/tmp/makima-control.sock` for runtime control:
 
 ```bash
-echo "pause"  | nc -U /tmp/makima.sock   # suspend all remapping
-echo "resume" | nc -U /tmp/makima.sock   # re-enable remapping
+echo "pause"               | socat - UNIX-CONNECT:/tmp/makima-control.sock
+echo "resume"              | socat - UNIX-CONNECT:/tmp/makima-control.sock
+echo "analog-state-export on"  | socat - UNIX-CONNECT:/tmp/makima-control.sock
+echo "analog-state-export off" | socat - UNIX-CONNECT:/tmp/makima-control.sock
 ```
 
 When paused, all input passes through unmodified. The `paused` flag is reflected in `/tmp/makima-state.json`. The primary use case is **HUD dry-run mode**: the overlay can show the full binding map without any remapping actually taking effect — useful for exploring layouts without triggering actions.
