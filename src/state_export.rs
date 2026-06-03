@@ -134,6 +134,7 @@ pub fn build_state(
                 .map(|k| serde_json::Value::String(format!("{:?}", k)))
                 .collect();
             let label = config.bindings.labels.get(&(*trigger, combo.clone()));
+            let silent = config.bindings.silent.contains(&(*trigger, combo.clone()));
             bindings.insert(
                 key,
                 serde_json::json!({
@@ -141,6 +142,7 @@ pub fn build_state(
                     "origin": origin_remap(trigger, combo),
                     "label": label,
                     "kind": "remap",
+                    "silent": silent,
                 }),
             );
         }
@@ -294,6 +296,13 @@ pub fn build_state(
     sorted_mods.dedup();
     let mut active_outputs: Vec<String> = Vec::new();
     for held_event in held_keys {
+        // silent = true on either the exact combo or the base binding suppresses
+        // this binding's output from active_outputs (HUD won't highlight it).
+        let is_silent = config.bindings.silent.contains(&(*held_event, sorted_mods.clone()))
+            || config.bindings.silent.contains(&(*held_event, vec![]));
+        if is_silent {
+            continue;
+        }
         match resolve_binding(&config.bindings, *held_event, &sorted_mods, chain_only) {
             ResolvedBinding::Keys { keys, .. } => {
                 for k in &keys {
@@ -420,6 +429,7 @@ mod tests {
                 movements: HashMap::new(),
                 no_pause: HashSet::new(),
                 labels: HashMap::new(),
+                silent: HashSet::new(),
             },
             override_bindings: None,
             settings: HashMap::new(),
@@ -622,6 +632,83 @@ mod tests {
         assert_eq!(
             state["modifier_active"]["BTN_NORTH"]["label"].as_str().unwrap(),
             "Copy"
+        );
+    }
+
+    // ── silent attribute ──────────────────────────────────────────────────────
+
+    #[test]
+    fn silent_suppresses_active_outputs() {
+        // BTN_SOUTH → BTN_LEFT (mouse button), marked silent.
+        // active_outputs must be empty even when BTN_SOUTH is held.
+        let btn_south = key(Key::BTN_SOUTH);
+        let mut config = make_config(
+            vec![(btn_south, vec![], vec![Key::BTN_LEFT])],
+            vec![], vec![],
+        );
+        config.bindings.silent.insert((btn_south, vec![]));
+        let state = build_state(&config, &[], 0, false, &[btn_south], &None, &["test".to_string()]);
+        assert_eq!(active_outputs(&state), Vec::<String>::new(),
+            "silent binding must not appear in active_outputs");
+    }
+
+    #[test]
+    fn silent_combo_suppresses_active_outputs() {
+        // BTN_TL-BTN_SOUTH → BTN_LEFT, marked silent.
+        // When BTN_SOUTH held with BTN_TL modifier, active_outputs still empty.
+        let btn_tl = key(Key::BTN_TL);
+        let btn_south = key(Key::BTN_SOUTH);
+        let mut config = make_config(
+            vec![(btn_south, vec![btn_tl], vec![Key::BTN_LEFT])],
+            vec![], vec![btn_tl],
+        );
+        config.bindings.silent.insert((btn_south, vec![btn_tl]));
+        let state = build_state(&config, &[btn_tl], 0, false, &[btn_south], &None, &["test".to_string()]);
+        assert_eq!(active_outputs(&state), Vec::<String>::new(),
+            "silent combo binding must not appear in active_outputs");
+    }
+
+    #[test]
+    fn non_silent_binding_still_visible() {
+        // Sanity: a regular (non-silent) binding must still appear in active_outputs.
+        let btn_south = key(Key::BTN_SOUTH);
+        let config = make_config(
+            vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
+            vec![], vec![],
+        );
+        let state = build_state(&config, &[], 0, false, &[btn_south], &None, &["test".to_string()]);
+        assert_eq!(active_outputs(&state), vec!["KEY_ENTER"]);
+    }
+
+    #[test]
+    fn silent_flag_in_bindings_json() {
+        // silent = true must appear in the bindings JSON entry for the HUD.
+        let btn_south = key(Key::BTN_SOUTH);
+        let mut config = make_config(
+            vec![(btn_south, vec![], vec![Key::BTN_LEFT])],
+            vec![], vec![],
+        );
+        config.bindings.silent.insert((btn_south, vec![]));
+        let state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        assert_eq!(
+            state["bindings"]["BTN_SOUTH"]["silent"].as_bool().unwrap(),
+            true,
+            "silent flag must be present in bindings JSON"
+        );
+    }
+
+    #[test]
+    fn non_silent_binding_silent_false_in_json() {
+        // silent defaults to false for normal bindings.
+        let btn_south = key(Key::BTN_SOUTH);
+        let config = make_config(
+            vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
+            vec![], vec![],
+        );
+        let state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        assert_eq!(
+            state["bindings"]["BTN_SOUTH"]["silent"].as_bool().unwrap(),
+            false
         );
     }
 
@@ -945,6 +1032,7 @@ mod tests {
                 movements: HashMap::new(),
                 no_pause: HashSet::new(),
                 labels: HashMap::new(),
+                silent: HashSet::new(),
             },
             override_bindings: Some(Bindings {
                 remap: override_remap,
@@ -952,6 +1040,7 @@ mod tests {
                 movements: HashMap::new(),
                 no_pause: HashSet::new(),
                 labels: HashMap::new(),
+                silent: HashSet::new(),
             }),
             settings: HashMap::new(),
             mapped_modifiers: MappedModifiers {
