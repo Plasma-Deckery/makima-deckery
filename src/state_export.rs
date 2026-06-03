@@ -294,19 +294,19 @@ pub fn build_state(
     let mut sorted_mods = modifiers.to_vec();
     sorted_mods.sort();
     sorted_mods.dedup();
-    let mut active_outputs: Vec<String> = Vec::new();
+    // active_outputs: array of { key, silent } objects.
+    // All resolved key outputs are included; silent=true entries are tagged
+    // so the HUD can choose to suppress or dim them — not omitted by the backend.
+    let mut active_outputs_map: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
     for held_event in held_keys {
-        // silent = true on either the exact combo or the base binding suppresses
-        // this binding's output from active_outputs (HUD won't highlight it).
         let is_silent = config.bindings.silent.contains(&(*held_event, sorted_mods.clone()))
             || config.bindings.silent.contains(&(*held_event, vec![]));
-        if is_silent {
-            continue;
-        }
         match resolve_binding(&config.bindings, *held_event, &sorted_mods, chain_only) {
             ResolvedBinding::Keys { keys, .. } => {
                 for k in &keys {
-                    active_outputs.push(format!("{:?}", k));
+                    let key_str = format!("{:?}", k);
+                    // If the key already exists as non-silent, keep it non-silent.
+                    active_outputs_map.entry(key_str).or_insert(is_silent);
                 }
             }
             // Command or movement handles this event — no key output.
@@ -315,8 +315,15 @@ pub fn build_state(
             ResolvedBinding::Hold { .. } | ResolvedBinding::Unbound => {}
         }
     }
-    active_outputs.sort_by_key(|k| modifier_sort_key(k.as_str()));
-    active_outputs.dedup();
+    // Sort by modifier rank first, then alphabetically (BTreeMap gives alpha order).
+    let mut active_outputs_sorted: Vec<(String, bool)> = active_outputs_map.into_iter().collect();
+    active_outputs_sorted.sort_by(|(a, _), (b, _)| {
+        modifier_sort_key(a.as_str()).cmp(&modifier_sort_key(b.as_str()))
+    });
+    let active_outputs: Vec<serde_json::Value> = active_outputs_sorted
+        .into_iter()
+        .map(|(key, silent)| serde_json::json!({ "key": key, "silent": silent }))
+        .collect();
 
     // available_modifiers: custom modifier buttons that, if pressed next,
     // would unlock at least one additional combo binding.
@@ -441,13 +448,31 @@ mod tests {
         }
     }
 
-    fn active_outputs(state: &serde_json::Value) -> Vec<String> {
+    /// Extract active_outputs keys (ignoring silent flag) for easy assertions.
+    fn active_output_keys(state: &serde_json::Value) -> Vec<String> {
         state["context"]["active_outputs"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap().to_string())
+            .map(|v| v["key"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// Extract (key, silent) pairs from active_outputs.
+    fn active_outputs_tagged(state: &serde_json::Value) -> Vec<(String, bool)> {
+        state["context"]["active_outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| (
+                v["key"].as_str().unwrap().to_string(),
+                v["silent"].as_bool().unwrap(),
+            ))
+            .collect()
+    }
+
+    fn active_outputs(state: &serde_json::Value) -> Vec<String> {
+        active_output_keys(state)
     }
 
     fn available_modifiers(state: &serde_json::Value) -> Vec<String> {
@@ -638,9 +663,9 @@ mod tests {
     // ── silent attribute ──────────────────────────────────────────────────────
 
     #[test]
-    fn silent_suppresses_active_outputs() {
-        // BTN_SOUTH → BTN_LEFT (mouse button), marked silent.
-        // active_outputs must be empty even when BTN_SOUTH is held.
+    fn silent_binding_tagged_in_active_outputs() {
+        // BTN_SOUTH → BTN_LEFT, marked silent.
+        // active_outputs must include BTN_LEFT but with silent=true.
         let btn_south = key(Key::BTN_SOUTH);
         let mut config = make_config(
             vec![(btn_south, vec![], vec![Key::BTN_LEFT])],
@@ -648,14 +673,15 @@ mod tests {
         );
         config.bindings.silent.insert((btn_south, vec![]));
         let state = build_state(&config, &[], 0, false, &[btn_south], &None, &["test".to_string()]);
-        assert_eq!(active_outputs(&state), Vec::<String>::new(),
-            "silent binding must not appear in active_outputs");
+        let tagged = active_outputs_tagged(&state);
+        assert_eq!(tagged, vec![("BTN_LEFT".to_string(), true)],
+            "silent binding must appear in active_outputs with silent=true");
     }
 
     #[test]
-    fn silent_combo_suppresses_active_outputs() {
+    fn silent_combo_tagged_in_active_outputs() {
         // BTN_TL-BTN_SOUTH → BTN_LEFT, marked silent.
-        // When BTN_SOUTH held with BTN_TL modifier, active_outputs still empty.
+        // active_outputs includes BTN_LEFT tagged silent=true.
         let btn_tl = key(Key::BTN_TL);
         let btn_south = key(Key::BTN_SOUTH);
         let mut config = make_config(
@@ -664,20 +690,22 @@ mod tests {
         );
         config.bindings.silent.insert((btn_south, vec![btn_tl]));
         let state = build_state(&config, &[btn_tl], 0, false, &[btn_south], &None, &["test".to_string()]);
-        assert_eq!(active_outputs(&state), Vec::<String>::new(),
-            "silent combo binding must not appear in active_outputs");
+        let tagged = active_outputs_tagged(&state);
+        assert_eq!(tagged, vec![("BTN_LEFT".to_string(), true)],
+            "silent combo must appear in active_outputs with silent=true");
     }
 
     #[test]
-    fn non_silent_binding_still_visible() {
-        // Sanity: a regular (non-silent) binding must still appear in active_outputs.
+    fn non_silent_binding_tagged_false() {
+        // A regular binding appears with silent=false.
         let btn_south = key(Key::BTN_SOUTH);
         let config = make_config(
             vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
             vec![], vec![],
         );
         let state = build_state(&config, &[], 0, false, &[btn_south], &None, &["test".to_string()]);
-        assert_eq!(active_outputs(&state), vec!["KEY_ENTER"]);
+        let tagged = active_outputs_tagged(&state);
+        assert_eq!(tagged, vec![("KEY_ENTER".to_string(), false)]);
     }
 
     #[test]
