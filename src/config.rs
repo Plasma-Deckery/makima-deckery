@@ -8,7 +8,7 @@ use std::{collections::{HashMap, HashSet}, str::FromStr};
 #[serde(untagged)]
 enum RemapValue {
     Simple(Vec<Key>),
-    WithAttrs { keys: Vec<Key>, #[serde(default)] no_pause: bool, #[serde(default)] label: Option<String> },
+    WithAttrs { keys: Vec<Key>, #[serde(default)] no_pause: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool },
 }
 
 /// Value for a `[commands]` entry — simple array or inline table with attributes.
@@ -130,6 +130,9 @@ pub struct Bindings {
     /// Human-readable label per (trigger, combo), exported to the state JSON.
     /// Set via `label = "…"` in an inline-table binding.
     pub labels: HashMap<(Event, Vec<Event>), String>,
+    /// Bindings whose outputs are suppressed from active_outputs in the HUD.
+    /// Set via `silent = true` in an inline-table binding.
+    pub silent: HashSet<(Event, Vec<Event>)>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -237,10 +240,11 @@ impl Config {
             for (combo, actions) in modifier_map {
                 if let Some(m) = merged.commands.get_mut(trigger)  { m.remove(combo); }
                 if let Some(m) = merged.movements.get_mut(trigger) { m.remove(combo); }
-                // Label belongs to the action: evict base label so a stale
-                // description (e.g. "Previous Desktop") never appears next to
-                // a replaced action. Override label, if any, is re-added below.
+                // Label and silent belong to the action: evict base values so a
+                // stale description or silence flag never sticks to a replaced action.
+                // Override values, if any, are re-added below.
                 merged.labels.remove(&(*trigger, combo.clone()));
+                merged.silent.remove(&(*trigger, combo.clone()));
                 merged.remap.entry(*trigger).or_default().insert(combo.clone(), actions.clone());
             }
         }
@@ -249,6 +253,7 @@ impl Config {
                 if let Some(m) = merged.remap.get_mut(trigger)     { m.remove(combo); }
                 if let Some(m) = merged.movements.get_mut(trigger) { m.remove(combo); }
                 merged.labels.remove(&(*trigger, combo.clone()));
+                merged.silent.remove(&(*trigger, combo.clone()));
                 merged.commands.entry(*trigger).or_default().insert(combo.clone(), cmds.clone());
             }
         }
@@ -257,16 +262,20 @@ impl Config {
                 if let Some(m) = merged.remap.get_mut(trigger)    { m.remove(combo); }
                 if let Some(m) = merged.commands.get_mut(trigger) { m.remove(combo); }
                 merged.labels.remove(&(*trigger, combo.clone()));
+                merged.silent.remove(&(*trigger, combo.clone()));
                 merged.movements.entry(*trigger).or_default().insert(combo.clone(), *movement);
             }
         }
 
-        // Override no_pause and labels win; base values are already in merged.
+        // Override no_pause, labels, and silent win; base values are already in merged.
         for entry in &self.bindings.no_pause {
             merged.no_pause.insert(entry.clone());
         }
         for (key, label) in &self.bindings.labels {
             merged.labels.insert(key.clone(), label.clone());
+        }
+        for entry in &self.bindings.silent {
+            merged.silent.insert(entry.clone());
         }
 
         self.bindings = merged;
@@ -330,9 +339,9 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
     mapped_modifiers.custom.extend(rstick_activation_modifiers);
 
     for (input, value) in remap.clone() {
-        let (output, np, lbl) = match value {
-            RemapValue::Simple(keys) => (keys, false, None),
-            RemapValue::WithAttrs { keys, no_pause, label } => (keys, no_pause, label),
+        let (output, np, lbl, sl) = match value {
+            RemapValue::Simple(keys) => (keys, false, None, false),
+            RemapValue::WithAttrs { keys, no_pause, label, silent } => (keys, no_pause, label, silent),
         };
         if let Some((mods, event)) = input.rsplit_once("-") {
             let str_modifiers = mods.split("-").collect::<Vec<&str>>();
@@ -355,7 +364,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
                 modifiers.push(Event::Hold);
             }
             if let Ok(event) = Axis::from_str(event) {
-                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); }
+                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Axis(event), modifiers.clone())); }
                 if !bindings.remap.contains_key(&Event::Axis(event)) {
                     bindings
                         .remap
@@ -368,7 +377,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
                         .insert(modifiers, output);
                 }
             } else if let Ok(event) = Key::from_str(event) {
-                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); }
+                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Key(event), modifiers.clone())); }
                 if !bindings.remap.contains_key(&Event::Key(event)) {
                     bindings
                         .remap
@@ -384,7 +393,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
         } else {
             let modifiers: Vec<Event> = Vec::new();
             if let Ok(event) = Axis::from_str(input.as_str()) {
-                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); }
+                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Axis(event), modifiers.clone())); }
                 if !bindings.remap.contains_key(&Event::Axis(event)) {
                     bindings
                         .remap
@@ -397,7 +406,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
                         .insert(modifiers, output);
                 }
             } else if let Ok(event) = Key::from_str(input.as_str()) {
-                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); }
+                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Key(event), modifiers.clone())); }
                 if !bindings.remap.contains_key(&Event::Key(event)) {
                     bindings
                         .remap

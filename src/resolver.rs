@@ -187,6 +187,7 @@ mod tests {
             movements: HashMap::new(),
             no_pause: no_pause.into_iter().collect::<HashSet<_>>(),
             labels: labels.into_iter().collect(),
+            silent: HashSet::new(),
         }
     }
 
@@ -429,6 +430,7 @@ mod tests {
             movements,
             no_pause: std::collections::HashSet::new(),
             labels: HashMap::new(),
+            silent: std::collections::HashSet::new(),
         };
         let result = resolve_binding(&bindings, trigger, &[], false);
         assert_eq!(result, ResolvedBinding::Movement { movement, is_combo: false });
@@ -448,6 +450,7 @@ mod tests {
             movements,
             no_pause: std::collections::HashSet::new(),
             labels: HashMap::new(),
+            silent: std::collections::HashSet::new(),
         };
         let result = resolve_binding(&bindings, trigger, &[btn_tl], false);
         assert_eq!(result, ResolvedBinding::Movement { movement, is_combo: true });
