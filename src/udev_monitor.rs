@@ -47,6 +47,21 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
         }
     }
 
+    // Suppress Steam Deck Lizard Mode — persists across device reinitializations.
+    // Reads SUPPRESS_LIZARD_MODE from any base config (default associations).
+    // Gracefully skips if the setting is absent or on non-Steam-Deck hardware.
+    {
+        use crate::lizard_mode::LizardModeSuppression;
+        let lizard_cfg = config_files
+            .iter()
+            .filter(|c| c.associations == Associations::default())
+            .find_map(|c| c.settings.get("SUPPRESS_LIZARD_MODE"))
+            .and_then(|v| LizardModeSuppression::from_setting(v));
+        if let Some(cfg) = lizard_cfg {
+            tokio::spawn(crate::lizard_mode::run_lizard_mode_suppression(cfg));
+        }
+    }
+
     let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
