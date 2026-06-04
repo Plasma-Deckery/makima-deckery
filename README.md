@@ -17,6 +17,7 @@ Quick overview — details in the sections below:
 - **Binding attributes** — extended configuration options per binding: human-readable display names and execution control flags
 - **State export** → `/tmp/makima-state.json` — all state needed for a real-time button preview HUD: active bindings, modifier context, currently held buttons, last executed action, and analog sensor values (sticks, trackpads, IMU)
 - **Trackpad MT translation** — both trackpads are emulated as standard system touchpad devices, activating existing trackpad gesture recognition tools on the left and right pad
+- **Lizard Mode suppression** — periodic hidraw heartbeat keeps the `hid-steam` kernel driver's built-in mouse/scroll fallback disabled without Steam running; configurable via `SUPPRESS_LIZARD_MODE`
 - **Pause / Resume IPC** — the service can be paused and resumed at any time via a Unix socket; useful for HUD dry-run mode where the overlay previews bindings without any remapping taking effect
 - **Steam Deck keycodes** — `BTN_GRIPL`, `BTN_GRIPR`, `BTN_GRIPL2`, `BTN_GRIPR2` for the back paddles (patched `evdev` crate)
 - **Unit test suite** — 69 tests covering resolver, state export, analog helpers, and config parsing
@@ -81,7 +82,32 @@ RPAD = "trackpad"   # creates "Deckery Right Trackpad" virtual MT device
 
 Trackpad position, touch state, and press state are always tracked and exported to `state.json` regardless of the mode setting — the HUD can visualize trackpad input even when `"disabled"`.
 
-> **Note:** Full Steam independence requires suppressing the kernel driver's Lizard Mode (its built-in mouse/scroll fallback). While Steam is running it handles this automatically. Makima-native Lizard Mode suppression is planned for Phase 2 (`GRAB_DEVICE = "true"`).
+---
+
+### Lizard Mode suppression
+
+The `hid-steam` kernel driver keeps a built-in mouse/scroll fallback ("Lizard Mode") active unless a userspace client suppresses it by sending HID feature reports periodically. Steam handles this while it is running — without it, the trackpads emit mouse events directly via the kernel driver, bypassing makima entirely.
+
+Makima-deckery takes over this role via a configurable hidraw heartbeat. On startup, it opens the raw controller hidraw device (the `.0005` interface, not the emulated keyboard/mouse nodes) and sends suppression reports every 4 s. The heartbeat is a built-in safety mechanism: if makima crashes or exits, the file descriptor is closed, and Lizard Mode re-activates automatically within ~8 s.
+
+Control which aspects are suppressed via `SUPPRESS_LIZARD_MODE` in the `[settings]` section of your base config:
+
+```toml
+[settings]
+SUPPRESS_LIZARD_MODE = "buttons,mouse"   # suppress both (recommended)
+SUPPRESS_LIZARD_MODE = "buttons"          # only clear keyboard/button mappings
+SUPPRESS_LIZARD_MODE = "mouse"            # only disable trackpad mouse/scroll emulation
+SUPPRESS_LIZARD_MODE = "false"            # disabled (default when setting is absent)
+```
+
+| Value | Effect |
+|---|---|
+| `"buttons"` | Sends `ID_CLEAR_DIGITAL_MAPPINGS` (0x81) — prevents the kernel driver from emitting arrow keys, Enter, Esc via d-pad and face buttons |
+| `"mouse"` | Sends `ID_SET_SETTINGS_VALUES` (0x87) with `TRACKPAD_NONE` — prevents the kernel driver from emitting mouse and scroll events from the trackpads |
+| `"buttons,mouse"` | Both of the above (recommended for full Steam independence) |
+| `"false"` / absent | Disabled — Lizard Mode is not suppressed |
+
+When the setting is absent, Lizard Mode is **not** suppressed. Makima gracefully skips the heartbeat task on non-Steam-Deck hardware (no Valve hidraw device found).
 
 ---
 
