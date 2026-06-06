@@ -1,0 +1,17 @@
+[Unit]
+Description=makima input remapper
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/makima
+Restart=on-failure
+RestartSec=3
+Environment=MAKIMA_CONFIG=%h/.config/makima
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=DISPLAY=:0
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_CURRENT_DESKTOP=KDE
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+[Install]
+WantedBy=graphical-session.target
