@@ -166,33 +166,30 @@ When paused, all input passes through unmodified. The `paused` flag is reflected
 
 ## Setup
 
-### Systemd services
-
-Two user services are required. Both are tracked in [steamdeck-dotfiles](https://github.com/Plasma-Deckery/steamdeck-dotfiles).
-
-**`makima.service`** runs the remapper. Environment variables must be hardcoded because the service starts before the desktop session environment is fully inherited:
-
-```ini
-[Service]
-ExecStart=/home/<user>/.local/bin/makima
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=DISPLAY=:0
-Environment=XDG_SESSION_TYPE=wayland
-Environment=XDG_CURRENT_DESKTOP=KDE
-```
-
-**`makima-resume-watcher.service`** watches for the `PrepareForSleep(false)` DBus signal and restarts makima after suspend. This is required because the Steam Deck kernel silently freezes evdev file descriptors on suspend without returning an error — makima cannot detect this on its own and will stop processing input until restarted.
+Requires [distrobox](https://github.com/containers/distrobox).
 
 ```bash
-systemctl --user enable --now makima.service
-systemctl --user enable --now makima-resume-watcher.service
+git clone https://github.com/Plasma-Deckery/makima-deckery
+cd makima-deckery
+bash install.sh          # one-time: container, systemd service, initial build
 ```
 
-### Building
+`install.sh` creates the `deckery` distrobox container (shared with deckery-hud), installs the Rust toolchain inside it, copies `systemd/makima.service.template` into `~/.config/systemd/user/`, and runs the first build. After code changes, use `redeploy.sh` instead (build + restart, no container setup).
 
-makima-deckery depends on a patched `evdev` crate that adds `BTN_GRIPL/R/L2/R2` keycodes for the Steam Deck's back paddles. The upstream binary does not include this.
+Prerequisites (manual, one-time):
 
-The build runs inside a [distrobox](https://github.com/containers/distrobox) container (`deckery`) with the Rust toolchain and patched dependencies pre-installed. See [steamdeck-dotfiles](https://github.com/Plasma-Deckery/steamdeck-dotfiles) for container setup.
+```bash
+sudo usermod -aG input $USER   # grants access to /dev/input/* and /dev/uinput
+# log out and back in after
+```
+
+The service environment variables (`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, etc.) are hardcoded in the unit because the service starts before the desktop session environment is fully inherited.
+
+**`makima-resume-watcher.service`** watches for the `PrepareForSleep(false)` DBus signal and restarts makima after suspend — the Steam Deck kernel silently freezes evdev file descriptors on suspend without returning an error, so makima cannot detect this on its own.
+
+```bash
+systemctl --user enable --now makima-resume-watcher.service
+```
 
 ---
 
