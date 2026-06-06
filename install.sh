@@ -21,7 +21,7 @@ fi
 # ── 2. Systemd user service (no sudo) ────────────────────────────────────────
 SERVICE_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SERVICE_DIR"
-GENERATED="$REPO/systemd/makima.service.template"
+GENERATED="$REPO/systemd/makima.service"
 INSTALLED="$SERVICE_DIR/makima.service"
 if ! diff -q "$GENERATED" "$INSTALLED" 2>/dev/null; then
     echo "Installing systemd user service..."
