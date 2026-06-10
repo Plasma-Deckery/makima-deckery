@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use crate::kwin_watcher;
 use tokio_stream::StreamExt;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Debug, Default, Eq, PartialEq, Hash, Clone)]
 pub enum Client {
@@ -30,7 +31,7 @@ pub struct Environment {
     pub server: Server,
 }
 
-pub async fn start_monitoring_udev(config_files: Vec<Config>, mut tasks: Vec<JoinHandle<()>>) {
+pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: String, mut tasks: Vec<JoinHandle<()>>) {
     let environment = set_environment();
     let device_error_notify = Arc::new(Notify::new());
     let active_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::Default));
@@ -56,6 +57,44 @@ pub async fn start_monitoring_udev(config_files: Vec<Config>, mut tasks: Vec<Joi
             .unwrap(),
     )
     .unwrap();
+
+    // Config file watcher — fires when any .toml in config_dir changes.
+    let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut watcher = RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                use notify::EventKind::*;
+                match event.kind {
+                    Create(_) | Modify(_) | Remove(_) => { let _ = config_tx.try_send(()); }
+                    _ => {}
+                }
+            }
+        },
+        notify::Config::default(),
+    ).expect("Failed to create config file watcher");
+    watcher.watch(std::path::Path::new(&config_dir), RecursiveMode::NonRecursive)
+        .expect("Failed to watch config directory");
+    // Also watch the real target directories of any symlinked .toml files,
+    // so edits to symlink targets (e.g. files in a git repo) are detected.
+    if let Ok(entries) = std::fs::read_dir(&config_dir) {
+        let mut extra_dirs: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                if let Ok(real) = std::fs::canonicalize(&path) {
+                    if real != path {
+                        if let Some(parent) = real.parent() {
+                            extra_dirs.insert(parent.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+        for dir in extra_dirs {
+            let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+        }
+    }
+
     loop {
         tokio::select! {
             event = monitor.next() => {
@@ -77,6 +116,19 @@ pub async fn start_monitoring_udev(config_files: Vec<Config>, mut tasks: Vec<Joi
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+            }
+            Some(_) = config_rx.recv() => {
+                // Debounce: drain any queued events, then wait briefly for the
+                // editor to finish writing.
+                while config_rx.try_recv().is_ok() {}
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                println!("---------------------\n\nConfig changed, reloading...\n");
+                config_files = crate::load_config_files(&config_dir);
+                for task in &tasks {
+                    task.abort();
+                }
+                tasks.clear();
                 launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
             }
         }

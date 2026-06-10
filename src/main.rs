@@ -14,18 +14,34 @@ use std::env;
 use tokio;
 use tokio::task::JoinHandle;
 
+pub fn load_config_files(config_dir: &str) -> Vec<Config> {
+    let dir = match std::fs::read_dir(config_dir) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut config_files: Vec<Config> = Vec::new();
+    for file in dir {
+        let filename: String = file.as_ref().unwrap().file_name().into_string().unwrap();
+        if filename.ends_with(".toml") && !filename.starts_with(".") {
+            let name: String = filename.split(".toml").collect::<Vec<&str>>()[0].to_string();
+            let config_file: Config =
+                Config::new_from_file(file.unwrap().path().to_str().unwrap(), name);
+            config_files.push(config_file);
+        }
+    }
+    config_files
+}
+
 #[tokio::main]
 async fn main() {
-    let config_path = match env::var("MAKIMA_CONFIG") {
+    let config_dir = match env::var("MAKIMA_CONFIG") {
         Ok(path) => {
             println!("\nMAKIMA_CONFIG set to {:?}.\n", path);
-            match std::fs::read_dir(path) {
-                Ok(dir) => dir,
-                _ => {
-                    println!("Directory not found, exiting Makima.");
-                    std::process::exit(0);
-                }
+            if !std::path::Path::new(&path).is_dir() {
+                println!("Directory not found, exiting Makima.");
+                std::process::exit(0);
             }
+            path
         }
         Err(_) => {
             let user_home = match env::var("HOME") {
@@ -41,25 +57,14 @@ async fn main() {
                 "\nMAKIMA_CONFIG environment variable is not set, defaulting to {:?}.\n",
                 default_config_path
             );
-            match std::fs::read_dir(default_config_path) {
-                Ok(dir) => dir,
-                _ => {
-                    println!("Directory not found, exiting Makima.");
-                    std::process::exit(0);
-                }
+            if !std::path::Path::new(&default_config_path).is_dir() {
+                println!("Directory not found, exiting Makima.");
+                std::process::exit(0);
             }
+            default_config_path
         }
     };
-    let mut config_files: Vec<Config> = Vec::new();
-    for file in config_path {
-        let filename: String = file.as_ref().unwrap().file_name().into_string().unwrap();
-        if filename.ends_with(".toml") && !filename.starts_with(".") {
-            let name: String = filename.split(".toml").collect::<Vec<&str>>()[0].to_string();
-            let config_file: Config =
-                Config::new_from_file(file.unwrap().path().to_str().unwrap(), name);
-            config_files.push(config_file);
-        }
-    }
+    let config_files = load_config_files(&config_dir);
     let tasks: Vec<JoinHandle<()>> = Vec::new();
-    start_monitoring_udev(config_files, tasks).await;
+    start_monitoring_udev(config_files, config_dir, tasks).await;
 }
