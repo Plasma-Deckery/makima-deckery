@@ -58,14 +58,24 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
     )
     .unwrap();
 
-    // Config file watcher — fires when any .toml in config_dir changes.
+    // Config file watcher — reloads on any .toml change in the watched dirs.
+    // Watches the config dir directly, plus the parent dirs of any symlinked
+    // .toml files (e.g. files in a git repo). Watching parent dirs instead of
+    // individual files survives editor renames (sed -i, vim swapfiles, etc.)
+    // that would otherwise invalidate an inode-based per-file watch.
+    // Events are filtered to .toml files so unrelated files in those dirs are ignored.
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<()>(1);
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res {
                 use notify::EventKind::*;
                 match event.kind {
-                    Create(_) | Modify(_) | Remove(_) => { let _ = config_tx.try_send(()); }
+                    Create(_) | Modify(_) | Remove(_) => {
+                        let is_toml = event.paths.iter().any(|p| {
+                            p.extension().and_then(|e| e.to_str()) == Some("toml")
+                        });
+                        if is_toml { let _ = config_tx.try_send(()); }
+                    }
                     _ => {}
                 }
             }
@@ -74,8 +84,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
     ).expect("Failed to create config file watcher");
     watcher.watch(std::path::Path::new(&config_dir), RecursiveMode::NonRecursive)
         .expect("Failed to watch config directory");
-    // Also watch the real target directories of any symlinked .toml files,
-    // so edits to symlink targets (e.g. files in a git repo) are detected.
+    // Also watch parent dirs of symlink targets.
     if let Ok(entries) = std::fs::read_dir(&config_dir) {
         let mut extra_dirs: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
         for entry in entries.flatten() {
