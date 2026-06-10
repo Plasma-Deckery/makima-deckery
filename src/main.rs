@@ -6,6 +6,7 @@ mod kwin_watcher;
 mod lizard_mode;
 mod resolver;
 mod state_export;
+mod trackpad;
 mod udev_monitor;
 mod virtual_devices;
 

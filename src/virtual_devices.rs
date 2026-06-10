@@ -9,6 +9,39 @@ pub struct VirtualDevices {
     pub abs: VirtualDevice,
     pub lpad: Option<VirtualDevice>,
     pub rpad: Option<VirtualDevice>,
+    /// Combined two-finger gesture device. Active when `combined_gesture_device = true`
+    /// in the config. Receives left pad as slot 0 and right pad as slot 1.
+    pub gesture_pad: Option<VirtualDevice>,
+}
+
+fn build_gesture_pad_device() -> VirtualDevice {
+    let range = AbsInfo::new(0, -32767, 32767, 256, 0, 1638);
+    let slot_info = AbsInfo::new(0, 0, 1, 0, 0, 0); // 2 slots (0..=1)
+    let id_info = AbsInfo::new(-1, -1, 65535, 0, 0, 0);
+
+    let mut pad_keys = evdev::AttributeSet::new();
+    pad_keys.insert(Key::BTN_TOUCH);
+    pad_keys.insert(Key::BTN_TOOL_FINGER);
+    pad_keys.insert(Key::BTN_TOOL_DOUBLETAP); // needed for 2-finger libinput recognition
+    pad_keys.insert(Key::BTN_LEFT);
+
+    let mut props = evdev::AttributeSet::<PropType>::new();
+    props.insert(PropType::POINTER);
+    props.insert(PropType::BUTTONPAD);
+
+    VirtualDeviceBuilder::new()
+        .expect("Unable to create gesture pad device")
+        .name("Deckery Combined Trackpad")
+        .with_properties(&props).unwrap()
+        .with_keys(&pad_keys).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType::ABS_X, range)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType::ABS_Y, range)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(47), slot_info)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(53), range)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(54), range)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(57), id_info)).unwrap()
+        .build()
+        .unwrap()
 }
 
 fn build_trackpad_device(name: &str) -> VirtualDevice {
@@ -19,9 +52,10 @@ fn build_trackpad_device(name: &str) -> VirtualDevice {
     //   ABS_MT_POSITION_Y  = 0x36 = 54
     //   ABS_MT_TRACKING_ID = 0x39 = 57
     // Steam Deck trackpad raw range: signed 16-bit, -32767..32767.
-    // Physical size ~50x50mm → resolution = 65534 / 50 ≈ 1311 units/mm.
-    // libinput rejects devices with nonsensical dimensions (resolution=1 → 65m pad).
-    let range = AbsInfo::new(0, -32767, 32767, 0, 0, 1311);
+    // Physical size ~38x38mm → resolution = 65534 / 40 ≈ 1638 units/mm (matches kernel driver).
+    // fuzz=256 matches real Steam Deck trackpad hardware noise level, helps libinput
+    // tune adaptive acceleration correctly and filters minor thumb resting artefacts.
+    let range = AbsInfo::new(0, -32767, 32767, 256, 0, 1638);
     let slot_info = AbsInfo::new(0, 0, 1, 0, 0, 0);    // 2 slots (0..=1)
     let id_info = AbsInfo::new(-1, -1, 65535, 0, 0, 0); // -1 = no touch
 
@@ -127,6 +161,7 @@ impl VirtualDevices {
             abs: virtual_device_abs,
             lpad: None,
             rpad: None,
+            gesture_pad: None,
         }
     }
 
@@ -139,5 +174,10 @@ impl VirtualDevices {
         if rpad {
             self.rpad = Some(build_trackpad_device("Deckery Right Trackpad"));
         }
+    }
+
+    /// Enable the combined two-finger gesture device.
+    pub fn enable_gesture_pad(&mut self) {
+        self.gesture_pad = Some(build_gesture_pad_device());
     }
 }

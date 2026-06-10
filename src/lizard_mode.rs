@@ -249,14 +249,28 @@ pub async fn run_lizard_mode_suppression(cfg: LizardModeSuppression) {
     );
 
     let fd = file.as_raw_fd();
-    let _keep_alive = file; // keep fd open — signals to hid-steam that a client is active
+    // Drop fd immediately — holding it sets client_opened=true in hid-steam,
+    // which stops the driver from emitting any cursor/scroll events.
+    // On Steam Deck (STEAM_QUIRK_DECK) closing the fd does NOT reset firmware modes.
+    drop(file);
 
     let mut interval = time::interval(HEARTBEAT_INTERVAL);
     interval.tick().await; // consume the immediate first tick (already sent above)
 
     loop {
         interval.tick().await;
-        let ok = heartbeat_reports.iter().all(|r| send_feature_report(fd, r));
+        let ok = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => {
+                let fd = f.as_raw_fd();
+                let ok = heartbeat_reports.iter().all(|r| send_feature_report(fd, r));
+                drop(f);
+                ok
+            }
+            Err(e) => {
+                eprintln!("Lizard Mode suppression: failed to reopen {:?}: {}", path, e);
+                false
+            }
+        };
         if !ok {
             eprintln!(
                 "Lizard Mode suppression: heartbeat failed on {:?}. \

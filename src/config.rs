@@ -3,6 +3,124 @@ use evdev::Key;
 use serde;
 use std::{collections::{HashMap, HashSet}, str::FromStr};
 
+// ── Trackpad configuration ────────────────────────────────────────────────────
+
+/// Which role a trackpad plays — determines both what makima does with the
+/// raw ABS_HAT events and what firmware mode the hid-steam driver is set to.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum TrackpadMode {
+    /// No virtual MT device created; firmware set to TRACKPAD_NONE.
+    /// Default when no `[trackpad]` section is present.
+    #[default]
+    Disabled,
+    /// Virtual uinput MT device created and fed raw position events.
+    /// Firmware set to TRACKPAD_NONE (no kernel cursor emulation).
+    /// Config value: `"mt-trackpad"`.
+    MtTrackpad,
+    /// No MT device; firmware set to TRACKPAD_RELATIVE_MOUSE.
+    /// The kernel driver handles cursor movement with trackball physics.
+    /// Config value: `"trackball"`.
+    Trackball,
+}
+
+impl TrackpadMode {
+    fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "disabled"    => Some(TrackpadMode::Disabled),
+            "mt-trackpad" => Some(TrackpadMode::MtTrackpad),
+            "trackball"   => Some(TrackpadMode::Trackball),
+            _             => None,
+        }
+    }
+}
+
+/// Configuration for one trackpad side.
+#[derive(Debug, Clone)]
+pub struct TrackpadSideConfig {
+    pub mode: TrackpadMode,
+    /// Physical click pressure threshold sent to firmware via HID.
+    /// Raw u16 firmware value. None = firmware default (0xFFFF = disabled).
+    pub click_pressure: Option<u16>,
+    // Mouse-mode parameters (firmware TRACKPAD_RELATIVE_MOUSE).
+    // Parsed and stored; firmware application planned.
+    pub momentum_decay: Option<u16>,
+    pub min_velocity: Option<u16>,
+    pub max_velocity: Option<u16>,
+    pub outer_radius: Option<u16>,
+}
+
+impl Default for TrackpadSideConfig {
+    fn default() -> Self {
+        TrackpadSideConfig {
+            mode: TrackpadMode::Disabled,
+            click_pressure: None,
+            momentum_decay: None,
+            min_velocity: None,
+            max_velocity: None,
+            outer_radius: None,
+        }
+    }
+}
+
+/// Configuration for both trackpad sides, parsed from `[trackpad.left]` /
+/// `[trackpad.right]` in the TOML config.
+#[derive(Debug, Clone, Default)]
+pub struct TrackpadConfig {
+    pub left: TrackpadSideConfig,
+    pub right: TrackpadSideConfig,
+    /// When true, a third virtual MT device ("Deckery Gesture Pad") is created.
+    /// As soon as both pads are simultaneously touched, events are routed to that
+    /// device with left=slot 0 and right=slot 1 — enabling pinch-zoom, two-finger
+    /// scroll and pan via libinput. The gesture session persists until both fingers
+    /// are fully lifted.
+    pub combined_gesture_device: bool,
+}
+
+// ── Raw deserialization types ─────────────────────────────────────────────────
+
+#[derive(serde::Deserialize, Default, Debug, Clone)]
+pub struct RawTrackpadSideConfig {
+    pub mode: Option<String>,
+    pub click_pressure: Option<u16>,
+    pub momentum_decay: Option<u16>,
+    pub min_velocity: Option<u16>,
+    pub max_velocity: Option<u16>,
+    pub outer_radius: Option<u16>,
+}
+
+#[derive(serde::Deserialize, Default, Debug, Clone)]
+pub struct RawTrackpadConfig {
+    pub left: Option<RawTrackpadSideConfig>,
+    pub right: Option<RawTrackpadSideConfig>,
+    pub combined_gesture_device: Option<bool>,
+}
+
+fn parse_trackpad_side(raw: Option<&RawTrackpadSideConfig>, legacy_setting: Option<&String>) -> TrackpadSideConfig {
+    if let Some(r) = raw {
+        let mode = r.mode.as_deref()
+            .and_then(TrackpadMode::from_str_opt)
+            .unwrap_or_default();
+        if r.mode.is_some() && mode == TrackpadMode::Disabled
+            && r.mode.as_deref() != Some("disabled") {
+            eprintln!("Warning: unrecognised trackpad mode {:?}, defaulting to \"disabled\".", r.mode);
+        }
+        TrackpadSideConfig {
+            mode,
+            click_pressure: r.click_pressure,
+            momentum_decay: r.momentum_decay,
+            min_velocity: r.min_velocity,
+            max_velocity: r.max_velocity,
+            outer_radius: r.outer_radius,
+        }
+    } else if let Some(s) = legacy_setting {
+        // Backward-compat: LPAD/RPAD = "trackpad" / "disabled"
+        let mode = TrackpadMode::from_str_opt(s.as_str()).unwrap_or_default();
+        TrackpadSideConfig { mode, ..Default::default() }
+    } else {
+        TrackpadSideConfig::default()
+    }
+}
+
 /// Value for a `[remap]` entry — simple array or inline table with attributes.
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(untagged)]
@@ -152,6 +270,8 @@ pub struct RawConfig {
     pub movements: HashMap<String, String>,
     #[serde(default)]
     pub settings: HashMap<String, String>,
+    #[serde(default)]
+    pub trackpad: RawTrackpadConfig,
 }
 
 impl RawConfig {
@@ -163,15 +283,18 @@ impl RawConfig {
         let file_content: String = std::fs::read_to_string(file).unwrap();
         let raw_config: RawConfig =
             toml::from_str(&file_content).expect("Couldn't parse config file.");
+        println!("  [debug] raw trackpad after toml parse: {:?}", raw_config.trackpad);
         let remap = raw_config.remap;
         let commands = raw_config.commands;
         let movements = raw_config.movements;
         let settings = raw_config.settings;
+        let trackpad = raw_config.trackpad;
         Self {
             remap,
             commands,
             movements,
             settings,
+            trackpad,
         }
     }
 }
@@ -188,13 +311,31 @@ pub struct Config {
     pub override_bindings: Option<Bindings>,
     pub settings: HashMap<String, String>,
     pub mapped_modifiers: MappedModifiers,
+    /// Trackpad configuration parsed from `[trackpad.left]` / `[trackpad.right]`.
+    /// Falls back to legacy `LPAD`/`RPAD` settings when `[trackpad]` is absent.
+    /// Only meaningful on the base config; app-specific configs inherit from base.
+    pub trackpad: TrackpadConfig,
 }
 
 impl Config {
     pub fn new_from_file(file: &str, file_name: String) -> Self {
         let raw_config = RawConfig::new_from_file(file);
+        let raw_trackpad = raw_config.trackpad.clone();
         let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config);
         let associations = Default::default();
+
+        // Parse [trackpad] section; fall back to legacy LPAD/RPAD settings.
+        let trackpad = TrackpadConfig {
+            left: parse_trackpad_side(
+                raw_trackpad.left.as_ref(),
+                settings.get("LPAD"),
+            ),
+            right: parse_trackpad_side(
+                raw_trackpad.right.as_ref(),
+                settings.get("RPAD"),
+            ),
+            combined_gesture_device: raw_trackpad.combined_gesture_device.unwrap_or(false),
+        };
 
         Self {
             name: file_name,
@@ -203,6 +344,7 @@ impl Config {
             override_bindings: None,
             settings,
             mapped_modifiers,
+            trackpad,
         }
     }
 
@@ -214,6 +356,7 @@ impl Config {
             override_bindings: None,
             settings: Default::default(),
             mapped_modifiers: Default::default(),
+            trackpad: Default::default(),
         }
     }
 
@@ -287,6 +430,13 @@ impl Config {
         }
         for (key, value) in &base.settings {
             self.settings.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        // Trackpad config is device-level; always inherit from base for app configs.
+        // App-specific configs should not override hardware settings.
+        if self.trackpad.left.mode == TrackpadMode::Disabled
+            && self.trackpad.right.mode == TrackpadMode::Disabled
+        {
+            self.trackpad = base.trackpad.clone();
         }
         self.mapped_modifiers.all.clear();
         self.mapped_modifiers.all.extend(self.mapped_modifiers.default.clone());

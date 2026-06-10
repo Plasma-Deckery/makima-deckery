@@ -301,6 +301,7 @@ pub fn launch_tasks(
                 device_error_notify.clone(),
                 active_client.clone(),
                 window_changed.clone(),
+                std::path::PathBuf::from(&event_device),
             );
             tasks.push(tokio::spawn(start_reader(reader)));
             devices_found += 1
