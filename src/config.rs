@@ -16,7 +16,7 @@ enum RemapValue {
 #[serde(untagged)]
 enum CommandValue {
     Simple(Vec<String>),
-    WithAttrs { run: Vec<String>, #[serde(default)] no_pause: bool, #[serde(default)] label: Option<String> },
+    WithAttrs { run: Vec<String>, #[serde(default)] no_pause: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool },
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
@@ -423,9 +423,9 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
     }
 
     for (input, value) in commands.clone() {
-        let (output, np, lbl) = match value {
-            CommandValue::Simple(cmds) => (cmds, false, None),
-            CommandValue::WithAttrs { run, no_pause, label } => (run, no_pause, label),
+        let (output, np, lbl, sl) = match value {
+            CommandValue::Simple(cmds) => (cmds, false, None, false),
+            CommandValue::WithAttrs { run, no_pause, label, silent } => (run, no_pause, label, silent),
         };
         if let Some((mods, event)) = input.rsplit_once("-") {
             let str_modifiers = mods.split("-").collect::<Vec<&str>>();
@@ -445,7 +445,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
                 }
             }
             if let Ok(event) = Axis::from_str(event) {
-                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); }
+                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Axis(event), modifiers.clone())); }
                 if !bindings.commands.contains_key(&Event::Axis(event)) {
                     bindings
                         .commands
@@ -458,7 +458,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
                         .insert(modifiers, output);
                 }
             } else if let Ok(event) = Key::from_str(event) {
-                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); }
+                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Key(event), modifiers.clone())); }
                 if !bindings.commands.contains_key(&Event::Key(event)) {
                     bindings
                         .commands
@@ -474,7 +474,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
         } else {
             let modifiers: Vec<Event> = Vec::new();
             if let Ok(event) = Axis::from_str(input.as_str()) {
-                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); }
+                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Axis(event), modifiers.clone())); }
                 if !bindings.commands.contains_key(&Event::Axis(event)) {
                     bindings
                         .commands
@@ -487,7 +487,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
                         .insert(modifiers, output);
                 }
             } else if let Ok(event) = Key::from_str(input.as_str()) {
-                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); }
+                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Key(event), modifiers.clone())); }
                 if !bindings.commands.contains_key(&Event::Key(event)) {
                     bindings
                         .commands

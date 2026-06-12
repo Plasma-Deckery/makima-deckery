@@ -25,6 +25,7 @@ pub struct LastAction {
     pub value: serde_json::Value, // [KEY_*] for keys, string for command/exec
     pub ts: f64,                  // Unix timestamp (secs + fractional)
     pub label: Option<String>,    // human-readable label, if set on the binding
+    pub silent: bool,             // true → suppress toast in HUD
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -1320,7 +1320,7 @@ impl EventReader {
                         }
                     }
                 }
-                self.set_last_emitted(&event, &out_keys, value, false, config.bindings.labels.get(&(event, vec![])).cloned()).await;
+                self.set_last_emitted(&event, &out_keys, value, false, config.bindings.labels.get(&(event, vec![])).cloned(), false).await;
                 self.toggle_modifiers(event, value, &config).await;
                 return;
             }
@@ -1328,7 +1328,7 @@ impl EventReader {
         // ───────────────────────────────────────────────────────────────────────
 
         match resolve_binding(&config.bindings, event, &modifiers, self.settings.chain_only) {
-            ResolvedBinding::Keys { keys, label, no_pause, is_combo, is_fallback } => {
+            ResolvedBinding::Keys { keys, label, no_pause, silent, is_combo, is_fallback } => {
                 // release_keys: release held modifier output keys before emitting.
                 //   true  → base binding with no modifiers held (normal press)
                 //   false → combo or fallback; modifier keys must stay held
@@ -1337,7 +1337,7 @@ impl EventReader {
                 //   false → fallback or base binding (modifier remains independent)
                 let release_keys    = !is_combo && !is_fallback;
                 let ignore_modifiers = is_combo;
-                self.set_last_emitted(&event, &keys, value, is_combo, label).await;
+                self.set_last_emitted(&event, &keys, value, is_combo, label, silent).await;
                 self.emit_event(&keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
                 if send_zero {
                     let mut modifiers = self.modifiers.lock().await.clone();
@@ -1351,9 +1351,9 @@ impl EventReader {
                 self.emit_event(&keys, value, &modifiers, &config, false, false, false).await;
                 return;
             }
-            ResolvedBinding::Command { commands, label, no_pause, .. } => {
+            ResolvedBinding::Command { commands, label, no_pause, silent, .. } => {
                 if value == 1 {
-                    self.set_last_emitted_cmd(&event, &commands, label).await;
+                    self.set_last_emitted_cmd(&event, &commands, label, silent).await;
                     if !paused || no_pause {
                         self.spawn_subprocess(&commands).await;
                     }
@@ -1929,7 +1929,7 @@ impl EventReader {
     /// Record the actual emitted key output for the HUD last-event display.
     /// Called at the emission site (not at input time) so the action reflects
     /// what was truly sent to the virtual device.
-    async fn set_last_emitted(&self, _trigger: &Event, emitted: &[Key], value: i32, is_combo: bool, label: Option<String>) {
+    async fn set_last_emitted(&self, _trigger: &Event, emitted: &[Key], value: i32, is_combo: bool, label: Option<String>, silent: bool) {
         if is_combo && value == 1 {
             let mut la = self.last_action.lock().await;
             *la = Some(LastAction {
@@ -1939,13 +1939,14 @@ impl EventReader {
                 ),
                 ts: crate::state_export::now_ts(),
                 label,
+                silent,
             });
         }
         self.write_state().await;
     }
 
     /// Record a spawned command as the last emitted action.
-    async fn set_last_emitted_cmd(&self, _trigger: &Event, commands: &[String], label: Option<String>) {
+    async fn set_last_emitted_cmd(&self, _trigger: &Event, commands: &[String], label: Option<String>, silent: bool) {
         {
             let mut la = self.last_action.lock().await;
             *la = Some(LastAction {
@@ -1953,6 +1954,7 @@ impl EventReader {
                 value: serde_json::Value::String(commands.join(" ")),
                 ts: crate::state_export::now_ts(),
                 label,
+                silent,
             });
         }
         self.write_state().await;

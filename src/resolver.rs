@@ -21,6 +21,7 @@ pub enum ResolvedBinding {
         keys: Vec<Key>,
         label: Option<String>,
         no_pause: bool,
+        silent: bool,
         /// true when the match was an explicit combo (non-empty modifier set)
         is_combo: bool,
         /// true when modifiers are held but no combo was defined — falls back
@@ -32,6 +33,7 @@ pub enum ResolvedBinding {
         commands: Vec<String>,
         label: Option<String>,
         no_pause: bool,
+        silent: bool,
         is_combo: bool,
     },
     /// An axis movement binding (stick-to-mouse etc.).
@@ -65,11 +67,14 @@ pub fn resolve_binding(
         if let Some(keys) = remap_map.get(&mods) {
             let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
                 || bindings.no_pause.contains(&(event, vec![]));
+            let silent = bindings.silent.contains(&(event, mods.clone()))
+                || bindings.silent.contains(&(event, vec![]));
             let label = bindings.labels.get(&(event, mods.clone())).cloned();
             return ResolvedBinding::Keys {
                 keys: keys.clone(),
                 label,
                 no_pause,
+                silent,
                 is_combo: !mods.is_empty(),
                 is_fallback: false,
             };
@@ -90,11 +95,14 @@ pub fn resolve_binding(
             if let Some(commands) = cmd_map.get(&mods) {
                 let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
                     || bindings.no_pause.contains(&(event, vec![]));
+                let silent = bindings.silent.contains(&(event, mods.clone()))
+                    || bindings.silent.contains(&(event, vec![]));
                 let label = bindings.labels.get(&(event, mods.clone())).cloned();
                 return ResolvedBinding::Command {
                     commands: commands.clone(),
                     label,
                     no_pause,
+                    silent,
                     is_combo: !mods.is_empty(),
                 };
             }
@@ -115,11 +123,13 @@ pub fn resolve_binding(
         //    is responsible for keeping them held (e.g. Ctrl+Enter).
         if let Some(keys) = remap_map.get(&vec![]) {
             let no_pause = bindings.no_pause.contains(&(event, vec![]));
+            let silent = bindings.silent.contains(&(event, vec![]));
             let label = bindings.labels.get(&(event, vec![])).cloned();
             return ResolvedBinding::Keys {
                 keys: keys.clone(),
                 label,
                 no_pause,
+                silent,
                 is_combo: false,
                 is_fallback: !mods.is_empty(),
             };
@@ -131,11 +141,14 @@ pub fn resolve_binding(
         if let Some(commands) = cmd_map.get(&mods) {
             let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
                 || bindings.no_pause.contains(&(event, vec![]));
+            let silent = bindings.silent.contains(&(event, mods.clone()))
+                || bindings.silent.contains(&(event, vec![]));
             let label = bindings.labels.get(&(event, mods.clone())).cloned();
             return ResolvedBinding::Command {
                 commands: commands.clone(),
                 label,
                 no_pause,
+                silent,
                 is_combo: !mods.is_empty(),
             };
         }
@@ -205,6 +218,7 @@ mod tests {
             keys: vec![Key::KEY_ENTER],
             label: None,
             no_pause: false,
+            silent: false,
             is_combo: false,
             is_fallback: false,
         });
@@ -225,6 +239,7 @@ mod tests {
             keys: vec![Key::KEY_LEFTCTRL, Key::KEY_C],
             label: None,
             no_pause: false,
+            silent: false,
             is_combo: true,
             is_fallback: false,
         });
@@ -248,6 +263,7 @@ mod tests {
             keys: vec![Key::KEY_ENTER],
             label: None,
             no_pause: false,
+            silent: false,
             is_combo: false,
             is_fallback: true,
         });
@@ -271,6 +287,7 @@ mod tests {
             keys: vec![Key::KEY_LEFTCTRL, Key::KEY_C],
             label: None,
             no_pause: false,
+            silent: false,
             is_combo: true,
             is_fallback: false,
         });
@@ -372,6 +389,7 @@ mod tests {
             keys: vec![Key::KEY_UP],
             label: None,
             no_pause: false,
+            silent: false,
             is_combo: true,
             is_fallback: false,
         });
@@ -472,6 +490,7 @@ mod tests {
             commands: vec!["hud-toggle".to_string()],
             label: None,
             no_pause: false,
+            silent: false,
             is_combo: false,
         });
     }
@@ -495,7 +514,47 @@ mod tests {
             commands: vec!["previous-desktop".to_string()],
             label: None,
             no_pause: false,
+            silent: false,
             is_combo: true,
+        });
+    }
+
+    // ── silent = true on a command ────────────────────────────────────────────
+
+    #[test]
+    fn silent_command_resolved_with_silent_true() {
+        let btn_thumbl = key_event(Key::BTN_THUMBL);
+        let mut bindings = make_bindings(
+            vec![],
+            vec![(btn_thumbl, vec![], vec!["hud-toggle".to_string()])],
+            vec![], vec![],
+        );
+        bindings.silent.insert((btn_thumbl, vec![]));
+        let result = resolve_binding(&bindings, btn_thumbl, &[], false);
+        assert_eq!(result, ResolvedBinding::Command {
+            commands: vec!["hud-toggle".to_string()],
+            label: None,
+            no_pause: false,
+            silent: true,
+            is_combo: false,
+        });
+    }
+
+    #[test]
+    fn non_silent_command_resolved_with_silent_false() {
+        let btn_thumbl = key_event(Key::BTN_THUMBL);
+        let bindings = make_bindings(
+            vec![],
+            vec![(btn_thumbl, vec![], vec!["hud-toggle".to_string()])],
+            vec![], vec![],
+        );
+        let result = resolve_binding(&bindings, btn_thumbl, &[], false);
+        assert_eq!(result, ResolvedBinding::Command {
+            commands: vec!["hud-toggle".to_string()],
+            label: None,
+            no_pause: false,
+            silent: false,
+            is_combo: false,
         });
     }
 }
