@@ -139,3 +139,60 @@ pub async fn start_kwin_watcher(
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::udev_monitor::Client;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn window_activated_updates_client_and_notifies() {
+        let active_client = Arc::new(Mutex::new(Client::Default));
+        let notify = Arc::new(Notify::new());
+
+        let iface = WatcherIface {
+            active_client: active_client.clone(),
+            notify: notify.clone(),
+        };
+
+        // First, start waiting for the notification
+        let notify_clone = notify.clone();
+        let wait_task = tokio::spawn(async move {
+            notify_clone.notified().await;
+        });
+
+        // Yield to ensure the spawned task actually reaches the `.await`
+        // before we trigger the notification.
+        tokio::task::yield_now().await;
+
+        // Simulate KWin script calling the D-Bus method
+        iface.window_activated("org.mozilla.firefox".to_string()).await;
+
+        // Verify the state was correctly updated
+        let client = active_client.lock().await;
+        assert_eq!(*client, Client::Class("org.mozilla.firefox".to_string()));
+
+        // Verify the notification was actually fired (should resolve immediately)
+        assert!(timeout(Duration::from_millis(100), wait_task).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn window_activated_empty_string_resets_to_default() {
+        let active_client = Arc::new(Mutex::new(Client::Class("some.other.app".to_string())));
+        let notify = Arc::new(Notify::new());
+
+        let iface = WatcherIface {
+            active_client: active_client.clone(),
+            notify: notify.clone(),
+        };
+
+        // Simulate empty class name (e.g., desktop focus lost)
+        iface.window_activated("".to_string()).await;
+
+        let client = active_client.lock().await;
+        assert_eq!(*client, Client::Default);
+    }
+}

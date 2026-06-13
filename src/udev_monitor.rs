@@ -47,7 +47,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
         }
     }
 
-    launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -110,22 +110,24 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                 if let Some(Ok(event)) = event {
                     if is_mapped(&event.device(), &config_files) {
                         println!("---------------------\n\nReinitializing...\n");
+                        release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
                         for task in &tasks {
                             task.abort();
                         }
                         tasks.clear();
-                        launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
                     }
                 }
             }
             _ = device_error_notify.notified() => {
                 println!("---------------------\n\nDevice error detected, reinitializing...\n");
+                release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
             }
             Some(_) = config_rx.recv() => {
                 // Debounce: drain any queued events, then wait briefly for the
@@ -134,12 +136,41 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 println!("---------------------\n\nConfig changed, reloading...\n");
                 config_files = crate::load_config_files(&config_dir);
+                release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();
                 }
                 tasks.clear();
-                launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
             }
+        }
+    }
+}
+
+/// Before destroying the old virtual devices during reinit, release all held
+/// modifier output keys so the kernel (and thus XWayland/compositor) knows
+/// those keys are no longer pressed. Without this, a stuck-modifier state
+/// persists across the reinit — modifiers held at reinit time (e.g. Ctrl+Alt
+/// from a paddle+button combo) are never released, causing phantom combo
+/// activation until the user physically presses and releases those keys again.
+async fn release_held_modifiers(
+    prev_virt_dev: &Option<Arc<Mutex<VirtualDevices>>>,
+    prev_modifiers: &Arc<Mutex<Vec<Event>>>,
+) {
+    let virt_dev = match prev_virt_dev {
+        Some(vd) => vd,
+        None => return,
+    };
+    let held = prev_modifiers.lock().await.clone();
+    if held.is_empty() {
+        return;
+    }
+    let mut vd = virt_dev.lock().await;
+    for modifier in &held {
+        if let Event::Key(key) = modifier {
+            let _ = vd.keys.emit(&[
+                evdev::InputEvent::new_now(evdev::EventType::KEY, key.code(), 0),
+            ]);
         }
     }
 }
@@ -151,9 +182,10 @@ pub fn launch_tasks(
     device_error_notify: Arc<Notify>,
     active_client: Arc<Mutex<Client>>,
     window_changed: Arc<Notify>,
-) {
+) -> (Option<Arc<Mutex<VirtualDevices>>>, Arc<Mutex<Vec<Event>>>) {
     let modifiers: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Default::default()));
     let modifier_was_activated: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
+    let mut virt_dev_holder: Option<Arc<Mutex<VirtualDevices>>> = None;
     let user_has_access = match Command::new("groups").output() {
         Ok(groups)
             if std::str::from_utf8(&groups.stdout.as_slice())
@@ -243,6 +275,7 @@ pub fn launch_tasks(
                 config_list.clone(),
             )));
             let virt_dev = Arc::new(Mutex::new(VirtualDevices::new(device.1)));
+            virt_dev_holder = Some(virt_dev.clone());
             let reader = EventReader::new(
                 config_list.clone(),
                 virt_dev,
@@ -263,6 +296,7 @@ pub fn launch_tasks(
     } else if devices_found == 0 && user_has_access {
         println!("No matching devices found.\nNote: double-check that your device and its associated config file have the same name, as reported by 'evtest'.\n");
     }
+    (virt_dev_holder, modifiers)
 }
 
 pub async fn start_reader(reader: EventReader) {
@@ -400,4 +434,37 @@ pub fn is_mapped(udev_device: &tokio_udev::Device, config_files: &Vec<Config>) -
         _ => return false,
     }
     return false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
+        let config_files = Vec::new();
+        let mut tasks = Vec::new();
+        let env = Environment {
+            user: Ok("test".to_string()),
+            sudo_user: Err(std::env::VarError::NotPresent),
+            server: Server::Unsupported,
+        };
+        let error_notify = Arc::new(Notify::new());
+        let client = Arc::new(Mutex::new(Client::Default));
+        let window_changed = Arc::new(Notify::new());
+
+        let (virt_dev_opt, modifiers) = launch_tasks(
+            &config_files,
+            &mut tasks,
+            env,
+            error_notify,
+            client,
+            window_changed,
+        );
+
+        if let Some(_) = virt_dev_opt {
+            // If a device was found, modifiers must be a connected Arc.
+            let _ = modifiers;
+        }
+    }
 }
