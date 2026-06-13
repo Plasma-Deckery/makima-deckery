@@ -8,6 +8,7 @@ use crate::Config;
 use evdev::{AbsoluteAxisType, EventStream, EventType, InputEvent, Key, RelativeAxisType};
 use fork::{fork, setsid, Fork};
 use std::{
+    collections::HashMap,
     future::Future,
     io::{BufRead, BufReader},
     option::Option,
@@ -89,6 +90,11 @@ pub struct EventReader {
     paused: Arc<Mutex<bool>>,
     last_action: Arc<Mutex<Option<LastAction>>>,
     held_keys: Arc<Mutex<Vec<Event>>>,
+    /// Maps each currently held physical button to the output keys it last emitted.
+    /// On key-up (value=0), every stored output key for this button is released,
+    /// ensuring that base-remap outputs (e.g. KEY_F10) are always cleaned up even
+    /// when a mid-hold modifier change (e.g. R1) switched the resolution to a combo.
+    emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>>,
     device_is_connected: Arc<Mutex<bool>>,
     device_error_notify: Arc<Notify>,
     active_layout: Arc<Mutex<u16>>,
@@ -133,6 +139,7 @@ impl EventReader {
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> = Arc::new(Mutex::new(HashMap::new()));
         let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(
             config
                 .iter()
@@ -424,6 +431,7 @@ impl EventReader {
             paused,
             last_action,
             held_keys,
+            emitted_outputs,
             device_is_connected,
             device_error_notify,
             active_layout,
@@ -1285,6 +1293,23 @@ impl EventReader {
             }
         } // lock dropped before any await
 
+        // On key-up (value=0), release every output key that was ever emitted
+        // for this physical button — even if the resolution changed mid-hold
+        // (e.g. base remap F10 → combo Alt+Ctrl+Z when R1 was pressed).
+        if value == 0 {
+            if let Event::Key(_) = event {
+                let mut eo = self.emitted_outputs.lock().await;
+                if let Some(prev_keys) = eo.remove(&event) {
+                    let mut vd = self.virt_dev.lock().await;
+                    for key in &prev_keys {
+                        let _ = vd.keys.emit(&[
+                            InputEvent::new_now(EventType::KEY, key.code(), 0),
+                        ]);
+                    }
+                }
+            }
+        }
+
         if value == 1 {
             self.update_config().await;
         };
@@ -1345,6 +1370,7 @@ impl EventReader {
                     modifiers.dedup();
                     self.emit_event(&keys, 0, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
                 }
+                self.store_emitted_outputs(&event, &keys).await;
                 return;
             }
             ResolvedBinding::Hold { keys } => {
@@ -1945,6 +1971,14 @@ impl EventReader {
         self.write_state().await;
     }
 
+    /// Store emitted output keys for a physical button so they can be released
+    /// in full on key-up, even if a mid-hold modifier change switched the resolution.
+    async fn store_emitted_outputs(&self, event: &Event, keys: &[Key]) {
+        if let Event::Key(_) = event {
+            self.emitted_outputs.lock().await.insert(*event, keys.to_vec());
+        }
+    }
+
     /// Record a spawned command as the last emitted action.
     async fn set_last_emitted_cmd(&self, _trigger: &Event, commands: &[String], label: Option<String>, silent: bool) {
         {
@@ -2257,6 +2291,135 @@ impl EventReader {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::Key;
+    use std::collections::HashMap;
+    use tokio;
+
+    /// Simulates the button lifecycle: press (store output), then release (retrieve + clear).
+    /// Verifies the emitted_outputs map is correctly populated and drained.
+    #[tokio::test]
+    async fn emitted_outputs_stores_and_releases_on_key_up() {
+        let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let button = Event::Key(Key::BTN_START);
+
+        // ── Press: base remap F10 ──
+        {
+            let mut eo = emitted_outputs.lock().await;
+            eo.insert(button, vec![Key::KEY_F10]);
+        }
+
+        // ── Key-up: should find F10 and remove the entry ──
+        {
+            let mut eo = emitted_outputs.lock().await;
+            let released = eo.remove(&button);
+            assert!(released.is_some(), "entry must exist for held button on release");
+            assert_eq!(released.unwrap(), vec![Key::KEY_F10]);
+            assert!(eo.is_empty());
+        }
+    }
+
+    /// When a combo fires mid-hold and overwrites the stored output, releasing the
+    /// button must release the NEW output, not the stale base remap (stored output
+    /// was already replaced when the combo fired its own store_emitted_outputs call).
+    #[tokio::test]
+    async fn emitted_outputs_overwritten_by_combo_releases_combo_keys() {
+        let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let button = Event::Key(Key::BTN_START);
+
+        // ── Press: base remap F10 ──
+        {
+            let mut eo = emitted_outputs.lock().await;
+            eo.insert(button, vec![Key::KEY_F10]);
+        }
+
+        // ── Modifier activated mid-hold → combo overwrites output ──
+        {
+            let mut eo = emitted_outputs.lock().await;
+            eo.insert(button, vec![Key::KEY_LEFTALT, Key::KEY_LEFTCTRL, Key::KEY_Z]);
+        }
+
+        // ── Key-up: should find the combo keys (last stored) ──
+        {
+            let mut eo = emitted_outputs.lock().await;
+            let released = eo.remove(&button);
+            assert!(released.is_some());
+            assert_eq!(
+                released.unwrap(),
+                vec![Key::KEY_LEFTALT, Key::KEY_LEFTCTRL, Key::KEY_Z]
+            );
+            assert!(eo.is_empty());
+        }
+    }
+
+    /// A button pressed in combo context (modifier already held, base remap never
+    /// emitted) has no entry in emitted_outputs before the combo stores its keys.
+    #[tokio::test]
+    async fn emitted_outputs_empty_before_first_store() {
+        let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let button = Event::Key(Key::BTN_START);
+
+        let released = emitted_outputs.lock().await.remove(&button);
+        assert!(released.is_none(), "no entry exists before first insertion");
+    }
+
+    /// Non-key events (axes, scroll) are not tracked in emitted_outputs.
+    #[tokio::test]
+    async fn emitted_outputs_ignores_axis_events() {
+        let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Axis events are not inserted (only Key events go through the tracking)
+        let axis = Event::Axis(Axis::BTN_DPAD_UP);
+        assert!(!matches!(axis, Event::Key(_)));
+
+        // Verify the map is untouched for non-Key events
+        let eo = emitted_outputs.lock().await;
+        assert!(eo.is_empty());
+    }
+
+    /// Multiple held buttons store their outputs independently.
+    #[tokio::test]
+    async fn emitted_outputs_tracks_multiple_buttons_independently() {
+        let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let start = Event::Key(Key::BTN_START);
+        let north = Event::Key(Key::BTN_NORTH);
+
+        // Press Start → F10
+        emitted_outputs.lock().await.insert(start, vec![Key::KEY_F10]);
+        // Press X → Backspace
+        emitted_outputs.lock().await.insert(north, vec![Key::KEY_BACKSPACE]);
+
+        // Release Start
+        {
+            let mut eo = emitted_outputs.lock().await;
+            let released = eo.remove(&start);
+            assert_eq!(released, Some(vec![Key::KEY_F10]));
+            // X entry still present
+            assert!(eo.contains_key(&north));
+        }
+
+        // Release X
+        {
+            let mut eo = emitted_outputs.lock().await;
+            let released = eo.remove(&north);
+            assert_eq!(released, Some(vec![Key::KEY_BACKSPACE]));
+            assert!(eo.is_empty());
         }
     }
 }

@@ -352,8 +352,16 @@ pub fn build_state(
     available_modifiers.sort();
     available_modifiers.dedup();
 
+    // Determine active app name from config_stack (e.g., "org.mozilla.firefox" or "default")
+    let active_app = if config_stack.len() > 1 {
+        config_stack[1].clone()
+    } else {
+        "default".to_string()
+    };
+
     serde_json::json!({
         "context": {
+            "active_app": active_app,
             "config_stack": config_stack,
             "layout": layout,
             "paused": paused,
