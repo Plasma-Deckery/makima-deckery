@@ -1,0 +1,11 @@
+[Unit]
+Description=Restart makima after suspend/resume
+After=plasma-core.target
+
+[Service]
+ExecStart=%h/.local/bin/makima-resume-watcher
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=plasma-core.target
