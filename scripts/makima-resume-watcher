@@ -1,0 +1,14 @@
+#!/bin/bash
+# Restarts makima after suspend/resume.
+# On this hardware the evdev fd freezes silently on suspend without
+# returning an error, so makima cannot self-recover. We watch for
+# the PrepareForSleep(false) DBus signal instead.
+
+exec dbus-monitor --system \
+  "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'" \
+  2>/dev/null | while read -r line; do
+    if echo "$line" | grep -q "boolean false"; then
+        sleep 2
+        systemctl --user restart makima.service
+    fi
+done

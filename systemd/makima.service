@@ -1,6 +1,6 @@
 [Unit]
 Description=makima input remapper
-After=graphical-session.target
+After=plasma-core.target
 
 [Service]
 ExecStart=%h/.local/bin/makima
@@ -14,4 +14,4 @@ Environment=XDG_CURRENT_DESKTOP=KDE
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=plasma-core.target

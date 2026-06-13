@@ -18,17 +18,26 @@ if ! distrobox enter deckery -- bash -c "\$HOME/.cargo/bin/cargo --version >/dev
     distrobox enter deckery -- sudo pacman -S --needed --noconfirm $PACKAGES
 fi
 
-# ── 2. Systemd user service (no sudo) ────────────────────────────────────────
+# ── 2. Systemd user services (no sudo) ───────────────────────────────────────
 SERVICE_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SERVICE_DIR"
-GENERATED="$REPO/systemd/makima.service"
-INSTALLED="$SERVICE_DIR/makima.service"
-if ! diff -q "$GENERATED" "$INSTALLED" 2>/dev/null; then
-    echo "Installing systemd user service..."
-    cp "$GENERATED" "$INSTALLED"
-    systemctl --user daemon-reload
-fi
+for svc in makima.service makima-resume-watcher.service; do
+    GENERATED="$REPO/systemd/$svc"
+    INSTALLED="$SERVICE_DIR/$svc"
+    if ! diff -q "$GENERATED" "$INSTALLED" 2>/dev/null; then
+        echo "Installing systemd user service: $svc"
+        cp "$GENERATED" "$INSTALLED"
+    fi
+done
+systemctl --user daemon-reload
 systemctl --user enable makima.service
+systemctl --user enable makima-resume-watcher.service
+
+# Install resume-watcher script
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
+cp "$REPO/scripts/makima-resume-watcher" "$BIN_DIR/makima-resume-watcher"
+chmod +x "$BIN_DIR/makima-resume-watcher"
 
 # ── 3. Build + deploy ────────────────────────────────────────────────────────
 bash "$REPO/redeploy.sh"
