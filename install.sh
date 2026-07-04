@@ -14,9 +14,8 @@ echo "Repo: $REPO"
 
 # ── 1. Distrobox container + packages ────────────────────────────────────────
 distrobox assemble create --file "$REPO/distrobox.ini"
-if ! distrobox enter deckery -- bash -c "\$HOME/.cargo/bin/cargo --version >/dev/null 2>&1"; then
-    distrobox enter deckery -- sudo pacman -S --needed --noconfirm rustup
-    distrobox enter deckery -- rustup default stable
+if ! distrobox enter deckery -- bash -c "cargo --version >/dev/null 2>&1"; then
+    distrobox enter deckery -- sudo pacman -S --needed --noconfirm rust
 fi
 
 # ── 2. Systemd user services (no sudo) ───────────────────────────────────────

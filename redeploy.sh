@@ -6,7 +6,7 @@ set -e
 REPO="$(dirname "$(readlink -f "$0")")"
 
 echo "Building makima..."
-distrobox enter deckery -- bash -c "cd '$REPO' && \$HOME/.cargo/bin/cargo build --release"
+distrobox enter deckery -- bash -c "cd '$REPO' && cargo build --release"
 
 systemctl --user stop makima.service
 mkdir -p "$HOME/.local/bin"
