@@ -16,3 +16,9 @@ toml = "0.7.3"
 fork = "0.1.23"
 zbus = { version = "3", features = ["tokio"] }
 notify = "6"
+
+[patch.crates-io]
+# evdev 0.12.1 is missing BTN_GRIPL/GRIPR/GRIPL2/GRIPR2 (Steam Deck back paddles, 0x224-0x227).
+# Using our fork until a new upstream release includes these codes.
+# Track: https://github.com/emberian/evdev/pull/178
+evdev = { git = "https://github.com/Plasma-Deckery/evdev", rev = "e428a6fe10c0f577ef05c38e85eaefd6eed8be1b" }
