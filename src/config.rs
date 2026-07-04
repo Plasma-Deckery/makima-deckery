@@ -297,7 +297,7 @@ impl Config {
 }
 
 /// Parse a single event name like "BTN_MODE" or "LSTICK_UP" into an Event.
-/// Returns None if the name is not recognized.
+/// Returns None and logs a warning if the name is not recognized.
 pub fn parse_event_name(name: &str) -> Option<Event> {
     if let Ok(axis) = Axis::from_str(name) {
         return Some(Event::Axis(axis));
@@ -305,7 +305,34 @@ pub fn parse_event_name(name: &str) -> Option<Event> {
     if let Ok(key) = evdev::Key::from_str(name) {
         return Some(Event::Key(key));
     }
+    eprintln!("[makima] WARNING: unknown binding name {:?} — skipping (typo in config?)", name);
     None
+}
+
+/// Parse a binding input string (e.g. "BTN_TL-BTN_SOUTH" or "BTN_EAST") into
+/// the trigger event and its modifier list. Registers any new custom modifiers.
+/// Returns (None, _) if the trigger event name is unrecognized.
+fn parse_binding_input(input: &str, mapped_modifiers: &mut MappedModifiers) -> (Option<Event>, Vec<Event>) {
+    if let Some((mods_str, event_str)) = input.rsplit_once('-') {
+        let str_modifiers: Vec<&str> = mods_str.split('-').collect();
+        let mut modifiers: Vec<Event> = str_modifiers.iter()
+            .filter(|&&m| !m.is_empty())
+            .filter_map(|m| parse_event_name(m))
+            .collect();
+        modifiers.sort();
+        modifiers.dedup();
+        for modifier in &modifiers {
+            if !mapped_modifiers.default.contains(modifier) {
+                mapped_modifiers.custom.push(modifier.clone());
+            }
+        }
+        if str_modifiers.first().map(|s| s.is_empty()).unwrap_or(false) {
+            modifiers.push(Event::Hold);
+        }
+        (parse_event_name(event_str), modifiers)
+    } else {
+        (parse_event_name(input), Vec::new())
+    }
 }
 
 fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>, MappedModifiers) {
@@ -338,281 +365,34 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
     mapped_modifiers.custom.extend(lstick_activation_modifiers);
     mapped_modifiers.custom.extend(rstick_activation_modifiers);
 
-    for (input, value) in remap.clone() {
+    for (input, value) in remap {
         let (output, np, lbl, sl) = match value {
             RemapValue::Simple(keys) => (keys, false, None, false),
             RemapValue::WithAttrs { keys, no_pause, label, silent } => (keys, no_pause, label, silent),
         };
-        if let Some((mods, event)) = input.rsplit_once("-") {
-            let str_modifiers = mods.split("-").collect::<Vec<&str>>();
-            let mut modifiers: Vec<Event> = Vec::new();
-            for event in str_modifiers.clone() {
-                if let Ok(axis) = Axis::from_str(event) {
-                    modifiers.push(Event::Axis(axis));
-                } else if let Ok(key) = Key::from_str(event) {
-                    modifiers.push(Event::Key(key));
-                }
-            }
-            modifiers.sort();
-            modifiers.dedup();
-            for modifier in &modifiers {
-                if !mapped_modifiers.default.contains(&modifier) {
-                    mapped_modifiers.custom.push(modifier.clone());
-                }
-            }
-            if str_modifiers[0] == "" {
-                modifiers.push(Event::Hold);
-            }
-            if let Ok(event) = Axis::from_str(event) {
-                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Axis(event), modifiers.clone())); }
-                if !bindings.remap.contains_key(&Event::Axis(event)) {
-                    bindings
-                        .remap
-                        .insert(Event::Axis(event), HashMap::from([(modifiers, output)]));
-                } else {
-                    bindings
-                        .remap
-                        .get_mut(&Event::Axis(event))
-                        .unwrap()
-                        .insert(modifiers, output);
-                }
-            } else if let Ok(event) = Key::from_str(event) {
-                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Key(event), modifiers.clone())); }
-                if !bindings.remap.contains_key(&Event::Key(event)) {
-                    bindings
-                        .remap
-                        .insert(Event::Key(event), HashMap::from([(modifiers, output)]));
-                } else {
-                    bindings
-                        .remap
-                        .get_mut(&Event::Key(event))
-                        .unwrap()
-                        .insert(modifiers, output);
-                }
-            }
-        } else {
-            let modifiers: Vec<Event> = Vec::new();
-            if let Ok(event) = Axis::from_str(input.as_str()) {
-                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Axis(event), modifiers.clone())); }
-                if !bindings.remap.contains_key(&Event::Axis(event)) {
-                    bindings
-                        .remap
-                        .insert(Event::Axis(event), HashMap::from([(modifiers, output)]));
-                } else {
-                    bindings
-                        .remap
-                        .get_mut(&Event::Axis(event))
-                        .unwrap()
-                        .insert(modifiers, output);
-                }
-            } else if let Ok(event) = Key::from_str(input.as_str()) {
-                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Key(event), modifiers.clone())); }
-                if !bindings.remap.contains_key(&Event::Key(event)) {
-                    bindings
-                        .remap
-                        .insert(Event::Key(event), HashMap::from([(modifiers, output)]));
-                } else {
-                    bindings
-                        .remap
-                        .get_mut(&Event::Key(event))
-                        .unwrap()
-                        .insert(modifiers, output);
-                }
-            }
-        }
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers) else { continue; };
+        if np { bindings.no_pause.insert((evt, modifiers.clone())); }
+        if let Some(l) = lbl { bindings.labels.insert((evt, modifiers.clone()), l); }
+        if sl { bindings.silent.insert((evt, modifiers.clone())); }
+        bindings.remap.entry(evt).or_default().insert(modifiers, output);
     }
 
-    for (input, value) in commands.clone() {
+    for (input, value) in commands {
         let (output, np, lbl, sl) = match value {
             CommandValue::Simple(cmds) => (cmds, false, None, false),
             CommandValue::WithAttrs { run, no_pause, label, silent } => (run, no_pause, label, silent),
         };
-        if let Some((mods, event)) = input.rsplit_once("-") {
-            let str_modifiers = mods.split("-").collect::<Vec<&str>>();
-            let mut modifiers: Vec<Event> = Vec::new();
-            for event in str_modifiers {
-                if let Ok(axis) = Axis::from_str(event) {
-                    modifiers.push(Event::Axis(axis));
-                } else if let Ok(key) = Key::from_str(event) {
-                    modifiers.push(Event::Key(key));
-                }
-            }
-            modifiers.sort();
-            modifiers.dedup();
-            for modifier in &modifiers {
-                if !mapped_modifiers.default.contains(&modifier) {
-                    mapped_modifiers.custom.push(modifier.clone());
-                }
-            }
-            if let Ok(event) = Axis::from_str(event) {
-                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Axis(event), modifiers.clone())); }
-                if !bindings.commands.contains_key(&Event::Axis(event)) {
-                    bindings
-                        .commands
-                        .insert(Event::Axis(event), HashMap::from([(modifiers, output)]));
-                } else {
-                    bindings
-                        .commands
-                        .get_mut(&Event::Axis(event))
-                        .unwrap()
-                        .insert(modifiers, output);
-                }
-            } else if let Ok(event) = Key::from_str(event) {
-                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Key(event), modifiers.clone())); }
-                if !bindings.commands.contains_key(&Event::Key(event)) {
-                    bindings
-                        .commands
-                        .insert(Event::Key(event), HashMap::from([(modifiers, output)]));
-                } else {
-                    bindings
-                        .commands
-                        .get_mut(&Event::Key(event))
-                        .unwrap()
-                        .insert(modifiers, output);
-                }
-            }
-        } else {
-            let modifiers: Vec<Event> = Vec::new();
-            if let Ok(event) = Axis::from_str(input.as_str()) {
-                if np { bindings.no_pause.insert((Event::Axis(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Axis(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Axis(event), modifiers.clone())); }
-                if !bindings.commands.contains_key(&Event::Axis(event)) {
-                    bindings
-                        .commands
-                        .insert(Event::Axis(event), HashMap::from([(modifiers, output)]));
-                } else {
-                    bindings
-                        .commands
-                        .get_mut(&Event::Axis(event))
-                        .unwrap()
-                        .insert(modifiers, output);
-                }
-            } else if let Ok(event) = Key::from_str(input.as_str()) {
-                if np { bindings.no_pause.insert((Event::Key(event), modifiers.clone())); } if let Some(l) = &lbl { bindings.labels.insert((Event::Key(event), modifiers.clone()), l.clone()); } if sl { bindings.silent.insert((Event::Key(event), modifiers.clone())); }
-                if !bindings.commands.contains_key(&Event::Key(event)) {
-                    bindings
-                        .commands
-                        .insert(Event::Key(event), HashMap::from([(modifiers, output)]));
-                } else {
-                    bindings
-                        .commands
-                        .get_mut(&Event::Key(event))
-                        .unwrap()
-                        .insert(modifiers, output);
-                }
-            }
-        }
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers) else { continue; };
+        if np { bindings.no_pause.insert((evt, modifiers.clone())); }
+        if let Some(l) = lbl { bindings.labels.insert((evt, modifiers.clone()), l); }
+        if sl { bindings.silent.insert((evt, modifiers.clone())); }
+        bindings.commands.entry(evt).or_default().insert(modifiers, output);
     }
 
-    for (input, output) in movements.clone() {
-        if let Some((mods, event)) = input.rsplit_once("-") {
-            let str_modifiers = mods.split("-").collect::<Vec<&str>>();
-            let mut modifiers: Vec<Event> = Vec::new();
-            for event in str_modifiers.clone() {
-                if let Ok(axis) = Axis::from_str(event) {
-                    modifiers.push(Event::Axis(axis));
-                } else if let Ok(key) = Key::from_str(event) {
-                    modifiers.push(Event::Key(key));
-                }
-            }
-            modifiers.sort();
-            modifiers.dedup();
-            for modifier in &modifiers {
-                if !mapped_modifiers.default.contains(&modifier) {
-                    mapped_modifiers.custom.push(modifier.clone());
-                }
-            }
-            if str_modifiers[0] == "" {
-                modifiers.push(Event::Hold);
-            }
-            if let Ok(event) = Axis::from_str(event) {
-                if !bindings.movements.contains_key(&Event::Axis(event)) {
-                    bindings.movements.insert(
-                        Event::Axis(event),
-                        HashMap::from([(
-                            modifiers,
-                            Relative::from_str(output.as_str())
-                                .expect("Invalid movement in [movements]."),
-                        )]),
-                    );
-                } else {
-                    bindings
-                        .movements
-                        .get_mut(&Event::Axis(event))
-                        .unwrap()
-                        .insert(
-                            modifiers,
-                            Relative::from_str(output.as_str())
-                                .expect("Invalid movement in [movements]."),
-                        );
-                }
-            } else if let Ok(event) = Key::from_str(event) {
-                if !bindings.movements.contains_key(&Event::Key(event)) {
-                    bindings.movements.insert(
-                        Event::Key(event),
-                        HashMap::from([(
-                            modifiers,
-                            Relative::from_str(output.as_str())
-                                .expect("Invalid movement in [movements]."),
-                        )]),
-                    );
-                } else {
-                    bindings
-                        .movements
-                        .get_mut(&Event::Key(event))
-                        .unwrap()
-                        .insert(
-                            modifiers,
-                            Relative::from_str(output.as_str())
-                                .expect("Invalid movement in [movements]."),
-                        );
-                }
-            }
-        } else {
-            let modifiers: Vec<Event> = Vec::new();
-            if let Ok(event) = Axis::from_str(input.as_str()) {
-                if !bindings.movements.contains_key(&Event::Axis(event)) {
-                    bindings.movements.insert(
-                        Event::Axis(event),
-                        HashMap::from([(
-                            modifiers,
-                            Relative::from_str(output.as_str())
-                                .expect("Invalid movement in [movements]."),
-                        )]),
-                    );
-                } else {
-                    bindings
-                        .movements
-                        .get_mut(&Event::Axis(event))
-                        .unwrap()
-                        .insert(
-                            modifiers,
-                            Relative::from_str(output.as_str())
-                                .expect("Invalid movement in [movements]."),
-                        );
-                }
-            } else if let Ok(event) = Key::from_str(input.as_str()) {
-                if !bindings.movements.contains_key(&Event::Key(event)) {
-                    bindings.movements.insert(
-                        Event::Key(event),
-                        HashMap::from([(
-                            modifiers,
-                            Relative::from_str(output.as_str())
-                                .expect("Invalid movement in [movements]."),
-                        )]),
-                    );
-                } else {
-                    bindings
-                        .movements
-                        .get_mut(&Event::Key(event))
-                        .unwrap()
-                        .insert(
-                            modifiers,
-                            Relative::from_str(output.as_str())
-                                .expect("Invalid movement in [movements]."),
-                        );
-                }
-            }
-        }
+    for (input, output) in movements {
+        let rel = Relative::from_str(output.as_str()).expect("Invalid movement in [movements].");
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers) else { continue; };
+        bindings.movements.entry(evt).or_default().insert(modifiers, rel);
     }
 
     mapped_modifiers.custom.sort();
@@ -628,21 +408,8 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
 }
 
 pub fn parse_modifiers(settings: &HashMap<String, String>, parameter: &str) -> Vec<Event> {
-    match settings.get(&parameter.to_string()) {
-        Some(modifiers) => {
-            let mut custom_modifiers = Vec::new();
-            let split_modifiers = modifiers.split("-").collect::<Vec<&str>>();
-            for modifier in split_modifiers {
-                if let Ok(key) = Key::from_str(modifier) {
-                    custom_modifiers.push(Event::Key(key));
-                } else if let Ok(axis) = Axis::from_str(modifier) {
-                    custom_modifiers.push(Event::Axis(axis));
-                } else {
-                    println!("Invalid value used as modifier in {}, ignoring.", parameter);
-                }
-            }
-            custom_modifiers
-        }
+    match settings.get(parameter) {
+        Some(modifiers) => modifiers.split('-').filter_map(|m| parse_event_name(m)).collect(),
         None => Vec::new(),
     }
 }
@@ -736,6 +503,15 @@ mod tests {
             app.bindings.remap.get(&btn_up).and_then(|m| m.get(&combo)).is_none(),
             "base remap must not leak when override defines a command for the same combo"
         );
+    }
+
+    /// parse_event_name returns Some for valid names and None for unknown ones.
+    #[test]
+    fn parse_event_name_known_and_unknown() {
+        assert!(parse_event_name("BTN_TL").is_some(), "BTN_TL must be recognised");
+        assert!(parse_event_name("BTN_GRIPR2").is_some(), "BTN_GRIPR2 (Steam Deck back paddle) must be recognised");
+        assert!(parse_event_name("BTN_TOTALLY_FAKE").is_none(), "unknown name must return None");
+        assert!(parse_event_name("").is_none(), "empty string must return None");
     }
 
     /// Unrelated combos from the base must still be inherited normally.
