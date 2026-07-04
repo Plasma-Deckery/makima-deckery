@@ -8,15 +8,13 @@
 
 set -e
 REPO="$(dirname "$(readlink -f "$0")")"
-PACKAGES="rust"
+BUILD_PACKAGES="rust pkgconf gcc systemd-libs"
 
 echo "Repo: $REPO"
 
 # ── 1. Distrobox container + packages ────────────────────────────────────────
-distrobox assemble create --file "$REPO/distrobox.ini"
-if ! distrobox enter deckery -- bash -c "cargo --version >/dev/null 2>&1"; then
-    distrobox enter deckery -- sudo pacman -S --needed --noconfirm rust
-fi
+distrobox create --name deckery --image archlinux:latest || true
+distrobox enter deckery -- sudo pacman -S --needed --noconfirm $BUILD_PACKAGES
 
 # ── 2. Systemd user services (no sudo) ───────────────────────────────────────
 SERVICE_DIR="$HOME/.config/systemd/user"
