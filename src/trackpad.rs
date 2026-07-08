@@ -1,18 +1,18 @@
 use crate::virtual_devices::VirtualDevices;
 use evdev::{EventType, InputEvent, Key};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Per-pad state shared between the pad hidraw reader (`pad_hidraw.rs`,
+/// writes position/touching) and the rest of makima (reads them for state
+/// export, click forwarding, etc). Position and touch state are always
+/// written together as one atomic frame by `EventReader::pad_loop` — see
+/// `pad_hidraw.rs` for why that atomicity matters.
 pub struct PadState {
     is_left: bool,
     pub position: Arc<Mutex<(i32, i32)>>,
     pub touching_hw: Arc<Mutex<bool>>,
     pub pressed: Arc<Mutex<bool>>,
-    pub x_fresh: AtomicBool,
-    pub y_fresh: AtomicBool,
-    pub emit_pending: AtomicBool,
-    pub dirty: AtomicBool,
 }
 
 impl PadState {
@@ -22,68 +22,7 @@ impl PadState {
             position: Arc::new(Mutex::new((0, 0))),
             touching_hw: Arc::new(Mutex::new(false)),
             pressed: Arc::new(Mutex::new(false)),
-            x_fresh: AtomicBool::new(false),
-            y_fresh: AtomicBool::new(false),
-            emit_pending: AtomicBool::new(false),
-            dirty: AtomicBool::new(false),
         }
-    }
-
-    pub fn reset_coalescing(&self) {
-        self.dirty.store(false, Ordering::Relaxed);
-        self.x_fresh.store(false, Ordering::Relaxed);
-        self.y_fresh.store(false, Ordering::Relaxed);
-        self.emit_pending.store(false, Ordering::Relaxed);
-    }
-
-    pub async fn process_syn(&self, virt_dev: &Arc<Mutex<VirtualDevices>>) {
-        if self.dirty.load(Ordering::Relaxed) {
-            self.dirty.store(false, Ordering::Relaxed);
-            // If we were already pending, it means we were waiting for the other axis.
-            // Don't wait any longer - emit now with whatever we have. This fixes the
-            // single-axis jitter where pure vertical/horizontal movement would never
-            // complete a frame (the other axis never arrives).
-            let was_pending = self.emit_pending.swap(false, Ordering::Relaxed);
-            if was_pending || (self.x_fresh.load(Ordering::Relaxed) && self.y_fresh.load(Ordering::Relaxed)) {
-                self.x_fresh.store(false, Ordering::Relaxed);
-                self.y_fresh.store(false, Ordering::Relaxed);
-                let (x, y) = *self.position.lock().await;
-                let touching = *self.touching_hw.lock().await;
-                self.emit(virt_dev, x, y, touching, None).await;
-            } else {
-                // First frame with only one axis fresh - wait one SYN for the other
-                self.emit_pending.store(true, Ordering::Relaxed);
-            }
-        } else if self.emit_pending.load(Ordering::Relaxed) {
-            // Empty SYN fallback: the other axis never came - emit what we have
-            self.emit_pending.store(false, Ordering::Relaxed);
-            self.x_fresh.store(false, Ordering::Relaxed);
-            self.y_fresh.store(false, Ordering::Relaxed);
-            let (x, y) = *self.position.lock().await;
-            let touching = *self.touching_hw.lock().await;
-            self.emit(virt_dev, x, y, touching, None).await;
-        }
-    }
-
-    /// Returns true if this pad is ready to emit a combined frame:
-    /// - it has no new data (!dirty), or
-    /// - it has new data with both axes fresh (x_fresh && y_fresh).
-    /// Does NOT reset any flags - the caller must reset them after emitting.
-    pub fn is_ready(&self) -> bool {
-        if self.dirty.load(Ordering::Relaxed) {
-            self.x_fresh.load(Ordering::Relaxed) && self.y_fresh.load(Ordering::Relaxed)
-        } else {
-            true
-        }
-    }
-
-    /// Reset all coalescing flags. Use after a combined frame has been emitted
-    /// (e.g. by the gesture pad emitter) to mark this pad as "consumed".
-    pub fn clear_pending(&self) {
-        self.dirty.store(false, Ordering::Relaxed);
-        self.x_fresh.store(false, Ordering::Relaxed);
-        self.y_fresh.store(false, Ordering::Relaxed);
-        self.emit_pending.store(false, Ordering::Relaxed);
     }
 
     pub async fn emit(

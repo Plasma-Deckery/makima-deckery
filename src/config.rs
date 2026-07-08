@@ -597,6 +597,7 @@ mod tests {
             override_bindings: None,
             settings: HashMap::new(),
             mapped_modifiers: Default::default(),
+            trackpad: Default::default(),
         }
     }
 

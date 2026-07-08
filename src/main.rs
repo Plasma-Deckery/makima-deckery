@@ -4,6 +4,7 @@ mod config;
 mod event_reader;
 mod kwin_watcher;
 mod lizard_mode;
+mod pad_hidraw;
 mod resolver;
 mod state_export;
 mod trackpad;

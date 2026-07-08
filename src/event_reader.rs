@@ -1,5 +1,6 @@
 use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, Relative, Scroll, TrackpadMode};
+use crate::pad_hidraw::{self, PadFrame};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::trackpad::{emit_gesture_event, PadState};
@@ -18,7 +19,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
 
@@ -105,93 +106,6 @@ pub struct EventReader {
     /// Path of the evdev device this reader is attached to — used to locate the
     /// corresponding hidraw sibling via sysfs at startup.
     device_path: std::path::PathBuf,
-    /// Toggled by the hidraw reader whenever LPAD_TOUCH or RPAD_TOUCH changes.
-    /// Uses watch::Sender so the event loop never loses a notification even when
-    /// the select! picks another branch at the same time (unlike Notify).
-    touch_changed: Arc<tokio::sync::watch::Sender<bool>>,
-}
-
-/// Given an evdev device path (e.g. `/dev/input/event5`), find the hidraw sibling
-/// that belongs to the same physical device via sysfs.
-///
-/// Sysfs layout on Steam Deck:
-///   evdev:   /sys/class/input/eventN/device  → …/usb_iface/HID_A/input/inputN
-///   hidraw:  /sys/class/hidraw/hidrawN/device → …/usb_iface/HID_B
-///
-/// evdev and hidraw may belong to different HID functions (e.g. .0003 vs .0005)
-/// of the same USB interface. We therefore go up to the shared USB interface
-/// (three levels above inputN: input/ → HID_A/ → usb_iface/) and look for any
-/// hidraw device whose sysfs path starts with that same USB interface path.
-fn find_hidraw_for_evdev(evdev_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let dev_name = evdev_path.file_name()?.to_str()?;
-    let evdev_sysfs = std::fs::canonicalize(
-        format!("/sys/class/input/{}/device", dev_name)
-    ).ok()?;
-    // evdev_sysfs is …/usb_iface/HID_A/input/inputN
-    // Go up three levels: inputN → input/ → HID_A/ → usb_iface/
-    let usb_iface = evdev_sysfs.parent()?.parent()?.parent()?;
-    for entry in std::fs::read_dir("/sys/class/hidraw/").ok()? {
-        let entry = entry.ok()?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Ok(hidraw_sysfs) = std::fs::canonicalize(
-            format!("/sys/class/hidraw/{}/device", name)
-        ) {
-            // The hidraw device lives at …/usb_iface/HID_B — its parent is usb_iface.
-            if hidraw_sysfs.parent() == Some(usb_iface) {
-                return Some(std::path::PathBuf::from(format!("/dev/{}", name)));
-            }
-        }
-    }
-    None
-}
-
-/// Reads HID reports from a hidraw device and extracts the LPAD_TOUCH (bit 3) and
-/// RPAD_TOUCH (bit 4) flags from byte 10. Updates the shared state and toggles
-/// `touch_changed` whenever the touch state transitions. Exits silently on read error.
-///
-/// Uses watch::Sender (toggled bool) instead of Notify so the event loop can never
-/// lose a transition: watch stores the latest value; changed() fires whenever it differs
-/// from what the receiver last saw, even if the select! branch was busy when it fired.
-async fn run_hidraw_reader(
-    path: std::path::PathBuf,
-    lpad_touching: Arc<Mutex<bool>>,
-    rpad_touching: Arc<Mutex<bool>>,
-    touch_changed: Arc<tokio::sync::watch::Sender<bool>>,
-) {
-    use tokio::io::AsyncReadExt;
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("makima: hidraw reader: cannot open {:?}: {}", path, e);
-            return;
-        }
-    };
-    let mut reader = tokio::io::BufReader::new(file);
-    let mut buf = [0u8; 64];
-    loop {
-        match reader.read_exact(&mut buf).await {
-            Ok(_) => {
-                let byte10 = buf[10];
-                let new_lpad = (byte10 & 0x08) != 0;
-                let new_rpad = (byte10 & 0x10) != 0;
-                let mut changed = false;
-                {
-                    let mut l = lpad_touching.lock().await;
-                    if *l != new_lpad { *l = new_lpad; changed = true; }
-                }
-                {
-                    let mut r = rpad_touching.lock().await;
-                    if *r != new_rpad { *r = new_rpad; changed = true; }
-                }
-                if changed {
-                    // Toggle the bool so the watch value always differs from what
-                    // the receiver last saw — guaranteeing changed() fires.
-                    touch_changed.send_modify(|v| *v = !*v);
-                }
-            }
-            Err(_) => break,
-        }
-    }
 }
 
 impl EventReader {
@@ -218,10 +132,6 @@ impl EventReader {
         let imu_raw = Arc::new(Mutex::new((0i32, 0i32)));
         let analog_state_export = Arc::new(Mutex::new(false));
         let analog_snapshot = Arc::new(Mutex::new([f32::NAN; 8]));
-        let lpad_position = Arc::new(Mutex::new((0i32, 0i32)));
-        let lpad_pressed = Arc::new(Mutex::new(false));
-        let rpad_position = Arc::new(Mutex::new((0i32, 0i32)));
-        let rpad_pressed = Arc::new(Mutex::new(false));
         let cursor_movement = Arc::new(Mutex::new((0, 0)));
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -522,7 +432,6 @@ impl EventReader {
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
             device_path,
-            touch_changed: Arc::new(tokio::sync::watch::channel(false).0),
         }
     }
 
@@ -545,20 +454,18 @@ impl EventReader {
         if self.settings.combined_gesture_device {
             self.virt_dev.lock().await.enable_gesture_pad();
         }
-        // Spawn a lightweight hidraw reader to track LPAD_TOUCH / RPAD_TOUCH bits
-        // directly from the HID report (byte 10, bits 3 and 4). This is more reliable
-        // than inferring touch state from HAT axis values, which sometimes fail to
-        // reset to (0,0) on lift (hid-steam trailing-event bug).
-        if let Some(hidraw_path) = find_hidraw_for_evdev(&self.device_path) {
-            println!("makima: hidraw reader attached to {:?}", hidraw_path);
-            let lpad = self.lpad.touching_hw.clone();
-            let rpad = self.rpad.touching_hw.clone();
-            let notify = self.touch_changed.clone();
-            tokio::spawn(async move {
-                run_hidraw_reader(hidraw_path, lpad, rpad, notify).await;
-            });
-        } else {
-            println!("makima: no hidraw sibling found for {:?}, touch detection falls back to position", self.device_path);
+        // Trackpad position AND touch state both come from the raw hidraw report
+        // (see pad_hidraw.rs for why: evdev and hidraw are different HID
+        // interfaces of the same device and can arrive out of order relative to
+        // each other, which used to cause cursor jumps on reposition). There is
+        // no evdev-based fallback: if no hidraw sibling is found, MtTrackpad mode
+        // simply gets no position/touch data.
+        let pad_rx = pad_hidraw::spawn(&self.device_path);
+        if pad_rx.is_none() {
+            println!(
+                "makima: no hidraw sibling found for {:?}, trackpad position/touch will not be available",
+                self.device_path
+            );
         }
         self.write_state().await;
         self.start_control_socket().await;
@@ -569,6 +476,7 @@ impl EventReader {
             self.key_cursor_loop(),
             self.key_scroll_loop(),
             self.window_changed_loop(),
+            self.pad_loop(pad_rx),
         );
     }
 
@@ -609,50 +517,30 @@ impl EventReader {
             }
         }
         let mut had_device_error = false;
-        // Subscribe to hidraw touch-change notifications. subscribe() creates a receiver
-        // that sees only future changes — any transitions during startup are fine to miss.
-        let mut touch_changed_rx = self.touch_changed.subscribe();
-        // Track previous touching state to detect transitions (lift/touch-down).
-        // Transitions always force an immediate state.json write, bypassing the rate limit.
-        let mut lpad_was_touching = false;
-        let mut rpad_was_touching = false;
-        // Gesture session state: true once both pads were simultaneously touched.
-        // Stays true until both fingers are fully lifted — events route to gesture_pad.
-        let mut gesture_active = false;
         // Dirty flags for stick axes — set whenever ABS_X/Y or ABS_RX/RY arrive.
         let mut lstick_dirty = false;
         let mut rstick_dirty = false;
         // Dirty flag for IMU axes (ABS_HAT2X/Y).
         let mut imu_dirty = false;
-        // Rate-limit state.json writes from trackpad/stick movement to ~60 Hz.
-        let mut last_trackpad_state_write = std::time::Instant::now()
+        // Rate-limit state.json writes from stick/gyro movement to ~60 Hz.
+        // (Trackpad state.json writes are handled by pad_loop, driven by hidraw
+        // frames — see pad_hidraw.rs.)
+        let mut last_stick_state_write = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_millis(17))
             .unwrap_or(std::time::Instant::now());
         loop {
-            let event = tokio::select! {
-                event_result = stream.next() => match event_result {
-                    Some(Ok(e)) => e,
-                    Some(Err(e)) => {
-                        println!(
-                            "[makima] Device read error on \"{}\": {} — signaling reconnect.",
-                            self.current_config.lock().await.name,
-                            e
-                        );
-                        had_device_error = true;
-                        break;
-                    }
-                    None => break,
-                },
-                _ = touch_changed_rx.changed() => {
-                    // hidraw detected a touch transition — sync was_touching state and
-                    // write state.json immediately without waiting for the next HAT event.
-                    // watch::changed() is guaranteed not to lose transitions even if the
-                    // event-stream branch was selected at the same time (unlike Notify).
-                    lpad_was_touching =                     *self.lpad.touching_hw.lock().await;
-                    rpad_was_touching =                     *self.rpad.touching_hw.lock().await;
-                    self.write_state().await;
-                    continue;
+            let event = match stream.next().await {
+                Some(Ok(e)) => e,
+                Some(Err(e)) => {
+                    println!(
+                        "[makima] Device read error on \"{}\": {} — signaling reconnect.",
+                        self.current_config.lock().await.name,
+                        e
+                    );
+                    had_device_error = true;
+                    break;
                 }
+                None => break,
             };
             match (
                 event.event_type(),
@@ -745,14 +633,10 @@ impl EventReader {
                 }
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
                 (_, _, AbsoluteAxisType::ABS_HAT0X, _) => {
-                    // Always track raw position for state export.
-                    self.lpad.position.lock().await.0 = event.value() as i32;
-                    self.lpad.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.lpad.x_fresh.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if self.settings.lpad.mode == TrackpadMode::MtTrackpad {
-                        // Trackpad mode: emit to virtual MT device on SYN_REPORT (dirty flag set above).
-                    } else {
-                        // D-pad hat switch (non-Steam-Deck controllers).
+                    // Trackpad position/touch now comes from hidraw (pad_loop) in
+                    // MtTrackpad mode — see pad_hidraw.rs. This handler only remains
+                    // for the D-pad hat-switch case on non-Steam-Deck controllers.
+                    if self.settings.lpad.mode != TrackpadMode::MtTrackpad {
                         match event.value() {
                             -1 => {
                                 self.convert_event(event, Event::Axis(Axis::BTN_DPAD_LEFT), 1, false)
@@ -793,14 +677,10 @@ impl EventReader {
                     }
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT0Y, _) => {
-                    // Always track raw position for state export.
-                    self.lpad.position.lock().await.1 = event.value() as i32;
-                    self.lpad.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.lpad.y_fresh.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if self.settings.lpad.mode == TrackpadMode::MtTrackpad {
-                        // Trackpad mode: emit to virtual MT device on SYN_REPORT (dirty flag set above).
-                    } else {
-                        // D-pad hat switch (non-Steam-Deck controllers).
+                    // Trackpad position/touch now comes from hidraw (pad_loop) in
+                    // MtTrackpad mode — see pad_hidraw.rs. This handler only remains
+                    // for the D-pad hat-switch case on non-Steam-Deck controllers.
+                    if self.settings.lpad.mode != TrackpadMode::MtTrackpad {
                         match event.value() {
                             -1 => {
                                 self.convert_event(event, Event::Axis(Axis::BTN_DPAD_UP), 1, false)
@@ -840,18 +720,10 @@ impl EventReader {
                         }
                     }
                 }
-                (_, _, AbsoluteAxisType::ABS_HAT1X, _) => {
-                    // Always track raw position for state export.
-                    self.rpad.position.lock().await.0 = event.value() as i32;
-                    self.rpad.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.rpad.x_fresh.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                (_, _, AbsoluteAxisType::ABS_HAT1Y, _) => {
-                    // Always track raw position for state export.
-                    self.rpad.position.lock().await.1 = event.value() as i32;
-                    self.rpad.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.rpad.y_fresh.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                // RPAD position (ABS_HAT1X/Y) is read directly from hidraw by pad_loop
+                // instead (see pad_hidraw.rs) — swallow these here so they don't fall
+                // through to emit_default_event and leak onto the generic ABS device.
+                (_, _, AbsoluteAxisType::ABS_HAT1X | AbsoluteAxisType::ABS_HAT1Y, _) => {}
                 // IMU (gyroscope/accelerometer): ABS_HAT2X/Y, range 0..32767.
                 // Stored for state export; not forwarded.
                 (_, _, AbsoluteAxisType::ABS_HAT2X, _) => {
@@ -1338,86 +1210,17 @@ impl EventReader {
                     }
                 }
                 (EventType::SYNCHRONIZATION, _, _, _) => {
-                    // SYN_REPORT: emit complete, consistent trackpad state once per frame,
-                    // but only when new HAT data actually arrived (dirty flag).
-                    // Without this guard, every SYN from sticks/triggers would re-emit the
-                    // trackpad position, confusing libinput's velocity calculation.
-                    let pad_changed = self.lpad.dirty.load(std::sync::atomic::Ordering::Relaxed) || self.rpad.dirty.load(std::sync::atomic::Ordering::Relaxed);
-                    if pad_changed && self.settings.combined_gesture_device {
-                        let lpad_pos = *self.lpad.position.lock().await;
-                        let rpad_pos = *self.rpad.position.lock().await;
-                        let l_touching = *self.lpad.touching_hw.lock().await;
-                        let r_touching = *self.rpad.touching_hw.lock().await;
-                        let was_gesture_active = gesture_active;
-                        // Enter gesture session when both pads touched simultaneously.
-                        if l_touching && r_touching {
-                            gesture_active = true;
-                        }
-                        // First frame of gesture session: lift any individual MT devices
-                        // that currently have a finger down so libinput sees a clean state.
-                        if !was_gesture_active && gesture_active {
-                            if self.settings.lpad.mode == TrackpadMode::MtTrackpad {
-                                self.lpad.emit(&self.virt_dev, 0, 0, false, None).await;
-                            }
-                            if self.settings.rpad.mode == TrackpadMode::MtTrackpad {
-                                self.rpad.emit(&self.virt_dev, 0, 0, false, None).await;
-                            }
-                        }
-                        if gesture_active {
-                            self.lpad.reset_coalescing();
-                            self.rpad.reset_coalescing();
-                            // Exit as soon as either finger lifts.
-                            if !l_touching || !r_touching {
-                                gesture_active = false;
-                                // Clean lift on both gesture device slots.
-                                emit_gesture_event(&self.virt_dev, 0, 0, 0, 0, false, false).await;
-                                // Immediately resume the finger that is still active
-                                // on its individual device — synthetic touch-down.
-                                if l_touching {
-                                    self.lpad.emit(&self.virt_dev, lpad_pos.0, lpad_pos.1, true, None).await;
-                                }
-                                if r_touching {
-                                    self.rpad.emit(&self.virt_dev, rpad_pos.0, rpad_pos.1, true, None).await;
-                                }
-                            } else {
-                                emit_gesture_event(&self.virt_dev, lpad_pos.0, lpad_pos.1, rpad_pos.0, rpad_pos.1, l_touching, r_touching).await;
-                            }
-                            // Sync to Arc so write_state_inner can read current gesture state.
-                            *self.gesture_session.lock().await = gesture_active;
-                            // Gesture entry/exit is a digital state change — always write
-                            // state.json immediately, independent of analog_state_export.
-                            if gesture_active != was_gesture_active {
-                                self.write_state().await;
-                            }
-                        }
-                    }
-                    // Individual MT devices — only when not currently in a gesture session.
-                    // X+Y coalescing is now handled centrally by PadState::process_syn.
-                    self.lpad.process_syn(&self.virt_dev).await;
-                    self.rpad.process_syn(&self.virt_dev).await;
-                    // Write state.json on trackpad/stick movement, rate-limited to ~60 Hz.
-                    // Touch transitions (lift / touch-down) bypass the rate limit so
-                    // touching=false is always written promptly when the finger leaves.
+                    // Trackpad handling (position, touch, gestures, its own state.json
+                    // writes) has moved entirely to pad_loop, driven by hidraw frames —
+                    // see pad_hidraw.rs. This SYN handler now only rate-limits
+                    // state.json writes triggered by stick/gyro movement.
                     let stick_changed = lstick_dirty || rstick_dirty || imu_dirty;
                     if lstick_dirty { lstick_dirty = false; }
                     if rstick_dirty { rstick_dirty = false; }
                     if imu_dirty { imu_dirty = false; }
-                    if pad_changed || stick_changed {
-                        let lpad_touching =                     *self.lpad.touching_hw.lock().await;
-                        let rpad_touching =                     *self.rpad.touching_hw.lock().await;
-                        let touch_transition = lpad_touching != lpad_was_touching
-                            || rpad_touching != rpad_was_touching;
-                        lpad_was_touching = lpad_touching;
-                        rpad_was_touching = rpad_touching;
-                        if touch_transition {
-                            // Touch transitions are digital — write immediately regardless of
-                            // analog_state_export, and reset the rate-limit timer.
-                            last_trackpad_state_write = std::time::Instant::now();
-                            self.write_state().await;
-                        } else if last_trackpad_state_write.elapsed().as_millis() >= 16 {
-                            last_trackpad_state_write = std::time::Instant::now();
-                            self.write_state_analog().await;
-                        }
+                    if stick_changed && last_stick_state_write.elapsed().as_millis() >= 16 {
+                        last_stick_state_write = std::time::Instant::now();
+                        self.write_state_analog().await;
                     }
                 }
                 _ => self.emit_default_event(event).await,
@@ -1434,6 +1237,120 @@ impl EventReader {
             self.current_config.lock().await.name
         );
     }
+
+    /// Consumes `PadFrame`s from the pad hidraw reader (see pad_hidraw.rs) and
+    /// drives trackpad position, touch state, individual MT emission, combined
+    /// two-finger gestures, and their state.json writes. Deliberately separate
+    /// from `event_loop` (the evdev stream): trackpad data has its own source
+    /// and its own cadence now, and doesn't need to be synchronized with
+    /// buttons/sticks/gyro at all — only the shared `Settings`/`virt_dev`.
+    ///
+    /// Returns immediately if `rx` is `None` (no hidraw sibling was found —
+    /// there is no evdev-based fallback for trackpad position/touch).
+    async fn pad_loop(&self, rx: Option<mpsc::Receiver<PadFrame>>) {
+        let mut rx = match rx {
+            Some(rx) => rx,
+            None => return,
+        };
+        // Previous frame, to know which pad(s) actually changed and whether a
+        // touch transition happened — every recv() is already a real change
+        // vs. the *last sent* frame (deduped in pad_hidraw.rs), but that dedup
+        // is over the whole frame, not per pad.
+        let mut prev = PadFrame::default();
+        // Gesture session state: true once both pads were simultaneously touched.
+        // Stays true until both fingers are fully lifted — events route to gesture_pad.
+        let mut gesture_active = false;
+        // Rate-limit state.json writes from trackpad movement to ~60 Hz. Touch
+        // transitions (lift/touch-down) bypass this and write immediately.
+        let mut last_state_write = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(17))
+            .unwrap_or_else(std::time::Instant::now);
+
+        while let Some(frame) = rx.recv().await {
+            let delta = pad_hidraw::diff_frames(prev, frame);
+            let (l_changed, r_changed, touch_transition) =
+                (delta.l_changed, delta.r_changed, delta.touch_transition);
+            prev = frame;
+
+            *self.lpad.position.lock().await = (frame.lx, frame.ly);
+            *self.lpad.touching_hw.lock().await = frame.ltouch;
+            *self.rpad.position.lock().await = (frame.rx, frame.ry);
+            *self.rpad.touching_hw.lock().await = frame.rtouch;
+
+            if !l_changed && !r_changed {
+                continue;
+            }
+
+            // Combined two-finger gesture routing — logic unchanged from the old
+            // SYN-block implementation, just moved here since it needs both pads'
+            // touch state at once, which this loop now always has atomically.
+            if self.settings.combined_gesture_device {
+                let was_gesture_active = gesture_active;
+                // Enter gesture session when both pads touched simultaneously.
+                if frame.ltouch && frame.rtouch {
+                    gesture_active = true;
+                }
+                // First frame of gesture session: lift any individual MT devices
+                // that currently have a finger down so libinput sees a clean state.
+                if !was_gesture_active && gesture_active {
+                    if self.settings.lpad.mode == TrackpadMode::MtTrackpad {
+                        self.lpad.emit(&self.virt_dev, 0, 0, false, None).await;
+                    }
+                    if self.settings.rpad.mode == TrackpadMode::MtTrackpad {
+                        self.rpad.emit(&self.virt_dev, 0, 0, false, None).await;
+                    }
+                }
+                if gesture_active {
+                    // Exit as soon as either finger lifts.
+                    if !frame.ltouch || !frame.rtouch {
+                        gesture_active = false;
+                        // Clean lift on both gesture device slots.
+                        emit_gesture_event(&self.virt_dev, 0, 0, 0, 0, false, false).await;
+                        // Immediately resume the finger that is still active on
+                        // its individual device — synthetic touch-down.
+                        if frame.ltouch {
+                            self.lpad.emit(&self.virt_dev, frame.lx, frame.ly, true, None).await;
+                        }
+                        if frame.rtouch {
+                            self.rpad.emit(&self.virt_dev, frame.rx, frame.ry, true, None).await;
+                        }
+                    } else {
+                        emit_gesture_event(
+                            &self.virt_dev, frame.lx, frame.ly, frame.rx, frame.ry, frame.ltouch, frame.rtouch,
+                        ).await;
+                    }
+                    // Sync to Arc so write_state_inner can read current gesture state.
+                    *self.gesture_session.lock().await = gesture_active;
+                    // Gesture entry/exit is a digital state change — always write
+                    // state.json immediately, independent of analog_state_export.
+                    if gesture_active != was_gesture_active {
+                        self.write_state().await;
+                    }
+                }
+            }
+
+            // Individual MT devices — only when not currently in a gesture session.
+            if !gesture_active {
+                if l_changed && self.settings.lpad.mode == TrackpadMode::MtTrackpad {
+                    self.lpad.emit(&self.virt_dev, frame.lx, frame.ly, frame.ltouch, None).await;
+                }
+                if r_changed && self.settings.rpad.mode == TrackpadMode::MtTrackpad {
+                    self.rpad.emit(&self.virt_dev, frame.rx, frame.ry, frame.rtouch, None).await;
+                }
+            }
+
+            // Write state.json, rate-limited to ~60 Hz. Touch transitions bypass
+            // the rate limit so touching=false is always written promptly.
+            if touch_transition {
+                last_state_write = std::time::Instant::now();
+                self.write_state().await;
+            } else if last_state_write.elapsed().as_millis() >= 16 {
+                last_state_write = std::time::Instant::now();
+                self.write_state_analog().await;
+            }
+        }
+    }
+
     async fn convert_event(
         &self,
         default_event: InputEvent,

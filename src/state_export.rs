@@ -454,6 +454,7 @@ mod tests {
                 custom: custom_modifiers,
                 all: all_mods,
             },
+            trackpad: Default::default(),
         }
     }
 
@@ -883,6 +884,7 @@ mod tests {
                     custom: vec![btn_tl],
                     all: vec![btn_tl],
                 },
+            trackpad: Default::default(),
             }
         };
 
@@ -901,6 +903,7 @@ mod tests {
                 override_bindings: None,
                 settings: HashMap::new(),
                 mapped_modifiers: Default::default(),
+            trackpad: Default::default(),
             }
         };
 
@@ -950,6 +953,7 @@ mod tests {
             mapped_modifiers: crate::config::MappedModifiers {
                 custom: vec![btn_tl], all: vec![btn_tl], default: vec![],
             },
+        trackpad: Default::default(),
         };
 
         // Override replaces with a remap, no label defined.
@@ -963,6 +967,7 @@ mod tests {
             override_bindings: None,
             settings: HashMap::new(),
             mapped_modifiers: Default::default(),
+        trackpad: Default::default(),
         };
 
         app.merge_base(&base);
@@ -1003,6 +1008,7 @@ mod tests {
             mapped_modifiers: crate::config::MappedModifiers {
                 custom: vec![btn_tl], all: vec![btn_tl], default: vec![],
             },
+        trackpad: Default::default(),
         };
 
         // Override replaces with a remap AND defines its own label.
@@ -1018,6 +1024,7 @@ mod tests {
             override_bindings: None,
             settings: HashMap::new(),
             mapped_modifiers: Default::default(),
+        trackpad: Default::default(),
         };
 
         app.merge_base(&base);
@@ -1085,6 +1092,7 @@ mod tests {
                 custom: vec![btn_tl],
                 all: vec![btn_tl],
             },
+        trackpad: Default::default(),
         };
 
         let state = build_state(
