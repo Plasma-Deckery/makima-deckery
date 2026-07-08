@@ -30,9 +30,11 @@ pub struct PadFrame {
     pub lx: i32,
     pub ly: i32,
     pub ltouch: bool,
+    pub lclick: bool,
     pub rx: i32,
     pub ry: i32,
     pub rtouch: bool,
+    pub rclick: bool,
 }
 
 impl PadFrame {
@@ -42,9 +44,17 @@ impl PadFrame {
             lx: i16::from_le_bytes([buf[16], buf[17]]) as i32,
             ly: i16::from_le_bytes([buf[18], buf[19]]) as i32,
             ltouch: (byte10 & 0x08) != 0,
+            // Click (physical press-through) lives in the exact same byte as
+            // touch — confirmed against the upstream hid-steam kernel driver
+            // (steam_do_deck_input_event): BTN_THUMB = b10 & BIT(1), BTN_THUMB2
+            // = b10 & BIT(2). Reading it here too makes click atomic with
+            // position/touch, same reasoning as the rest of this module —
+            // instead of sourcing it from evdev BTN_THUMB/BTN_THUMB2 separately.
+            lclick: (byte10 & 0x02) != 0,
             rx: i16::from_le_bytes([buf[20], buf[21]]) as i32,
             ry: i16::from_le_bytes([buf[22], buf[23]]) as i32,
             rtouch: (byte10 & 0x10) != 0,
+            rclick: (byte10 & 0x04) != 0,
         }
     }
 }
@@ -63,10 +73,83 @@ pub struct PadDelta {
 
 pub fn diff_frames(prev: PadFrame, frame: PadFrame) -> PadDelta {
     PadDelta {
-        l_changed: (frame.lx, frame.ly, frame.ltouch) != (prev.lx, prev.ly, prev.ltouch),
-        r_changed: (frame.rx, frame.ry, frame.rtouch) != (prev.rx, prev.ry, prev.rtouch),
+        l_changed: (frame.lx, frame.ly, frame.ltouch, frame.lclick)
+            != (prev.lx, prev.ly, prev.ltouch, prev.lclick),
+        r_changed: (frame.rx, frame.ry, frame.rtouch, frame.rclick)
+            != (prev.rx, prev.ry, prev.rtouch, prev.rclick),
         touch_transition: frame.ltouch != prev.ltouch || frame.rtouch != prev.rtouch,
     }
+}
+
+/// Identifies one physical trackpad, used by `decide_gesture_transition` to
+/// say which pad "survives" when a combined gesture session ends with only
+/// one finger still down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pad {
+    Left,
+    Right,
+}
+
+/// Result of feeding one `PadFrame` into the combined-gesture state machine.
+/// Pure and I/O-free so the entry/exit logic can be unit-tested directly,
+/// independent of which pad physically touched down first or lifted first —
+/// see the `tests` module below for the symmetry checks this exists to
+/// guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GestureTransition {
+    /// Whether a combined gesture session is active *after* this frame.
+    pub now_active: bool,
+    /// True only on the single frame where the session starts (both pads
+    /// just became simultaneously touched) — callers use this to force a
+    /// clean lift on any individual per-pad MT devices before combined
+    /// events start.
+    pub entering: bool,
+    /// True only on the single frame where an active session ends (one or
+    /// both fingers lifted).
+    pub exiting: bool,
+    /// If a session just ended (`exiting`) and exactly one finger is still
+    /// touching, this is that pad — it should resume on its own individual
+    /// MT device with a synthetic touch-down. `None` if both fingers lifted
+    /// at the same time (nothing to resume).
+    pub resume_survivor: Option<Pad>,
+}
+
+/// Decides the combined-gesture state transition for `frame`, given whether
+/// a session was already active going into it. Entry requires both pads
+/// touching simultaneously; exit fires as soon as either lifts — both
+/// checks are pad-order-independent by construction (they only look at
+/// `ltouch`/`rtouch` together, never which one changed first), which is
+/// what guarantees "start left, add right" and "start right, add left" (and
+/// likewise for lifting) behave identically.
+pub fn decide_gesture_transition(was_active: bool, frame: PadFrame) -> GestureTransition {
+    let mut now_active = was_active;
+    if frame.ltouch && frame.rtouch {
+        now_active = true;
+    }
+    if now_active && (!frame.ltouch || !frame.rtouch) {
+        let resume_survivor = if frame.ltouch {
+            Some(Pad::Left)
+        } else if frame.rtouch {
+            Some(Pad::Right)
+        } else {
+            None
+        };
+        return GestureTransition { now_active: false, entering: false, exiting: was_active, resume_survivor };
+    }
+    GestureTransition {
+        now_active,
+        entering: !was_active && now_active,
+        exiting: false,
+        resume_survivor: None,
+    }
+}
+
+/// A physical click on either half of the pad while both fingers are down
+/// in an active gesture session reads as one combined click — the same way
+/// combined movement is reported once on the gesture device instead of
+/// twice on two individual ones.
+pub fn combined_click(frame: PadFrame) -> bool {
+    frame.lclick || frame.rclick
 }
 
 /// Given an evdev device path (e.g. `/dev/input/event5`), find the hidraw sibling
@@ -160,10 +243,34 @@ mod tests {
 
     /// Builds a synthetic 64-byte hidraw report with the given RPAD/LPAD
     /// position and touch bits at the empirically-determined offsets
-    /// (see module docs), everything else zeroed.
+    /// (see module docs), everything else zeroed. Clicks default to false —
+    /// use `make_report_full` when a test cares about click bits too.
     fn make_report(lx: i16, ly: i16, ltouch: bool, rx: i16, ry: i16, rtouch: bool) -> [u8; 64] {
+        make_report_full(lx, ly, ltouch, false, rx, ry, rtouch, false)
+    }
+
+    /// Like `make_report`, but also sets the click bits (byte 10, bits 1/2 —
+    /// see `PadFrame::parse` docs for why click lives in the same byte as
+    /// touch).
+    #[allow(clippy::too_many_arguments)]
+    fn make_report_full(
+        lx: i16,
+        ly: i16,
+        ltouch: bool,
+        lclick: bool,
+        rx: i16,
+        ry: i16,
+        rtouch: bool,
+        rclick: bool,
+    ) -> [u8; 64] {
         let mut buf = [0u8; 64];
         let mut byte10 = 0u8;
+        if lclick {
+            byte10 |= 0x02;
+        }
+        if rclick {
+            byte10 |= 0x04;
+        }
         if ltouch {
             byte10 |= 0x08;
         }
@@ -178,6 +285,13 @@ mod tests {
         buf
     }
 
+    /// Shorthand for building a `PadFrame` straight from touch state, for
+    /// the gesture-transition tests below where exact position doesn't
+    /// matter.
+    fn touch_frame(ltouch: bool, rtouch: bool) -> PadFrame {
+        PadFrame::parse(&make_report(0, 0, ltouch, 0, 0, rtouch))
+    }
+
     /// Regression test for the offsets found by correlating a real recorded
     /// trace (2026-07-08): LPAD X/Y at 16/18, RPAD X/Y at 20/22, touch bits
     /// in byte 10 (0x08 = LPAD, 0x10 = RPAD). If a future refactor gets an
@@ -189,8 +303,42 @@ mod tests {
         let frame = PadFrame::parse(&buf);
         assert_eq!(
             frame,
-            PadFrame { lx: 1111, ly: -2222, ltouch: true, rx: 3333, ry: -4444, rtouch: false }
+            PadFrame {
+                lx: 1111,
+                ly: -2222,
+                ltouch: true,
+                lclick: false,
+                rx: 3333,
+                ry: -4444,
+                rtouch: false,
+                rclick: false,
+            }
         );
+    }
+
+    /// Click lives in the same byte as touch (bits 1/2 vs. 3/4) — verify the
+    /// two don't get confused with each other or with the other pad's bits.
+    #[test]
+    fn parse_extracts_click_bits_independently_of_touch_and_other_pad() {
+        // Left touching+clicked, right touching but not clicked.
+        let buf = make_report_full(1, 2, true, true, 3, 4, true, false);
+        let frame = PadFrame::parse(&buf);
+        assert!(frame.ltouch && frame.lclick);
+        assert!(frame.rtouch && !frame.rclick);
+
+        // Right touching+clicked, left touching but not clicked — the mirror
+        // case, to catch a swapped bitmask.
+        let buf = make_report_full(1, 2, true, false, 3, 4, true, true);
+        let frame = PadFrame::parse(&buf);
+        assert!(frame.ltouch && !frame.lclick);
+        assert!(frame.rtouch && frame.rclick);
+
+        // Click without touch must be possible in principle (the parser
+        // shouldn't gate one bit on the other).
+        let buf = make_report_full(0, 0, false, true, 0, 0, false, true);
+        let frame = PadFrame::parse(&buf);
+        assert!(!frame.ltouch && frame.lclick);
+        assert!(!frame.rtouch && frame.rclick);
     }
 
     /// Negative i16 values (finger left/above center) must round-trip
@@ -277,5 +425,96 @@ mod tests {
         assert!(!delta.l_changed);
         assert!(!delta.r_changed);
         assert!(!delta.touch_transition);
+    }
+
+    /// A click-only change (touch and position unchanged) must still count
+    /// as a change — otherwise a tap-click with the finger resting still
+    /// would never reach the emit call in `pad_loop`.
+    #[test]
+    fn click_only_change_is_detected() {
+        let a = PadFrame::parse(&make_report_full(1, 2, true, false, 3, 4, true, false));
+        let b = PadFrame::parse(&make_report_full(1, 2, true, true, 3, 4, true, false));
+        let delta = diff_frames(a, b);
+        assert!(delta.l_changed, "left click-only change was not detected");
+        assert!(!delta.r_changed);
+    }
+
+    // --- Combined-gesture transition symmetry -----------------------------
+    //
+    // These pin down that entering/exiting a combined two-finger gesture
+    // session behaves identically no matter which pad touched down or
+    // lifted first — the asymmetry a manual test session found (right
+    // continues after left lifts, but not vice versa) turned out to be
+    // explained by config (left pad mode = disabled, no individual device to
+    // resume onto), not by the transition logic itself. These tests assume a
+    // symmetric setup (both pads capable of resuming) so a *real* asymmetry
+    // in `decide_gesture_transition` would fail here regardless of config.
+
+    #[test]
+    fn gesture_enters_when_both_touch_regardless_of_which_touched_first() {
+        // Left touched first, right added later.
+        let mut active = false;
+        let t1 = decide_gesture_transition(active, touch_frame(true, false));
+        assert!(!t1.now_active && !t1.entering, "single-pad touch must not start a gesture");
+        active = t1.now_active;
+        let t2 = decide_gesture_transition(active, touch_frame(true, true));
+        assert!(t2.now_active && t2.entering, "adding the second pad must start the gesture");
+
+        // Mirror: right touched first, left added later.
+        let mut active = false;
+        let t1 = decide_gesture_transition(active, touch_frame(false, true));
+        assert!(!t1.now_active && !t1.entering);
+        active = t1.now_active;
+        let t2 = decide_gesture_transition(active, touch_frame(true, true));
+        assert!(t2.now_active && t2.entering);
+    }
+
+    #[test]
+    fn gesture_exit_survivor_is_right_when_left_lifts_first() {
+        // Active session, left finger lifts, right keeps touching.
+        let transition = decide_gesture_transition(true, touch_frame(false, true));
+        assert!(!transition.now_active);
+        assert!(transition.exiting);
+        assert_eq!(transition.resume_survivor, Some(Pad::Right));
+    }
+
+    #[test]
+    fn gesture_exit_survivor_is_left_when_right_lifts_first() {
+        // Mirror of the above: active session, right lifts, left keeps
+        // touching. Must behave identically (just mirrored), or the manual
+        // "one direction has no follow-through" report would be a real bug.
+        let transition = decide_gesture_transition(true, touch_frame(true, false));
+        assert!(!transition.now_active);
+        assert!(transition.exiting);
+        assert_eq!(transition.resume_survivor, Some(Pad::Left));
+    }
+
+    #[test]
+    fn gesture_exit_no_survivor_when_both_lift_simultaneously() {
+        let transition = decide_gesture_transition(true, touch_frame(false, false));
+        assert!(!transition.now_active);
+        assert!(transition.exiting);
+        assert_eq!(transition.resume_survivor, None);
+    }
+
+    #[test]
+    fn gesture_continues_while_both_still_touching() {
+        let transition = decide_gesture_transition(true, touch_frame(true, true));
+        assert!(transition.now_active);
+        assert!(!transition.entering);
+        assert!(!transition.exiting);
+        assert_eq!(transition.resume_survivor, None);
+    }
+
+    #[test]
+    fn combined_click_true_if_either_pad_clicked() {
+        let l_only = PadFrame::parse(&make_report_full(0, 0, true, true, 0, 0, true, false));
+        let r_only = PadFrame::parse(&make_report_full(0, 0, true, false, 0, 0, true, true));
+        let both = PadFrame::parse(&make_report_full(0, 0, true, true, 0, 0, true, true));
+        let neither = PadFrame::parse(&make_report_full(0, 0, true, false, 0, 0, true, false));
+        assert!(combined_click(l_only));
+        assert!(combined_click(r_only));
+        assert!(combined_click(both));
+        assert!(!combined_click(neither));
     }
 }

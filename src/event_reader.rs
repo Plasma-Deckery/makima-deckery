@@ -560,24 +560,15 @@ impl EventReader {
                     {
                         pen_events.push(event)
                     }
-                    // Left trackpad physical click → forward to lpad MT device.
-                    Key::BTN_THUMB if self.settings.lpad.mode == TrackpadMode::MtTrackpad => {
-                        let pressed = event.value() != 0;
-                        *self.lpad.pressed.lock().await = pressed;
-                        let pos =                     *self.lpad.position.lock().await;
-                        let touching =                     *self.lpad.touching_hw.lock().await;
-                        self.lpad.emit(&self.virt_dev, pos.0, pos.1, touching, Some(pressed)).await;
-                        self.write_state().await;
-                    }
-                    // Right trackpad physical click → forward to rpad MT device.
-                    Key::BTN_THUMB2 if self.settings.rpad.mode == TrackpadMode::MtTrackpad => {
-                        let pressed = event.value() != 0;
-                        *self.rpad.pressed.lock().await = pressed;
-                        let pos =                     *self.rpad.position.lock().await;
-                        let touching =                     *self.rpad.touching_hw.lock().await;
-                        self.rpad.emit(&self.virt_dev, pos.0, pos.1, touching, Some(pressed)).await;
-                        self.write_state().await;
-                    }
+                    // Left trackpad physical click (BTN_THUMB) is read directly
+                    // from hidraw by pad_loop instead (see pad_hidraw.rs —
+                    // click lives in the same byte as touch, so it comes in
+                    // atomically with position/touch there). Swallow it here so
+                    // it doesn't fall through to emit_default_event and leak
+                    // onto the generic key device.
+                    Key::BTN_THUMB if self.settings.lpad.mode == TrackpadMode::MtTrackpad => {}
+                    // Right trackpad physical click (BTN_THUMB2) — same as above.
+                    Key::BTN_THUMB2 if self.settings.rpad.mode == TrackpadMode::MtTrackpad => {}
                     _ => {
                         self.convert_event(
                             event,
@@ -1274,25 +1265,27 @@ impl EventReader {
 
             *self.lpad.position.lock().await = (frame.lx, frame.ly);
             *self.lpad.touching_hw.lock().await = frame.ltouch;
+            *self.lpad.pressed.lock().await = frame.lclick;
             *self.rpad.position.lock().await = (frame.rx, frame.ry);
             *self.rpad.touching_hw.lock().await = frame.rtouch;
+            *self.rpad.pressed.lock().await = frame.rclick;
 
             if !l_changed && !r_changed {
                 continue;
             }
 
-            // Combined two-finger gesture routing — logic unchanged from the old
-            // SYN-block implementation, just moved here since it needs both pads'
-            // touch state at once, which this loop now always has atomically.
+            // Combined two-finger gesture routing. The entry/exit decision
+            // itself is a pure function (pad_hidraw::decide_gesture_transition)
+            // so it's unit-tested independently of which pad touched/lifted
+            // first — see that module for the symmetry tests this guards.
             if self.settings.combined_gesture_device {
                 let was_gesture_active = gesture_active;
-                // Enter gesture session when both pads touched simultaneously.
-                if frame.ltouch && frame.rtouch {
-                    gesture_active = true;
-                }
+                let transition = pad_hidraw::decide_gesture_transition(gesture_active, frame);
+                gesture_active = transition.now_active;
+
                 // First frame of gesture session: lift any individual MT devices
                 // that currently have a finger down so libinput sees a clean state.
-                if !was_gesture_active && gesture_active {
+                if transition.entering {
                     if self.settings.lpad.mode == TrackpadMode::MtTrackpad {
                         self.lpad.emit(&self.virt_dev, 0, 0, false, None).await;
                     }
@@ -1300,25 +1293,37 @@ impl EventReader {
                         self.rpad.emit(&self.virt_dev, 0, 0, false, None).await;
                     }
                 }
-                if gesture_active {
-                    // Exit as soon as either finger lifts.
-                    if !frame.ltouch || !frame.rtouch {
-                        gesture_active = false;
-                        // Clean lift on both gesture device slots.
-                        emit_gesture_event(&self.virt_dev, 0, 0, 0, 0, false, false).await;
-                        // Immediately resume the finger that is still active on
-                        // its individual device — synthetic touch-down.
-                        if frame.ltouch {
-                            self.lpad.emit(&self.virt_dev, frame.lx, frame.ly, true, None).await;
+
+                if transition.now_active {
+                    // A click on either half while a session is active reads as
+                    // one combined click on the gesture device.
+                    emit_gesture_event(
+                        &self.virt_dev, frame.lx, frame.ly, frame.rx, frame.ry, frame.ltouch, frame.rtouch,
+                        Some(pad_hidraw::combined_click(frame)),
+                    ).await;
+                } else if transition.exiting {
+                    // Clean lift on both gesture device slots — also releases
+                    // BTN_LEFT so a click held at the moment of exit doesn't
+                    // get stuck on the gesture device.
+                    emit_gesture_event(&self.virt_dev, 0, 0, 0, 0, false, false, Some(false)).await;
+                    // Immediately resume whichever pad is still touching on its
+                    // own individual device — synthetic touch-down.
+                    match transition.resume_survivor {
+                        Some(pad_hidraw::Pad::Left) => {
+                            self.lpad
+                                .emit(&self.virt_dev, frame.lx, frame.ly, true, Some(frame.lclick))
+                                .await;
                         }
-                        if frame.rtouch {
-                            self.rpad.emit(&self.virt_dev, frame.rx, frame.ry, true, None).await;
+                        Some(pad_hidraw::Pad::Right) => {
+                            self.rpad
+                                .emit(&self.virt_dev, frame.rx, frame.ry, true, Some(frame.rclick))
+                                .await;
                         }
-                    } else {
-                        emit_gesture_event(
-                            &self.virt_dev, frame.lx, frame.ly, frame.rx, frame.ry, frame.ltouch, frame.rtouch,
-                        ).await;
+                        None => {}
                     }
+                }
+
+                if transition.now_active || transition.exiting {
                     // Sync to Arc so write_state_inner can read current gesture state.
                     *self.gesture_session.lock().await = gesture_active;
                     // Gesture entry/exit is a digital state change — always write
@@ -1332,10 +1337,14 @@ impl EventReader {
             // Individual MT devices — only when not currently in a gesture session.
             if !gesture_active {
                 if l_changed && self.settings.lpad.mode == TrackpadMode::MtTrackpad {
-                    self.lpad.emit(&self.virt_dev, frame.lx, frame.ly, frame.ltouch, None).await;
+                    self.lpad
+                        .emit(&self.virt_dev, frame.lx, frame.ly, frame.ltouch, Some(frame.lclick))
+                        .await;
                 }
                 if r_changed && self.settings.rpad.mode == TrackpadMode::MtTrackpad {
-                    self.rpad.emit(&self.virt_dev, frame.rx, frame.ry, frame.rtouch, None).await;
+                    self.rpad
+                        .emit(&self.virt_dev, frame.rx, frame.ry, frame.rtouch, Some(frame.rclick))
+                        .await;
                 }
             }
 

@@ -69,6 +69,11 @@ impl PadState {
 /// Emit a combined two-finger gesture event to the gesture pad device.
 /// `l_touching` / `r_touching` must come from hidraw hardware state.
 /// Pass both `false` to force a clean lift on both slots (gesture exit).
+/// `click` is the combined click state (`pad_hidraw::combined_click` — a
+/// physical click on either half of the pad while a gesture session is
+/// active reads as one click on this device) — `None` leaves BTN_LEFT
+/// untouched, e.g. for the initial "both pads just started touching" frame
+/// where a stale click value doesn't matter yet.
 pub async fn emit_gesture_event(
     virt_dev: &Arc<Mutex<VirtualDevices>>,
     lx: i32,
@@ -77,6 +82,7 @@ pub async fn emit_gesture_event(
     ry: i32,
     l_touching: bool,
     r_touching: bool,
+    click: Option<bool>,
 ) {
     let mut vd = virt_dev.lock().await;
     let dev = match vd.gesture_pad.as_mut() {
@@ -117,6 +123,10 @@ pub async fn emit_gesture_event(
     events.push(InputEvent::new_now(EventType::KEY, Key::BTN_TOUCH.code(),          any  as i32));
     events.push(InputEvent::new_now(EventType::KEY, Key::BTN_TOOL_DOUBLETAP.code(), both as i32));
     events.push(InputEvent::new_now(EventType::KEY, Key::BTN_TOOL_FINGER.code(),    (any && !both) as i32));
+
+    if let Some(pressed) = click {
+        events.push(InputEvent::new_now(EventType::KEY, Key::BTN_LEFT.code(), pressed as i32));
+    }
 
     events.push(InputEvent::new_now(EventType::SYNCHRONIZATION, 0, 0));
     dev.emit(&events).ok();
