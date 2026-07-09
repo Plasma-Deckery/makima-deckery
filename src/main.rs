@@ -2,12 +2,17 @@ mod active_client;
 mod analog;
 mod config;
 mod event_reader;
+mod gesture_pad;
 mod kwin_watcher;
 mod lizard_mode;
+mod mt_trackpad;
 mod pad_hidraw;
 mod resolver;
+mod scroll_pad;
 mod state_export;
+mod trackball;
 mod trackpad;
+mod trackpad_router;
 mod udev_monitor;
 mod virtual_devices;
 

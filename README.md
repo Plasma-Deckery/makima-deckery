@@ -51,29 +51,47 @@ GRAB_DEVICE = "false"
 
 ### Trackpad emulation as system touchpads
 
-The Steam Deck trackpads are capable input surfaces, but the raw `ABS_HAT` events they produce are invisible to gesture tools — they expect standard Linux multi-touch devices. By translating the trackpad data into proper MT events and exposing virtual uinput devices, makima makes both pads visible to tools like `libinput-gestures` or `fusuma`. This is the prerequisite for defining custom gestures per pad (swipe zones, tap areas, circular scroll) without having to implement gesture recognition inside makima itself.
+The Steam Deck trackpads are capable input surfaces, but Steam Input's default handling is invisible to gesture tools — they expect standard Linux multi-touch devices. By reading the trackpads' raw hidraw reports and translating them into proper MT events on virtual uinput devices, makima makes both pads (and, optionally, a combined two-finger gesture surface) visible to tools like `libinput-gestures` or `fusuma`. This is the prerequisite for defining custom gestures per pad (swipe zones, tap areas, circular scroll, pinch-zoom) without having to implement gesture recognition inside makima itself.
 
-With `LPAD = "trackpad"` or `RPAD = "trackpad"` in the config, makima translates the raw Steam Deck trackpad axes into proper Linux multi-touch events and exposes them as standard uinput touchpad devices — `Deckery Left Trackpad` and `Deckery Right Trackpad`.
-
-The Steam Deck kernel driver (`hid-steam`) delivers trackpad data as absolute axes on the gamepad device:
+Trackpad handling is split across three layers, each independently testable and swappable:
 
 ```
-ABS_HAT0X / ABS_HAT0Y  →  left trackpad position  (−32767 … +32767)
-ABS_HAT1X / ABS_HAT1Y  →  right trackpad position
-BTN_THUMB              →  left trackpad physical click
-BTN_THUMB2             →  right trackpad physical click
+pad_hidraw.rs        — raw producer: parses 64-byte hidraw reports from the
+                        Steam Deck controller into PadFrame{x, y, touching, click}
+                        per pad. No knowledge of modes or gestures.
+trackpad_router.rs   — Core routing: always mirrors raw position/touch/click into
+                        state.json regardless of mode, and decides which channel
+                        is active — left individual, right individual, or (if
+                        enabled) the combined two-finger gesture channel once both
+                        pads are touching simultaneously.
+mt_trackpad.rs        — handler(s): turn one channel's frame stream into an
+                        emulated MT device, including click-edge detection and
+                        haptic click-tick policy. A future trackball or
+                        multi-zone handler would be a sibling module here,
+                        without touching the two layers above.
 ```
 
-makima translates these to `ABS_MT_POSITION_X/Y` + `BTN_TOUCH` + `BTN_TOOL_FINGER` frames on the virtual device, with Y-axis corrected to libinput convention (hardware reports up as negative; the virtual device flips this). Once the virtual device exists, gesture tools like `libinput-gestures` or `fusuma` can read it and map swipes, taps, and zones to arbitrary actions — independently configurable per pad.
+With `mode = "mt-trackpad"` under `[trackpad.left]`/`[trackpad.right]` in the config, makima exposes each pad as its own standard uinput touchpad device — `Deckery Left Trackpad` / `Deckery Right Trackpad`. Setting `combined_gesture_device = true` additionally exposes a third two-slot MT device, `Deckery Combined Trackpad`, active only while both pads are touching at once (e.g. for pinch-zoom) — individual pads seamlessly resume their own device the instant one finger lifts.
 
 ```toml
-[settings]
-LPAD = "trackpad"   # creates "Deckery Left Trackpad" virtual MT device
-RPAD = "trackpad"   # creates "Deckery Right Trackpad" virtual MT device
-# LPAD = "disabled" # default — no virtual device, but position is still tracked in state.json
+[trackpad.left]
+mode = "mt-trackpad"   # creates "Deckery Left Trackpad" virtual MT device
+
+[trackpad.right]
+mode = "mt-trackpad"   # creates "Deckery Right Trackpad" virtual MT device
+
+[trackpad]
+combined_gesture_device = true   # also creates "Deckery Combined Trackpad" for two-finger gestures
+# mode = "disabled" # default per pad — no virtual device, but position is still tracked in state.json
 ```
 
-Trackpad position, touch state, and press state are always tracked and exported to `state.json` regardless of the mode setting — the HUD can visualize trackpad input even when `"disabled"`.
+The legacy `[settings] LPAD = "trackpad"` / `RPAD = "trackpad"` syntax is still accepted as a fallback for `mode = "mt-trackpad"`.
+
+Position is Y-corrected to libinput convention (hardware reports up as negative; the virtual device flips this) and split into left/right halves of a shared X axis on the combined device so a pinch gesture tracks correctly across both slots. Trackpad position, touch state, and press state are always tracked and exported to `state.json` regardless of the mode setting — the HUD can visualize trackpad input even when `"disabled"`.
+
+Each pad's virtual device also emits a short haptic "click tick" (via the Steam Deck's trackpad actuators) on the rising edge of a click, independent of whichever handler mode is active.
+
+> **Tip:** if you enable `combined_gesture_device` and use quick two-hand gestures (e.g. pinch-zoom), disable "Tap to click" on the individual `Deckery Left/Right Trackpad` devices in your desktop's touchpad settings. Touching down with one pad slightly before the other briefly routes through that pad's individual channel before gesture mode activates; the router's forced clean-lift on gesture entry looks like a fast tap-and-release to libinput, which tap-to-click would otherwise turn into a spurious click.
 
 ---
 

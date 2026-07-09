@@ -62,6 +62,14 @@ impl PadState {
         }
 
         events.push(InputEvent::new_now(EventType::SYNCHRONIZATION, 0, 0));
+        if click.is_some() {
+            eprintln!(
+                "[trackpad-debug] {}pad emit: touch={} click={:?}",
+                if self.is_left { "l" } else { "r" },
+                touching,
+                click
+            );
+        }
         dev.emit(&events).ok();
     }
 }
@@ -129,5 +137,9 @@ pub async fn emit_gesture_event(
     }
 
     events.push(InputEvent::new_now(EventType::SYNCHRONIZATION, 0, 0));
+    eprintln!(
+        "[trackpad-debug] gesture emit: l_touch={} r_touch={} click={:?}",
+        l_touching, r_touching, click
+    );
     dev.emit(&events).ok();
 }

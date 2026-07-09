@@ -59,99 +59,6 @@ impl PadFrame {
     }
 }
 
-/// Result of comparing two consecutive `PadFrame`s: which pad(s) actually
-/// changed, and whether either pad's touch state flipped. Pure and I/O-free
-/// on purpose so it can be unit-tested without an async runtime or a real
-/// virtual device — see the `tests` module below. Used by
-/// `EventReader::pad_loop` to decide whether to emit/write state at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PadDelta {
-    pub l_changed: bool,
-    pub r_changed: bool,
-    pub touch_transition: bool,
-}
-
-pub fn diff_frames(prev: PadFrame, frame: PadFrame) -> PadDelta {
-    PadDelta {
-        l_changed: (frame.lx, frame.ly, frame.ltouch, frame.lclick)
-            != (prev.lx, prev.ly, prev.ltouch, prev.lclick),
-        r_changed: (frame.rx, frame.ry, frame.rtouch, frame.rclick)
-            != (prev.rx, prev.ry, prev.rtouch, prev.rclick),
-        touch_transition: frame.ltouch != prev.ltouch || frame.rtouch != prev.rtouch,
-    }
-}
-
-/// Identifies one physical trackpad, used by `decide_gesture_transition` to
-/// say which pad "survives" when a combined gesture session ends with only
-/// one finger still down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pad {
-    Left,
-    Right,
-}
-
-/// Result of feeding one `PadFrame` into the combined-gesture state machine.
-/// Pure and I/O-free so the entry/exit logic can be unit-tested directly,
-/// independent of which pad physically touched down first or lifted first —
-/// see the `tests` module below for the symmetry checks this exists to
-/// guard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GestureTransition {
-    /// Whether a combined gesture session is active *after* this frame.
-    pub now_active: bool,
-    /// True only on the single frame where the session starts (both pads
-    /// just became simultaneously touched) — callers use this to force a
-    /// clean lift on any individual per-pad MT devices before combined
-    /// events start.
-    pub entering: bool,
-    /// True only on the single frame where an active session ends (one or
-    /// both fingers lifted).
-    pub exiting: bool,
-    /// If a session just ended (`exiting`) and exactly one finger is still
-    /// touching, this is that pad — it should resume on its own individual
-    /// MT device with a synthetic touch-down. `None` if both fingers lifted
-    /// at the same time (nothing to resume).
-    pub resume_survivor: Option<Pad>,
-}
-
-/// Decides the combined-gesture state transition for `frame`, given whether
-/// a session was already active going into it. Entry requires both pads
-/// touching simultaneously; exit fires as soon as either lifts — both
-/// checks are pad-order-independent by construction (they only look at
-/// `ltouch`/`rtouch` together, never which one changed first), which is
-/// what guarantees "start left, add right" and "start right, add left" (and
-/// likewise for lifting) behave identically.
-pub fn decide_gesture_transition(was_active: bool, frame: PadFrame) -> GestureTransition {
-    let mut now_active = was_active;
-    if frame.ltouch && frame.rtouch {
-        now_active = true;
-    }
-    if now_active && (!frame.ltouch || !frame.rtouch) {
-        let resume_survivor = if frame.ltouch {
-            Some(Pad::Left)
-        } else if frame.rtouch {
-            Some(Pad::Right)
-        } else {
-            None
-        };
-        return GestureTransition { now_active: false, entering: false, exiting: was_active, resume_survivor };
-    }
-    GestureTransition {
-        now_active,
-        entering: !was_active && now_active,
-        exiting: false,
-        resume_survivor: None,
-    }
-}
-
-/// A physical click on either half of the pad while both fingers are down
-/// in an active gesture session reads as one combined click — the same way
-/// combined movement is reported once on the gesture device instead of
-/// twice on two individual ones.
-pub fn combined_click(frame: PadFrame) -> bool {
-    frame.lclick || frame.rclick
-}
-
 /// Given an evdev device path (e.g. `/dev/input/event5`), find the hidraw sibling
 /// that belongs to the same physical device via sysfs.
 ///
@@ -211,6 +118,10 @@ pub async fn run_pad_hidraw_reader(path: PathBuf, tx: mpsc::Sender<PadFrame>) {
                 let frame = PadFrame::parse(&buf);
                 if last != Some(frame) {
                     last = Some(frame);
+                    eprintln!(
+                        "[trackpad-debug] hidraw frame: ltouch={} lclick={} rtouch={} rclick={}",
+                        frame.ltouch, frame.lclick, frame.rtouch, frame.rclick
+                    );
                     if tx.send(frame).await.is_err() {
                         // Receiver dropped — nothing left to do.
                         return;
@@ -222,19 +133,178 @@ pub async fn run_pad_hidraw_reader(path: PathBuf, tx: mpsc::Sender<PadFrame>) {
     }
 }
 
+/// Which pad(s) a haptic pulse should play on — mirrors the Steam Deck's own
+/// firmware constants (`STEAM_PAD_LEFT`/`RIGHT`/`BOTH` in the upstream
+/// `hid-steam` kernel driver), not the `Pad` enum above: haptics additionally
+/// need a "both" option that gesture-transition logic has no use for.
+///
+/// `Both` isn't constructed anywhere right now — the gesture-pad handler
+/// (`gesture_pad.rs`) fires no click haptic at all (see its module doc) — but
+/// stays available for when gesture-lifecycle haptics get wired up.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HapticPad {
+    Left,
+    Right,
+    Both,
+}
+
+impl HapticPad {
+    fn wire_value(self) -> u8 {
+        // The kernel source names read as STEAM_PAD_LEFT=0/RIGHT=1/BOTH=2,
+        // and that's what this returned originally — but on-hardware testing
+        // (2026-07-09) showed pressing the *right* pad buzzing the *left*
+        // actuator: with a real device in hand, 0 fires the right pad and 1
+        // fires the left one. Swapped to match observed behaviour rather
+        // than the assumption from reading hid-steam.c; "both" is unaffected.
+        match self {
+            HapticPad::Left => 1,
+            HapticPad::Right => 0,
+            HapticPad::Both => 2,
+        }
+    }
+}
+
+/// One haptic "rumble" pulse to send to the trackpad's linear resonant
+/// actuator, matching the parameters of the Steam Deck firmware's
+/// `ID_TRIGGER_HAPTIC_PULSE` (0x8F) HID feature report — see
+/// `build_haptic_report` for the exact wire layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HapticCommand {
+    pub pad: HapticPad,
+    /// Pulse duration in microseconds.
+    pub duration_us: u16,
+    /// Time between pulses in microseconds (only matters when `count > 1`).
+    pub interval_us: u16,
+    /// Number of pulses to fire.
+    pub count: u16,
+    /// Gain in decibels — roughly -24 (quiet) to +6 (loud) per the firmware.
+    pub gain_db: i8,
+}
+
+/// HID feature report ID for `ID_TRIGGER_HAPTIC_PULSE`, straight from
+/// upstream `hid-steam.c`.
+const ID_TRIGGER_HAPTIC_PULSE: u8 = 0x8F;
+
+/// Serializes a `HapticCommand` into the exact 65-byte HID feature report
+/// buffer the kernel's `hid-steam` driver sends over USB/BT, reproduced here
+/// so we can send it directly via `HIDIOCSFEATURE` from userspace without
+/// going through the kernel driver at all (hidraw bypasses hid-steam's
+/// input-only interface).
+///
+/// Layout (from `steam_send_report`/`steam_haptic_pulse` in hid-steam.c):
+///   buf[0]    = 0x00           report ID (always 0)
+///   buf[1]    = 0x8F           ID_TRIGGER_HAPTIC_PULSE
+///   buf[2]    = 0x08           payload length (8 bytes follow)
+///   buf[3]    = pad            0=left, 1=right, 2=both
+///   buf[4..6] = duration (u16 LE, microseconds)
+///   buf[6..8] = interval (u16 LE, microseconds)
+///   buf[8..10]= count    (u16 LE, pulses)
+///   buf[10]   = gain (i8, dB)
+///   buf[11..65] = 0 padding — `hid_hw_raw_request` is called with
+///                 `max(size, 64) + 1` bytes regardless of payload length.
+/// Pure and I/O-free so the wire format itself is unit-testable without a
+/// real hidraw device.
+pub fn build_haptic_report(cmd: &HapticCommand) -> [u8; 65] {
+    let mut buf = [0u8; 65];
+    buf[1] = ID_TRIGGER_HAPTIC_PULSE;
+    buf[2] = 8;
+    buf[3] = cmd.pad.wire_value();
+    buf[4..6].copy_from_slice(&cmd.duration_us.to_le_bytes());
+    buf[6..8].copy_from_slice(&cmd.interval_us.to_le_bytes());
+    buf[8..10].copy_from_slice(&cmd.count.to_le_bytes());
+    buf[10] = cmd.gain_db as u8;
+    buf
+}
+
+/// Computes the `HIDIOCSFEATURE(len)` ioctl request number. Not exposed by
+/// the `libc` crate (it's HID-specific, defined in `<linux/hid.h>`), so we
+/// reproduce the standard Linux `_IOC(dir, type, nr, size)` macro by hand:
+///   _IOC_WRITE | _IOC_READ = 3, type = 'H', nr = 0x06.
+/// `len` is the full buffer size passed to the ioctl (65 here, including the
+/// leading report-ID byte) — matches `#define HIDIOCSFEATURE(len) \
+/// _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len)` in `<linux/hidraw.h>`.
+const fn hidiocsfeature(len: usize) -> libc::c_ulong {
+    const IOC_NRSHIFT: u32 = 0;
+    const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + 8;
+    const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + 8;
+    const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + 14;
+    const IOC_WRITE: u32 = 1;
+    const IOC_READ: u32 = 2;
+    let dir = IOC_WRITE | IOC_READ;
+    let ty = b'H' as u32;
+    let nr = 0x06u32;
+    let size = len as u32;
+    ((dir << IOC_DIRSHIFT) | (ty << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT) | (size << IOC_SIZESHIFT))
+        as libc::c_ulong
+}
+
+/// Sends one already-serialized haptic feature report to an open hidraw fd
+/// via `HIDIOCSFEATURE`. Blocking (it's a synchronous ioctl syscall) —
+/// callers running in an async context should use `spawn_blocking`.
+fn send_haptic_report(fd: std::os::fd::RawFd, buf: &mut [u8; 65]) -> std::io::Result<()> {
+    let ret = unsafe {
+        libc::ioctl(fd, hidiocsfeature(buf.len()) as _, buf.as_mut_ptr())
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Receives `HapticCommand`s over `rx` and writes each one out to `path` as
+/// a HID feature report. Runs as its own task, entirely separate from the
+/// read loop (`run_pad_hidraw_reader`) — the hidraw character device
+/// supports independent read and write file descriptors, so haptics can be
+/// fired without any coordination with the position/touch read path.
+/// Exits silently once the channel closes or the device can't be opened.
+pub async fn run_pad_haptic_writer(path: PathBuf, mut rx: mpsc::Receiver<HapticCommand>) {
+    use std::os::unix::io::AsRawFd;
+    let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("makima: pad haptic writer: cannot open {:?}: {}", path, e);
+            return;
+        }
+    };
+    let fd = file.as_raw_fd();
+    while let Some(cmd) = rx.recv().await {
+        let mut buf = build_haptic_report(&cmd);
+        // ioctl is a blocking syscall; run it off the async executor thread.
+        let result = tokio::task::spawn_blocking(move || {
+            send_haptic_report(fd, &mut buf)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("makima: haptic pulse failed: {}", e),
+            Err(e) => eprintln!("makima: haptic pulse task panicked: {}", e),
+        }
+    }
+}
+
 /// Spawns the pad hidraw reader task if a hidraw sibling is found for
-/// `evdev_path`. Returns the receiving end of the channel it feeds, or
-/// `None` if no hidraw sibling exists (trackpad position/touch will then
-/// simply never update — `MtTrackpad` mode requires hidraw, there is no
-/// evdev-based fallback).
-pub fn spawn(evdev_path: &std::path::Path) -> Option<mpsc::Receiver<PadFrame>> {
+/// `evdev_path`. Returns the receiving end of the position/touch channel it
+/// feeds and the sending end of a haptic-command channel, or `None` if no
+/// hidraw sibling exists (trackpad position/touch will then simply never
+/// update — `MtTrackpad` mode requires hidraw, there is no evdev-based
+/// fallback).
+pub fn spawn(
+    evdev_path: &std::path::Path,
+) -> Option<(mpsc::Receiver<PadFrame>, mpsc::Sender<HapticCommand>)> {
     let hidraw_path = find_hidraw_for_evdev(evdev_path)?;
     println!("makima: pad hidraw reader attached to {:?}", hidraw_path);
     let (tx, rx) = mpsc::channel(64);
+    let read_path = hidraw_path.clone();
     tokio::spawn(async move {
-        run_pad_hidraw_reader(hidraw_path, tx).await;
+        run_pad_hidraw_reader(read_path, tx).await;
     });
-    Some(rx)
+    let (haptic_tx, haptic_rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        run_pad_haptic_writer(hidraw_path, haptic_rx).await;
+    });
+    Some((rx, haptic_tx))
 }
 
 #[cfg(test)]
@@ -283,13 +353,6 @@ mod tests {
         buf[20..22].copy_from_slice(&rx.to_le_bytes());
         buf[22..24].copy_from_slice(&ry.to_le_bytes());
         buf
-    }
-
-    /// Shorthand for building a `PadFrame` straight from touch state, for
-    /// the gesture-transition tests below where exact position doesn't
-    /// matter.
-    fn touch_frame(ltouch: bool, rtouch: bool) -> PadFrame {
-        PadFrame::parse(&make_report(0, 0, ltouch, 0, 0, rtouch))
     }
 
     /// Regression test for the offsets found by correlating a real recorded
@@ -368,7 +431,6 @@ mod tests {
     /// other axis" step to get wrong.
     #[test]
     fn diagonal_movement_never_produces_a_half_updated_frame() {
-        let mut prev = PadFrame::default();
         for step in 1..=20i16 {
             let x = step * 100;
             let y = -step * 50;
@@ -378,9 +440,6 @@ mod tests {
             // X with a previous step's Y (the old staircase failure mode).
             assert_eq!(frame.rx, x as i32, "x did not update for step {step}");
             assert_eq!(frame.ry, y as i32, "y did not update for step {step}");
-            let delta = diff_frames(prev, frame);
-            assert!(delta.r_changed, "step {step} not detected as changed");
-            prev = frame;
         }
     }
 
@@ -400,121 +459,61 @@ mod tests {
         let lifted = PadFrame::parse(&make_report(0, 0, false, 1000, 2000, false));
         let touching_at_b = PadFrame::parse(&make_report(0, 0, false, 5000, 6000, true));
 
-        let lift_delta = diff_frames(touching_at_a, lifted);
-        assert!(lift_delta.touch_transition, "lift was not detected as a touch transition");
+        assert!(touching_at_a.rtouch);
         assert!(!lifted.rtouch, "lifted frame must report not-touching");
-
-        let retouch_delta = diff_frames(lifted, touching_at_b);
-        assert!(retouch_delta.touch_transition, "retouch was not detected as a touch transition");
         assert!(touching_at_b.rtouch);
         assert_eq!((touching_at_b.rx, touching_at_b.ry), (5000, 6000));
         // Crucially: the lift frame and the new touch-down frame are two
         // separate, ordered frames — there is no way to observe the new
         // position (5000, 6000) while `rtouch` still reads the old lift
-        // state, because both always come from one read() together.
+        // state, because both always come from one read() together. Whether
+        // this pair of frames constitutes a "change" worth routing is a
+        // `trackpad_router::diff_frames` concern, tested there.
     }
 
-    /// A frame identical to the previous one must be reported as unchanged —
-    /// otherwise pad_loop would emit and write state.json continuously even
-    /// while the finger rests still.
-    #[test]
-    fn identical_frame_is_not_a_change() {
-        let a = PadFrame::parse(&make_report(1, 2, true, 3, 4, true));
-        let b = PadFrame::parse(&make_report(1, 2, true, 3, 4, true));
-        let delta = diff_frames(a, b);
-        assert!(!delta.l_changed);
-        assert!(!delta.r_changed);
-        assert!(!delta.touch_transition);
-    }
-
-    /// A click-only change (touch and position unchanged) must still count
-    /// as a change — otherwise a tap-click with the finger resting still
-    /// would never reach the emit call in `pad_loop`.
-    #[test]
-    fn click_only_change_is_detected() {
-        let a = PadFrame::parse(&make_report_full(1, 2, true, false, 3, 4, true, false));
-        let b = PadFrame::parse(&make_report_full(1, 2, true, true, 3, 4, true, false));
-        let delta = diff_frames(a, b);
-        assert!(delta.l_changed, "left click-only change was not detected");
-        assert!(!delta.r_changed);
-    }
-
-    // --- Combined-gesture transition symmetry -----------------------------
-    //
-    // These pin down that entering/exiting a combined two-finger gesture
-    // session behaves identically no matter which pad touched down or
-    // lifted first — the asymmetry a manual test session found (right
-    // continues after left lifts, but not vice versa) turned out to be
-    // explained by config (left pad mode = disabled, no individual device to
-    // resume onto), not by the transition logic itself. These tests assume a
-    // symmetric setup (both pads capable of resuming) so a *real* asymmetry
-    // in `decide_gesture_transition` would fail here regardless of config.
+    // --- Haptic feedback wire format ---------------------------------------
 
     #[test]
-    fn gesture_enters_when_both_touch_regardless_of_which_touched_first() {
-        // Left touched first, right added later.
-        let mut active = false;
-        let t1 = decide_gesture_transition(active, touch_frame(true, false));
-        assert!(!t1.now_active && !t1.entering, "single-pad touch must not start a gesture");
-        active = t1.now_active;
-        let t2 = decide_gesture_transition(active, touch_frame(true, true));
-        assert!(t2.now_active && t2.entering, "adding the second pad must start the gesture");
-
-        // Mirror: right touched first, left added later.
-        let mut active = false;
-        let t1 = decide_gesture_transition(active, touch_frame(false, true));
-        assert!(!t1.now_active && !t1.entering);
-        active = t1.now_active;
-        let t2 = decide_gesture_transition(active, touch_frame(true, true));
-        assert!(t2.now_active && t2.entering);
+    fn build_haptic_report_matches_hid_steam_layout() {
+        let cmd = HapticCommand {
+            pad: HapticPad::Right,
+            duration_us: 0x1234,
+            interval_us: 0x5678,
+            count: 3,
+            gain_db: -6,
+        };
+        let buf = build_haptic_report(&cmd);
+        assert_eq!(buf[0], 0x00, "report ID must always be 0");
+        assert_eq!(buf[1], 0x8F, "command must be ID_TRIGGER_HAPTIC_PULSE");
+        assert_eq!(buf[2], 8, "payload length must be 8");
+        assert_eq!(buf[3], 0, "HapticPad::Right must be wire value 0 (swapped from hid-steam.c naming — see wire_value)");
+        assert_eq!(&buf[4..6], &0x1234u16.to_le_bytes());
+        assert_eq!(&buf[6..8], &0x5678u16.to_le_bytes());
+        assert_eq!(&buf[8..10], &3u16.to_le_bytes());
+        assert_eq!(buf[10] as i8, -6);
+        assert!(buf[11..].iter().all(|&b| b == 0), "padding must be zeroed");
+        assert_eq!(buf.len(), 65);
     }
 
     #[test]
-    fn gesture_exit_survivor_is_right_when_left_lifts_first() {
-        // Active session, left finger lifts, right keeps touching.
-        let transition = decide_gesture_transition(true, touch_frame(false, true));
-        assert!(!transition.now_active);
-        assert!(transition.exiting);
-        assert_eq!(transition.resume_survivor, Some(Pad::Right));
+    fn build_haptic_report_pad_wire_values_match_steam_firmware_constants() {
+        // Wire values are swapped relative to the hid-steam.c constant names
+        // (STEAM_PAD_LEFT/RIGHT = 0/1) based on on-hardware testing — see the
+        // comment on `HapticPad::wire_value`. "Both" is unaffected.
+        let base = HapticCommand { pad: HapticPad::Left, duration_us: 0, interval_us: 0, count: 0, gain_db: 0 };
+        assert_eq!(build_haptic_report(&base)[3], 1);
+        assert_eq!(build_haptic_report(&HapticCommand { pad: HapticPad::Right, ..base })[3], 0);
+        assert_eq!(build_haptic_report(&HapticCommand { pad: HapticPad::Both, ..base })[3], 2);
     }
 
+    /// The ioctl request number is a fixed, well-known constant on Linux
+    /// (verified against `<linux/hidraw.h>`'s `HIDIOCSFEATURE(len)` macro
+    /// expansion for len=65: dir=3, type='H'=0x48, nr=0x06, size=65) — pin it
+    /// down so a refactor of the bit-shifting can't silently break it.
     #[test]
-    fn gesture_exit_survivor_is_left_when_right_lifts_first() {
-        // Mirror of the above: active session, right lifts, left keeps
-        // touching. Must behave identically (just mirrored), or the manual
-        // "one direction has no follow-through" report would be a real bug.
-        let transition = decide_gesture_transition(true, touch_frame(true, false));
-        assert!(!transition.now_active);
-        assert!(transition.exiting);
-        assert_eq!(transition.resume_survivor, Some(Pad::Left));
-    }
-
-    #[test]
-    fn gesture_exit_no_survivor_when_both_lift_simultaneously() {
-        let transition = decide_gesture_transition(true, touch_frame(false, false));
-        assert!(!transition.now_active);
-        assert!(transition.exiting);
-        assert_eq!(transition.resume_survivor, None);
-    }
-
-    #[test]
-    fn gesture_continues_while_both_still_touching() {
-        let transition = decide_gesture_transition(true, touch_frame(true, true));
-        assert!(transition.now_active);
-        assert!(!transition.entering);
-        assert!(!transition.exiting);
-        assert_eq!(transition.resume_survivor, None);
-    }
-
-    #[test]
-    fn combined_click_true_if_either_pad_clicked() {
-        let l_only = PadFrame::parse(&make_report_full(0, 0, true, true, 0, 0, true, false));
-        let r_only = PadFrame::parse(&make_report_full(0, 0, true, false, 0, 0, true, true));
-        let both = PadFrame::parse(&make_report_full(0, 0, true, true, 0, 0, true, true));
-        let neither = PadFrame::parse(&make_report_full(0, 0, true, false, 0, 0, true, false));
-        assert!(combined_click(l_only));
-        assert!(combined_click(r_only));
-        assert!(combined_click(both));
-        assert!(!combined_click(neither));
+    fn hidiocsfeature_65_matches_known_constant() {
+        // dir(3) << 30 | type(0x48) << 8 | nr(0x06) | size(65) << 16
+        let expected: u32 = (3u32 << 30) | (0x48u32 << 8) | 0x06u32 | (65u32 << 16);
+        assert_eq!(hidiocsfeature(65) as u32, expected);
     }
 }
