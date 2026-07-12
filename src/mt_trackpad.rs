@@ -43,22 +43,34 @@ pub struct HapticPulse {
     pub gain_db: i8,
 }
 
-fn default_duration_us() -> u16 { 2000 }
-fn default_count() -> u16 { 1 }
+fn default_duration_us() -> u16 { 8000 }
+fn default_interval_us() -> u16 { 8000 }
+fn default_count() -> u16 { 3 }
 
 impl Default for HapticPulse {
     fn default() -> Self {
-        // A short, quiet "tick" — conservative default, not user-tuned yet.
-        Self { duration_us: default_duration_us(), interval_us: 0, count: default_count(), gain_db: 0 }
+        // A three-pulse burst (8ms on / 8ms off) — tuned on real Steam Deck
+        // hardware (2026-07-10) against the Lizard Mode click buzz as a
+        // reference feel. `gain_db` is deliberately left at 0 (not raised
+        // to compensate): on-hardware A/B testing (0 / +6 / i8::MAX) showed
+        // gain_db has no perceptible effect on this hardware at all — see
+        // issue #20 — so it isn't a real lever, unlike duration_us/
+        // interval_us/count, which are.
+        Self { duration_us: default_duration_us(), interval_us: default_interval_us(), count: default_count(), gain_db: 0 }
     }
 }
 
 /// Haptic policy for this handler: which events fire a pulse, and with what
-/// parameters. `on_movement` is parsed but not yet wired up to anything —
-/// placeholder for the mode-specific haptic policy work tracked in issue #18.
+/// parameters. A physical click is really two distinct edges — press and
+/// release — and they deserve independent pulses (e.g. a firmer tick on
+/// press, nothing or a softer tick on release) rather than being collapsed
+/// into a single "on_click" that only ever fires once. `on_movement` is
+/// parsed but not yet wired up to anything — placeholder for the
+/// mode-specific haptic policy work tracked in issue #18.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct HapticConfig {
-    pub on_click: Option<HapticPulse>,
+    pub on_press: Option<HapticPulse>,
+    pub on_release: Option<HapticPulse>,
     pub on_movement: Option<HapticPulse>,
 }
 
@@ -83,10 +95,27 @@ impl MtTrackpadConfig {
         })
     }
 
-    /// The haptic pulse to fire on a click edge — user-configured `on_click`,
-    /// or the conservative built-in default.
-    pub fn click_pulse(&self) -> HapticPulse {
-        self.haptic.on_click.unwrap_or_default()
+    /// The haptic pulse to fire on the press edge (finger comes down on an
+    /// already-touching pad) — user-configured `on_press`, or the
+    /// conservative built-in default. Defaults to firing (rather than
+    /// silence) to preserve the pre-press/release-split behavior of the old
+    /// single `on_click` pulse, which always fired on this same edge.
+    pub fn press_pulse(&self) -> HapticPulse {
+        self.haptic.on_press.unwrap_or_default()
+    }
+
+    /// The haptic pulse to fire on the release edge (finger lifts off the
+    /// click mechanism while still touching) — user-configured `on_release`,
+    /// or the same built-in default as `press_pulse`. Originally left silent
+    /// unless explicitly configured (release haptics were new opt-in
+    /// behavior with no established feel to fall back to), but on-hardware
+    /// A/B testing (2026-07-10) confirmed the tuned default burst feels
+    /// right on both edges, so it's now a real default like press rather
+    /// than opt-in-only. Still returns `Option` (not a bare `HapticPulse`)
+    /// so a future need to silence release-only without touching press
+    /// remains possible via explicit config.
+    pub fn release_pulse(&self) -> Option<HapticPulse> {
+        Some(self.haptic.on_release.unwrap_or_default())
     }
 }
 
@@ -100,8 +129,9 @@ impl MtTrackpadConfig {
 /// is shared infrastructure, only the "when/with what parameters" policy is
 /// per-handler.
 pub(crate) async fn pulse(haptic_tx: &Option<mpsc::Sender<HapticCommand>>, pad: HapticPad, pulse: HapticPulse) {
+    eprintln!("[haptic-debug] pulse() called: pad={:?} pulse={:?} tx_present={}", pad, pulse, haptic_tx.is_some());
     if let Some(tx) = haptic_tx {
-        let _ = tx
+        let send_result = tx
             .send(HapticCommand {
                 pad,
                 duration_us: pulse.duration_us,
@@ -110,28 +140,38 @@ pub(crate) async fn pulse(haptic_tx: &Option<mpsc::Sender<HapticCommand>>, pad: 
                 gain_db: pulse.gain_db,
             })
             .await;
+        eprintln!("[haptic-debug] pulse() send result: {:?}", send_result.is_ok());
     }
 }
 
 /// Runs one individual (non-gesture) MT trackpad handler until `rx` closes.
 /// Consumes `SinglePadFrame`s already routed to this pad by
 /// `trackpad_router::run` and emits them to `pad`'s virtual MT device,
-/// firing a haptic click-tick on the rising edge of `click`.
+/// firing a haptic tick on the press edge (rising) and, if configured,
+/// another on the release edge (falling) of `click` — press and release are
+/// deliberately two independent pulses rather than one "on_click", since a
+/// real click mechanism has two distinct, separately-feelable edges.
 pub async fn run_single(
     mut rx: mpsc::Receiver<SinglePadFrame>,
     virt_dev: &Arc<Mutex<VirtualDevices>>,
     pad: &PadState,
     haptic_tx: Option<mpsc::Sender<HapticCommand>>,
     haptic_pad: HapticPad,
-    click_pulse: HapticPulse,
+    press_pulse: HapticPulse,
+    release_pulse: Option<HapticPulse>,
 ) {
     let mut prev_click = false;
     while let Some(frame) = rx.recv().await {
-        let click_edge = frame.click && !prev_click;
+        let press_edge = frame.click && !prev_click;
+        let release_edge = !frame.click && prev_click;
         prev_click = frame.click;
         pad.emit(virt_dev, frame.x, frame.y, frame.touching, Some(frame.click)).await;
-        if click_edge {
-            pulse(&haptic_tx, haptic_pad, click_pulse).await;
+        if press_edge {
+            pulse(&haptic_tx, haptic_pad, press_pulse).await;
+        } else if release_edge {
+            if let Some(release_pulse) = release_pulse {
+                pulse(&haptic_tx, haptic_pad, release_pulse).await;
+            }
         }
     }
 }
