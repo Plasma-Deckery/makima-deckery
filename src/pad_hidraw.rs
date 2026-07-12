@@ -118,10 +118,6 @@ pub async fn run_pad_hidraw_reader(path: PathBuf, tx: mpsc::Sender<PadFrame>) {
                 let frame = PadFrame::parse(&buf);
                 if last != Some(frame) {
                     last = Some(frame);
-                    eprintln!(
-                        "[trackpad-debug] hidraw frame: ltouch={} lclick={} rtouch={} rclick={}",
-                        frame.ltouch, frame.lclick, frame.rtouch, frame.rclick
-                    );
                     if tx.send(frame).await.is_err() {
                         // Receiver dropped — nothing left to do.
                         return;
@@ -269,15 +265,18 @@ pub async fn run_pad_haptic_writer(path: PathBuf, mut rx: mpsc::Receiver<HapticC
         }
     };
     let fd = file.as_raw_fd();
+    eprintln!("[haptic-debug] writer opened {:?} fd={}", path, fd);
     while let Some(cmd) = rx.recv().await {
+        eprintln!("[haptic-debug] writer received cmd: {:?}", cmd);
         let mut buf = build_haptic_report(&cmd);
+        eprintln!("[haptic-debug] report bytes[0..12]: {:?}", &buf[0..12]);
         // ioctl is a blocking syscall; run it off the async executor thread.
         let result = tokio::task::spawn_blocking(move || {
             send_haptic_report(fd, &mut buf)
         })
         .await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => eprintln!("[haptic-debug] ioctl succeeded"),
             Ok(Err(e)) => eprintln!("makima: haptic pulse failed: {}", e),
             Err(e) => eprintln!("makima: haptic pulse task panicked: {}", e),
         }
@@ -294,7 +293,11 @@ pub fn spawn(
     evdev_path: &std::path::Path,
 ) -> Option<(mpsc::Receiver<PadFrame>, mpsc::Sender<HapticCommand>)> {
     let hidraw_path = find_hidraw_for_evdev(evdev_path)?;
-    println!("makima: pad hidraw reader attached to {:?}", hidraw_path);
+    println!(
+        "makima: pad hidraw reader attached to {:?}. +{}ms since startup",
+        hidraw_path,
+        crate::startup_ms()
+    );
     let (tx, rx) = mpsc::channel(64);
     let read_path = hidraw_path.clone();
     tokio::spawn(async move {

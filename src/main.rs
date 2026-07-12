@@ -21,8 +21,21 @@ mod virtual_devices;
 use crate::udev_monitor::*;
 use config::Config;
 use std::env;
+use std::sync::OnceLock;
+use std::time::Instant;
 use tokio;
 use tokio::task::JoinHandle;
+
+/// Process start time, set once at the top of `main()`. Used to log
+/// "+Nms since startup" markers at key init milestones — cheap way to
+/// profile how long makima takes to become fully active, e.g. across
+/// the suspend/resume restart done by `makima-resume-watcher`.
+static START: OnceLock<Instant> = OnceLock::new();
+
+/// Milliseconds elapsed since process start, for startup-profiling log lines.
+pub fn startup_ms() -> u128 {
+    START.get().map(|s| s.elapsed().as_millis()).unwrap_or(0)
+}
 
 pub fn load_config_files(config_dir: &str) -> Vec<Config> {
     let dir = match std::fs::read_dir(config_dir) {
@@ -44,6 +57,7 @@ pub fn load_config_files(config_dir: &str) -> Vec<Config> {
 
 #[tokio::main]
 async fn main() {
+    START.set(Instant::now()).ok();
     // Any panic anywhere in the process must kill the whole process immediately.
     // Without this, Tokio tasks are independent: a panic in the event reader
     // would leave the Lizard Mode heartbeat running, keeping the Steam Deck
@@ -84,6 +98,7 @@ async fn main() {
         }
     };
     let config_files = load_config_files(&config_dir);
+    println!("makima: config loaded, +{}ms since startup", startup_ms());
     let tasks: Vec<JoinHandle<()>> = Vec::new();
     start_monitoring_udev(config_files, config_dir, tasks).await;
 }

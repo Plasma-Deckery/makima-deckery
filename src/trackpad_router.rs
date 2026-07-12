@@ -255,7 +255,6 @@ pub async fn run(
             let transition = decide_gesture_transition(gesture_active, frame);
             gesture_active = transition.now_active;
 
-
             // First frame of gesture session: lift any individual channel
             // that currently has a finger down so its handler sees a clean
             // state before combined events start.

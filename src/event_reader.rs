@@ -425,8 +425,7 @@ impl EventReader {
 
     pub async fn start(&self) {
         let name = &self.config.iter().find(|&x| x.associations == Associations::default()).unwrap().name;
-        println!("{:?} detected, reading events.\n", name);
-
+        println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
         let session = TrackpadSession::setup(&self.trackpad, &self.virt_dev, &self.device_path).await;
         self.write_state().await;

@@ -8,7 +8,10 @@ exec dbus-monitor --system \
   "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'" \
   2>/dev/null | while read -r line; do
     if echo "$line" | grep -q "boolean false"; then
+        echo "makima-resume-watcher: resume detected at $(date -Is), waiting 2s before restart"
         sleep 2
+        echo "makima-resume-watcher: restarting makima.service at $(date -Is)"
         systemctl --user restart makima.service
+        echo "makima-resume-watcher: restart command returned at $(date -Is)"
     fi
 done

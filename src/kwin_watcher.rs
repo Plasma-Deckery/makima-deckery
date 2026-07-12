@@ -123,7 +123,10 @@ pub async fn start_kwin_watcher(
 
         match scripting.load_script(SCRIPT_PATH, PLUGIN_NAME).await {
             Ok(id) => {
-                println!("makima: kwin_watcher: script loaded (id {id}), window-activation events enabled.");
+                println!(
+                    "makima: kwin_watcher: script loaded (id {id}), window-activation events enabled. +{}ms since startup",
+                    crate::startup_ms()
+                );
                 let _ = scripting.start().await;
                 break;
             }

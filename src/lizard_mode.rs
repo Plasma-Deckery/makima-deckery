@@ -244,8 +244,8 @@ pub async fn run_lizard_mode_suppression(cfg: LizardModeSuppression) {
     };
 
     println!(
-        "Lizard Mode suppression active on {:?} (buttons={}, mouse={}).",
-        path, cfg.suppress_buttons, cfg.suppress_mouse
+        "Lizard Mode suppression active on {:?} (buttons={}, mouse={}). +{}ms since startup",
+        path, cfg.suppress_buttons, cfg.suppress_mouse, crate::startup_ms()
     );
 
     let fd = file.as_raw_fd();
