@@ -47,6 +47,14 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
         }
     }
 
+    // EXPERIMENTAL: in-process suspend/resume watcher (see resume_watcher.rs).
+    // Replaces the external makima-resume-watcher script + `systemctl restart`
+    // with a direct D-Bus subscription that triggers the existing in-process
+    // reinit path on resume, instead of a full process restart.
+    tokio::spawn(crate::resume_watcher::start_resume_watcher(
+        device_error_notify.clone(),
+    ));
+
     // Suppress Steam Deck Lizard Mode — persists across device reinitializations.
     // Reads SUPPRESS_LIZARD_MODE from any base config (default associations).
     // Gracefully skips if the setting is absent or on non-Steam-Deck hardware.

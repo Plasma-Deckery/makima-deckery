@@ -10,6 +10,7 @@ mod lizard_mode;
 mod mt_trackpad;
 mod pad_hidraw;
 mod resolver;
+mod resume_watcher;
 mod scroll_pad;
 mod state_export;
 mod trackball;
