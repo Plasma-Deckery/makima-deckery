@@ -239,6 +239,17 @@ pub fn launch_tasks(
             false
         }
     };
+    // How many currently-enumerated devices have a name matching some config
+    // — computed up front so the reuse decision below can see the total
+    // before committing to it per-device (see `should_reuse_virt_dev`).
+    let matched_device_count = evdev::enumerate()
+        .filter(|device| {
+            config_files.iter().any(|config| {
+                let split_config_name = config.name.split("::").collect::<Vec<&str>>();
+                split_config_name[0] == device.1.name().unwrap_or_default().replace("/", "")
+            })
+        })
+        .count();
     let devices: evdev::EnumerateDevices = evdev::enumerate();
     let mut devices_found = 0;
     for device in devices {
@@ -304,9 +315,14 @@ pub fn launch_tasks(
             // recreated uinput device (see issue #39), so a resume or
             // transient-read-error reinit should keep the existing virtual
             // devices alive rather than tearing them down and back up.
-            let virt_dev = match &reuse_virt_dev {
-                Some(existing) => existing.clone(),
-                None => Arc::new(Mutex::new(VirtualDevices::new(device.1))),
+            // Only safe when exactly one physical device matched this round:
+            // handing every device the same reused instance would silently
+            // give a second/third device virtual output built from a
+            // different device's capabilities.
+            let virt_dev = if should_reuse_virt_dev(matched_device_count, reuse_virt_dev.is_some()) {
+                reuse_virt_dev.as_ref().unwrap().clone()
+            } else {
+                Arc::new(Mutex::new(VirtualDevices::new(device.1)))
             };
             virt_dev_holder = Some(virt_dev.clone());
             let reader = EventReader::new(
@@ -330,7 +346,30 @@ pub fn launch_tasks(
     } else if devices_found == 0 && user_has_access {
         println!("No matching devices found.\nNote: double-check that your device and its associated config file have the same name, as reported by 'evtest'.\n");
     }
+    if devices_found == 0 && reuse_virt_dev.is_some() {
+        // The caller's persisted VirtualDevices (and its live uinput devices)
+        // has no task left holding a clone of it after this call, so it gets
+        // dropped here — the next reinit that does find a device will pay
+        // the full libinput-rediscovery cost again. Likely a transient
+        // enumeration race (e.g. right after resume, before the device is
+        // back), not a bug, but worth surfacing since it silently forfeits
+        // the persistence this reuse mechanism exists for.
+        println!("Warning: no matching devices found this round, persisted virtual devices could not be carried over and will be rebuilt on next reinit.\n");
+    }
     (virt_dev_holder, modifiers)
+}
+
+/// Whether it's safe to reuse a previously-built `VirtualDevices` for this
+/// reinit round instead of constructing a fresh one. Reuse was requested by
+/// the caller (a resume/read-error reinit, not a USB replug or config
+/// reload) — but only actually safe when exactly one physical device
+/// matched this round's configs. Handing every device the same reused
+/// instance when more than one device matches would give a second/third
+/// device virtual output devices built from a *different* device's
+/// capabilities. Doesn't affect Steam Deck (always exactly one matched
+/// device) but matters for generic multi-controller configs.
+fn should_reuse_virt_dev(matched_device_count: usize, reuse_requested: bool) -> bool {
+    reuse_requested && matched_device_count == 1
 }
 
 pub async fn start_reader(reader: EventReader) {
@@ -501,5 +540,15 @@ mod tests {
             // If a device was found, modifiers must be a connected Arc.
             let _ = modifiers;
         }
+    }
+
+    #[test]
+    fn should_reuse_virt_dev_only_when_requested_and_single_device() {
+        assert!(!should_reuse_virt_dev(0, true), "no matched device: nothing to reuse for");
+        assert!(should_reuse_virt_dev(1, true), "exactly one matched device: safe to reuse");
+        assert!(!should_reuse_virt_dev(2, true), "multiple matched devices: reuse would mix up per-device capabilities");
+        assert!(!should_reuse_virt_dev(1, false), "reuse not requested (USB replug / config reload): always rebuild");
+        assert!(!should_reuse_virt_dev(0, false));
+        assert!(!should_reuse_virt_dev(2, false));
     }
 }
