@@ -192,17 +192,24 @@ impl VirtualDevices {
 
     /// Call after construction to enable the virtual MT trackpad devices.
     /// `lpad` / `rpad`: which of the two pads to activate (controlled by config).
+    /// Idempotent — a pad already enabled (e.g. this `VirtualDevices` is being
+    /// reused across a resume reinit rather than rebuilt) is left untouched, so
+    /// the underlying uinput device and its `/dev/input/eventN` node survive
+    /// unchanged instead of being torn down and recreated (which is what makes
+    /// libinput take seconds to rediscover it after every resume).
     pub fn enable_trackpads(&mut self, lpad: bool, rpad: bool) {
-        if lpad {
+        if lpad && self.lpad.is_none() {
             self.lpad = Some(build_trackpad_device("Deckery Left Trackpad"));
         }
-        if rpad {
+        if rpad && self.rpad.is_none() {
             self.rpad = Some(build_trackpad_device("Deckery Right Trackpad"));
         }
     }
 
-    /// Enable the combined two-finger gesture device.
+    /// Enable the combined two-finger gesture device. Idempotent, see `enable_trackpads`.
     pub fn enable_gesture_pad(&mut self) {
-        self.gesture_pad = Some(build_gesture_pad_device());
+        if self.gesture_pad.is_none() {
+            self.gesture_pad = Some(build_gesture_pad_device());
+        }
     }
 }

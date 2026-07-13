@@ -182,16 +182,36 @@ pub async fn run_single(
     movement_pulse: Option<MovementHaptic>,
 ) {
     let mut prev_click = false;
+    let mut first_frame = true;
+    let mut first_movement = true;
+    let mut first_movement_prev_pos: Option<(i32, i32)> = None;
     let mut prev_pos: Option<(i32, i32)> = None;
     let mut move_accum: f64 = 0.0;
-
     while let Some(frame) = rx.recv().await {
         let press_edge = frame.click && !prev_click;
         let release_edge = !frame.click && prev_click;
         prev_click = frame.click;
 
         pad.emit(virt_dev, frame.x, frame.y, frame.touching, Some(frame.click)).await;
-
+        if first_frame {
+            first_frame = false;
+            println!(
+                "makima: first trackpad event written to virtual device. +{}ms since startup",
+                crate::startup_ms()
+            );
+        }
+        if first_movement && frame.touching {
+            if let Some(prev) = first_movement_prev_pos {
+                if prev != (frame.x, frame.y) {
+                    first_movement = false;
+                    println!(
+                        "makima: first trackpad movement (position change) written to virtual device. +{}ms since startup",
+                        crate::startup_ms()
+                    );
+                }
+            }
+            first_movement_prev_pos = Some((frame.x, frame.y));
+        }
         if press_edge {
             pulse(&haptic_tx, haptic_pad, press_pulse).await;
         } else if release_edge {

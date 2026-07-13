@@ -70,7 +70,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
         }
     }
 
-    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None);
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -138,7 +138,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                             task.abort();
                         }
                         tasks.clear();
-                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None);
                     }
                 }
             }
@@ -150,7 +150,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), prev_virt_dev.clone());
             }
             Some(_) = config_rx.recv() => {
                 // Debounce: drain any queued events, then wait briefly for the
@@ -164,7 +164,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                     task.abort();
                 }
                 tasks.clear();
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None);
             }
         }
     }
@@ -205,6 +205,7 @@ pub fn launch_tasks(
     device_error_notify: Arc<Notify>,
     active_client: Arc<Mutex<Client>>,
     window_changed: Arc<Notify>,
+    reuse_virt_dev: Option<Arc<Mutex<VirtualDevices>>>,
 ) -> (Option<Arc<Mutex<VirtualDevices>>>, Arc<Mutex<Vec<Event>>>) {
     let modifiers: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Default::default()));
     let modifier_was_activated: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -297,7 +298,16 @@ pub fn launch_tasks(
                 Path::new(&event_device),
                 config_list.clone(),
             )));
-            let virt_dev = Arc::new(Mutex::new(VirtualDevices::new(device.1)));
+            // Reuse the previous VirtualDevices (same uinput devices, same
+            // /dev/input/eventN nodes) instead of rebuilding from scratch when
+            // asked to — libinput takes seconds to rediscover a freshly
+            // recreated uinput device (see issue #39), so a resume or
+            // transient-read-error reinit should keep the existing virtual
+            // devices alive rather than tearing them down and back up.
+            let virt_dev = match &reuse_virt_dev {
+                Some(existing) => existing.clone(),
+                None => Arc::new(Mutex::new(VirtualDevices::new(device.1))),
+            };
             virt_dev_holder = Some(virt_dev.clone());
             let reader = EventReader::new(
                 config_list.clone(),
@@ -484,6 +494,7 @@ mod tests {
             error_notify,
             client,
             window_changed,
+            None,
         );
 
         if let Some(_) = virt_dev_opt {
