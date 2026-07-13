@@ -4,10 +4,14 @@
 //
 // Replaces the external `makima-resume-watcher` bash script + `systemctl
 // --user restart makima.service` with an in-process D-Bus subscription to
-// logind's `PrepareForSleep` signal. On resume we reuse the *existing*
-// `device_error_notify` reinit path in `udev_monitor.rs` (previously only
-// triggered by a read error on the evdev fd — which never happens on this
-// hardware after suspend, the fd just freezes silently instead of erroring).
+// logind's `PrepareForSleep` signal. On resume we trigger a dedicated
+// `resume_notify` reinit path in `udev_monitor.rs`, separate from the
+// `device_error_notify` path used for a real read error on the evdev fd —
+// resume is (near-certainly) the same physical device coming back, so that
+// path reuses the existing `VirtualDevices` instead of rebuilding it from
+// scratch (see issue #39: rebuilding costs several seconds of libinput
+// rediscovery). A genuine read error carries no such guarantee, so it still
+// does a full recreate.
 //
 // Why this should be faster than the external script:
 //   - No `sleep 2` blind guess before acting.
@@ -21,12 +25,11 @@
 //     `launch_tasks` call site in udev_monitor.rs — future optimization: skip
 //     that when we know config hasn't changed).
 //
-// What's NOT solved yet by this alone: `launch_tasks` still rebuilds
-// `VirtualDevices` from scratch on every reinit (new uinput devices), so the
-// compositor/libinput still has to rediscover them via udev after every
-// resume. If that turns out to be the remaining bottleneck, the next step is
-// decoupling `VirtualDevices` lifetime from the reinit cycle so only the
-// physical-device reader is rebuilt on resume.
+// `launch_tasks` reuses the existing `VirtualDevices` on this path instead of
+// rebuilding it from scratch, so the compositor/libinput doesn't have to
+// rediscover new uinput devices via udev after every resume (previously
+// measured at ~6.36s — see issue #39). Only the physical-device reader is
+// rebuilt.
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
@@ -43,10 +46,11 @@ trait LoginManager {
 }
 
 /// Starts the resume watcher. Meant to be spawned once as a tokio task; runs
-/// indefinitely. `device_error_notify` is the same `Notify` used by
-/// `udev_monitor.rs`'s device-error reinit path — triggering it does a full
-/// in-process `launch_tasks()` reinit, exactly like a USB replug would.
-pub async fn start_resume_watcher(device_error_notify: Arc<Notify>) {
+/// indefinitely. `resume_notify` is `udev_monitor.rs`'s dedicated resume
+/// reinit signal (separate from `device_error_notify`) — triggering it does
+/// an in-process `launch_tasks()` reinit that reuses the existing
+/// `VirtualDevices` rather than rebuilding it.
+pub async fn start_resume_watcher(resume_notify: Arc<Notify>) {
     let conn = match Connection::system().await {
         Ok(c) => c,
         Err(e) => {
@@ -88,7 +92,7 @@ pub async fn start_resume_watcher(device_error_notify: Arc<Notify>) {
                 "makima: resume_watcher: resume detected, triggering in-process reinit. +{}ms since startup",
                 crate::startup_ms()
             );
-            device_error_notify.notify_waiters();
+            resume_notify.notify_waiters();
         }
     }
 }

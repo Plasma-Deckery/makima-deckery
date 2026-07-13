@@ -34,6 +34,12 @@ pub struct Environment {
 pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: String, mut tasks: Vec<JoinHandle<()>>) {
     let environment = set_environment();
     let device_error_notify = Arc::new(Notify::new());
+    // Separate signal from `device_error_notify`: a real evdev read error
+    // means the physical device may genuinely be gone/changed, so that path
+    // still does a full VirtualDevices recreate. Resume is (near-certainly)
+    // the same device coming back, so it's safe to reuse the existing
+    // VirtualDevices and skip the libinput-rediscovery cost (see issue #39).
+    let resume_notify = Arc::new(Notify::new());
     let active_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::Default));
     let window_changed: Arc<Notify> = Arc::new(Notify::new());
 
@@ -52,7 +58,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
     // with a direct D-Bus subscription that triggers the existing in-process
     // reinit path on resume, instead of a full process restart.
     tokio::spawn(crate::resume_watcher::start_resume_watcher(
-        device_error_notify.clone(),
+        resume_notify.clone(),
     ));
 
     // Suppress Steam Deck Lizard Mode — persists across device reinitializations.
@@ -150,6 +156,15 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None);
+            }
+            _ = resume_notify.notified() => {
+                println!("---------------------\n\nResume detected, reinitializing...\n");
+                release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
+                for task in &tasks {
+                    task.abort();
+                }
+                tasks.clear();
                 (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), prev_virt_dev.clone());
             }
             Some(_) = config_rx.recv() => {
