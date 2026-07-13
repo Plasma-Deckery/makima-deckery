@@ -71,6 +71,24 @@ pub struct CombinedPadFrame {
     pub rclick: bool,
 }
 
+/// One event delivered to the combined-gesture handler's channel, tagged
+/// with where it falls in the gesture's lifecycle — start, ongoing
+/// movement, or end. `gesture_pad::run` needs this tag (not just the raw
+/// frame) to fire lifecycle haptics (`on_gesture_start`/`on_gesture_move`/
+/// `on_gesture_end`) without re-deriving session-transition state itself;
+/// that state already lives here, in `decide_gesture_transition`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureEvent {
+    /// The single frame where the session starts (both pads just became
+    /// simultaneously touched).
+    Start(CombinedPadFrame),
+    /// Any frame while the session is active, after the starting frame.
+    Move(CombinedPadFrame),
+    /// The session just ended (one or both fingers lifted) — carries no
+    /// frame since the virtual device should simply clear to untouched.
+    End,
+}
+
 /// A request to persist current state to `state.json`. The router knows
 /// *when* pad state changed and needs writing, but not *how* — it just
 /// signals intent and lets the caller's `state_write_loop` do the actual
@@ -166,7 +184,7 @@ pub async fn run(
     state_tx: mpsc::Sender<StateWrite>,
     left_tx: Option<mpsc::Sender<SinglePadFrame>>,
     right_tx: Option<mpsc::Sender<SinglePadFrame>>,
-    combined_tx: Option<mpsc::Sender<CombinedPadFrame>>,
+    combined_tx: Option<mpsc::Sender<GestureEvent>>,
 ) {
     // Previous frame, to know which pad(s) actually changed and whether a
     // touch transition happened — every recv() is already a real change vs.
@@ -229,21 +247,25 @@ pub async fn run(
             }
 
             if transition.now_active {
-                let _ = combined_tx
-                    .send(CombinedPadFrame {
-                        lx: frame.lx,
-                        ly: frame.ly,
-                        ltouch: frame.ltouch,
-                        lclick: frame.lclick,
-                        rx: frame.rx,
-                        ry: frame.ry,
-                        rtouch: frame.rtouch,
-                        rclick: frame.rclick,
-                    })
-                    .await;
+                let combined_frame = CombinedPadFrame {
+                    lx: frame.lx,
+                    ly: frame.ly,
+                    ltouch: frame.ltouch,
+                    lclick: frame.lclick,
+                    rx: frame.rx,
+                    ry: frame.ry,
+                    rtouch: frame.rtouch,
+                    rclick: frame.rclick,
+                };
+                let event = if transition.entering {
+                    GestureEvent::Start(combined_frame)
+                } else {
+                    GestureEvent::Move(combined_frame)
+                };
+                let _ = combined_tx.send(event).await;
             } else if transition.exiting {
                 // Clean lift on the combined channel.
-                let _ = combined_tx.send(CombinedPadFrame::default()).await;
+                let _ = combined_tx.send(GestureEvent::End).await;
                 // Immediately resume whichever pad is still touching on its
                 // own individual channel — synthetic touch-down.
                 match transition.resume_survivor {
