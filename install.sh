@@ -19,7 +19,7 @@ distrobox enter deckery -- sudo pacman -S --needed --noconfirm $BUILD_PACKAGES
 # ── 2. Systemd user services (no sudo) ───────────────────────────────────────
 SERVICE_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SERVICE_DIR"
-for svc in makima.service makima-resume-watcher.service; do
+for svc in makima.service; do
     GENERATED="$REPO/systemd/$svc"
     INSTALLED="$SERVICE_DIR/$svc"
     if ! diff -q "$GENERATED" "$INSTALLED" 2>/dev/null; then
@@ -29,13 +29,24 @@ for svc in makima.service makima-resume-watcher.service; do
 done
 systemctl --user daemon-reload
 systemctl --user enable makima.service
-systemctl --user enable makima-resume-watcher.service
 
-# Install resume-watcher script
-BIN_DIR="$HOME/.local/bin"
-mkdir -p "$BIN_DIR"
-cp "$REPO/scripts/makima-resume-watcher" "$BIN_DIR/makima-resume-watcher"
-chmod +x "$BIN_DIR/makima-resume-watcher"
+# Remove the old external resume-watcher (script + unit) from any prior
+# install: makima now watches logind's PrepareForSleep in-process (see
+# resume_watcher.rs), so the external systemctl-restart-on-resume mechanism
+# is obsolete. Leaving it installed would double-trigger reinit on resume
+# alongside the in-process watcher.
+OLD_UNIT="$SERVICE_DIR/makima-resume-watcher.service"
+if [ -f "$OLD_UNIT" ]; then
+    echo "Removing obsolete makima-resume-watcher.service..."
+    systemctl --user disable --now makima-resume-watcher.service 2>/dev/null || true
+    rm -f "$OLD_UNIT"
+    systemctl --user daemon-reload
+fi
+OLD_SCRIPT="$HOME/.local/bin/makima-resume-watcher"
+if [ -f "$OLD_SCRIPT" ]; then
+    echo "Removing obsolete makima-resume-watcher script..."
+    rm -f "$OLD_SCRIPT"
+fi
 
 # ── 3. Build + deploy ────────────────────────────────────────────────────────
 bash "$REPO/redeploy.sh"
