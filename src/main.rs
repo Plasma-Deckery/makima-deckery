@@ -1,6 +1,7 @@
 mod active_client;
 mod analog;
 mod config;
+mod device_session;
 mod event_reader;
 mod gesture_pad;
 mod kde_input_defaults;
@@ -82,7 +83,6 @@ async fn main() {
             default_config_path
         }
     };
-    kde_input_defaults::ensure_kde_input_defaults();
     let config_files = load_config_files(&config_dir);
     let tasks: Vec<JoinHandle<()>> = Vec::new();
     start_monitoring_udev(config_files, config_dir, tasks).await;

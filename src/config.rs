@@ -33,6 +33,9 @@ pub struct TrackpadSideConfig {
     /// table (including `mode`/`click_pressure`, which handlers are free to
     /// ignore), handed unparsed to whichever handler `mode` selects.
     pub handler_config: toml::Value,
+    /// Raw `[trackpad.left.kde]` / `[trackpad.right.kde]` sub-table, handed
+    /// unparsed to `kde_input_defaults`. Empty table when absent.
+    pub kde_config: toml::Value,
 }
 
 impl Default for TrackpadSideConfig {
@@ -41,6 +44,7 @@ impl Default for TrackpadSideConfig {
             mode: "disabled".to_string(),
             click_pressure: None,
             handler_config: toml::Value::Table(toml::value::Table::new()),
+            kde_config: toml::Value::Table(toml::value::Table::new()),
         }
     }
 }
@@ -63,6 +67,9 @@ pub struct TrackpadConfig {
     /// `click_pressure` of its own — so unlike `left`/`right` there's no
     /// dedicated side-config type, just this raw passthrough.
     pub gesture_handler_config: toml::Value,
+    /// Raw `[trackpad.gestures.kde]` sub-table, handed unparsed to
+    /// `kde_input_defaults`. Empty table when absent.
+    pub gesture_kde_config: toml::Value,
 }
 
 impl Default for TrackpadConfig {
@@ -72,6 +79,7 @@ impl Default for TrackpadConfig {
             right: TrackpadSideConfig::default(),
             combined_gesture_device: false,
             gesture_handler_config: toml::Value::Table(toml::value::Table::new()),
+            gesture_kde_config: toml::Value::Table(toml::value::Table::new()),
         }
     }
 }
@@ -95,10 +103,14 @@ fn parse_trackpad_side(raw: Option<&toml::Value>, legacy_setting: Option<&String
         let click_pressure = t.get("click_pressure")
             .and_then(|v| v.as_integer())
             .map(|i| i as u16);
+        let kde_config = t.get("kde")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new()));
         TrackpadSideConfig {
             mode,
             click_pressure,
             handler_config: toml::Value::Table(t.clone()),
+            kde_config,
         }
     } else if let Some(s) = legacy_setting {
         // Backward-compat: LPAD/RPAD = "mt-trackpad" / "disabled"
@@ -321,6 +333,10 @@ impl Config {
                 settings.get("RPAD"),
             ),
             combined_gesture_device: raw_trackpad.combined_gesture_device.unwrap_or(false),
+            gesture_kde_config: raw_trackpad.gestures.as_ref()
+                .and_then(|v| v.get("kde"))
+                .cloned()
+                .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
             gesture_handler_config: raw_trackpad.gestures
                 .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
         };

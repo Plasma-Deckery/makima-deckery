@@ -1,8 +1,6 @@
 use crate::active_client::*;
-use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, Relative, Scroll};
-use crate::pad_hidraw;
-use crate::mt_trackpad;
-use crate::gesture_pad;
+use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, Relative, Scroll, TrackpadConfig};
+use crate::device_session::TrackpadSession;
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::trackpad::PadState;
@@ -33,14 +31,6 @@ struct Stick {
     activation_modifiers: Vec<Event>,
 }
 
-struct Pad {
-    mode: String,
-    /// Raw `[trackpad.left]`/`[trackpad.right]` TOML sub-table, handed
-    /// unparsed to whichever handler `mode` selects — see `config.rs` for
-    /// the Core/handler config-ownership split.
-    handler_config: toml::Value,
-}
-
 struct Movement {
     speed: i32,
     acceleration: f32,
@@ -49,8 +39,6 @@ struct Movement {
 struct Settings {
     lstick: Stick,
     rstick: Stick,
-    lpad: Pad,
-    rpad: Pad,
     invert_cursor_axis: bool,
     invert_scroll_axis: bool,
     axis_16_bit: bool,
@@ -63,13 +51,6 @@ struct Settings {
     /// If true, cursor/scroll loops keep running even while makima is paused.
     /// Default: true. Set CURSOR_WHEN_PAUSED = "false" in [settings] to disable.
     cursor_when_paused: bool,
-    /// When true, a combined gesture device is created and events are routed to it
-    /// while both pads are simultaneously touched (see `combined_gesture_device` in config).
-    combined_gesture_device: bool,
-    /// Raw `[trackpad.gestures]` TOML sub-table, handed unparsed to
-    /// `gesture_pad::GesturePadConfig` — see `config.rs` for the Core/handler
-    /// config-ownership split.
-    gesture_handler_config: toml::Value,
 }
 
 pub struct EventReader {
@@ -110,6 +91,7 @@ pub struct EventReader {
     settings: Settings,
     active_client: Arc<Mutex<Client>>,
     window_changed: Arc<Notify>,
+    trackpad: TrackpadConfig,
     lpad: PadState,
     rpad: PadState,
     /// True while a combined gesture session is active.
@@ -391,22 +373,10 @@ impl EventReader {
             .iter()
             .find(|&x| x.associations == Associations::default())
             .unwrap();
-        let lpad = Pad {
-            mode: base_cfg.trackpad.left.mode.clone(),
-            handler_config: base_cfg.trackpad.left.handler_config.clone(),
-        };
-        let rpad = Pad {
-            mode: base_cfg.trackpad.right.mode.clone(),
-            handler_config: base_cfg.trackpad.right.handler_config.clone(),
-        };
-        let combined_gesture_device = base_cfg.trackpad.combined_gesture_device;
-        let gesture_handler_config = base_cfg.trackpad.gesture_handler_config.clone();
-
+        let trackpad = base_cfg.trackpad.clone();
         let settings = Settings {
             lstick,
             rstick,
-            lpad,
-            rpad,
             invert_cursor_axis,
             invert_scroll_axis,
             axis_16_bit,
@@ -417,8 +387,6 @@ impl EventReader {
             layout_switcher,
             notify_layout_switch,
             cursor_when_paused,
-            combined_gesture_device,
-            gesture_handler_config,
         };
         Self {
             config,
@@ -447,6 +415,7 @@ impl EventReader {
             settings,
             active_client,
             window_changed,
+            trackpad,
             lpad: PadState::new(true),
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
@@ -455,85 +424,11 @@ impl EventReader {
     }
 
     pub async fn start(&self) {
-        println!(
-            "{:?} detected, reading events.\n",
-            self.config
-                .iter()
-                .find(|&x| x.associations == Associations::default())
-                .unwrap()
-                .name
-        );
-        // Enable virtual trackpad MT devices if mode == "trackpad".
-        // When mode == "disabled" (default), no device is created and no events forwarded;
-        // state tracking (position, touch, press → state.json) remains active either way.
-        for (side, mode) in [("left", &self.settings.lpad.mode), ("right", &self.settings.rpad.mode)] {
-            if !["disabled", "mt-trackpad", "trackball", "scroll"].contains(&mode.as_str()) {
-                eprintln!(
-                    "[makima] Warning: unrecognised trackpad mode {:?} for {} pad, treating as disabled.",
-                    mode, side
-                );
-            }
-        }
-        self.virt_dev.lock().await.enable_trackpads(
-            self.settings.lpad.mode == "mt-trackpad",
-            self.settings.rpad.mode == "mt-trackpad",
-        );
-        if self.settings.combined_gesture_device {
-            self.virt_dev.lock().await.enable_gesture_pad();
-        }
-        // Trackpad position AND touch state both come from the raw hidraw report
-        // (see pad_hidraw.rs for why: evdev and hidraw are different HID
-        // interfaces of the same device and can arrive out of order relative to
-        // each other, which used to cause cursor jumps on reposition). There is
-        // no evdev-based fallback: if no hidraw sibling is found, MtTrackpad mode
-        // simply gets no position/touch data.
-        let pad_channels = pad_hidraw::spawn(&self.device_path);
-        if pad_channels.is_none() {
-            println!(
-                "makima: no hidraw sibling found for {:?}, trackpad position/touch will not be available",
-                self.device_path
-            );
-        }
-        let (pad_rx, haptic_tx) = match pad_channels {
-            Some((rx, tx)) => (Some(rx), Some(tx)),
-            None => (None, None),
-        };
-        // Each mt-trackpad-mode pad self-parses its own handler config (haptics
-        // policy, etc.) out of the raw TOML sub-table Core handed it — see
-        // `mt_trackpad::MtTrackpadConfig` and `config.rs` for the ownership split.
-        let left_mt_config = mt_trackpad::MtTrackpadConfig::from_toml_value(&self.settings.lpad.handler_config);
-        let (left_press_pulse, left_release_pulse, left_movement_pulse) = (left_mt_config.press_pulse(), left_mt_config.release_pulse(), left_mt_config.movement_pulse());
-        let right_mt_config = mt_trackpad::MtTrackpadConfig::from_toml_value(&self.settings.rpad.handler_config);
-        let (right_press_pulse, right_release_pulse, right_movement_pulse) = (right_mt_config.press_pulse(), right_mt_config.release_pulse(), right_mt_config.movement_pulse());
-        // The combined gesture device is its own handler with its own config
-        // (`[trackpad.gestures]`) — see `gesture_pad.rs` for why it doesn't
-        // borrow a per-pad haptic setting: unlike a single-finger click, a
-        // click during a two-finger gesture has no established semantics, so
-        // there's no sane default pulse to fall back to (none, by default).
-        let gesture_pad_config = gesture_pad::GesturePadConfig::from_toml_value(&self.settings.gesture_handler_config);
-        // Per-channel handler input, created only for the channels that
-        // actually have a handler attached — `trackpad_router::run` treats a
-        // `None` channel as "no handler for this pad/mode" and skips sending
-        // into it entirely, so a disabled channel can never block routing.
-        let (left_tx, left_rx) = if self.settings.lpad.mode == "mt-trackpad" {
-            let (tx, rx) = mpsc::channel(64);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-        let (right_tx, right_rx) = if self.settings.rpad.mode == "mt-trackpad" {
-            let (tx, rx) = mpsc::channel(64);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-        let (combined_tx, combined_rx) = if self.settings.combined_gesture_device {
-            let (tx, rx) = mpsc::channel(64);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+        let name = &self.config.iter().find(|&x| x.associations == Associations::default()).unwrap().name;
+        println!("{:?} detected, reading events.\n", name);
+
         let (state_tx, state_rx) = mpsc::channel(8);
+        let session = TrackpadSession::setup(&self.trackpad, &self.virt_dev, &self.device_path).await;
         self.write_state().await;
         self.start_control_socket().await;
         tokio::join!(
@@ -544,56 +439,7 @@ impl EventReader {
             self.key_scroll_loop(),
             self.window_changed_loop(),
             self.state_write_loop(state_rx),
-            async {
-                if let Some(rx) = pad_rx {
-                    trackpad_router::run(
-                        rx,
-                        &self.lpad,
-                        &self.rpad,
-                        &self.gesture_session,
-                        state_tx,
-                        left_tx,
-                        right_tx,
-                        combined_tx,
-                    )
-                    .await;
-                }
-            },
-            async {
-                if let Some(rx) = left_rx {
-                    mt_trackpad::run_single(
-                        rx,
-                        &self.virt_dev,
-                        &self.lpad,
-                        haptic_tx.clone(),
-                        pad_hidraw::HapticPad::Left,
-                        left_press_pulse,
-                        left_release_pulse,
-                        left_movement_pulse,
-                    )
-                    .await;
-                }
-            },
-            async {
-                if let Some(rx) = right_rx {
-                    mt_trackpad::run_single(
-                        rx,
-                        &self.virt_dev,
-                        &self.rpad,
-                        haptic_tx.clone(),
-                        pad_hidraw::HapticPad::Right,
-                        right_press_pulse,
-                        right_release_pulse,
-                        right_movement_pulse,
-                    )
-                    .await;
-                }
-            },
-            async {
-                if let Some(rx) = combined_rx {
-                    gesture_pad::run(rx, &self.virt_dev, haptic_tx.clone(), gesture_pad_config).await;
-                }
-            },
+            session.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx),
         );
     }
 
@@ -683,9 +529,9 @@ impl EventReader {
                     // atomically with position/touch there). Swallow it here so
                     // it doesn't fall through to emit_default_event and leak
                     // onto the generic key device.
-                    Key::BTN_THUMB if self.settings.lpad.mode == "mt-trackpad" => {}
+                    Key::BTN_THUMB if self.trackpad.left.mode == "mt-trackpad" => {}
                     // Right trackpad physical click (BTN_THUMB2) — same as above.
-                    Key::BTN_THUMB2 if self.settings.rpad.mode == "mt-trackpad" => {}
+                    Key::BTN_THUMB2 if self.trackpad.right.mode == "mt-trackpad" => {}
                     _ => {
                         self.convert_event(
                             event,
@@ -744,7 +590,7 @@ impl EventReader {
                     // Trackpad position/touch now comes from hidraw (trackpad_router) in
                     // MtTrackpad mode — see pad_hidraw.rs. This handler only remains
                     // for the D-pad hat-switch case on non-Steam-Deck controllers.
-                    if self.settings.lpad.mode != "mt-trackpad" {
+                    if self.trackpad.left.mode != "mt-trackpad" {
                         match event.value() {
                             -1 => {
                                 self.convert_event(event, Event::Axis(Axis::BTN_DPAD_LEFT), 1, false)
@@ -788,7 +634,7 @@ impl EventReader {
                     // Trackpad position/touch now comes from hidraw (trackpad_router) in
                     // MtTrackpad mode — see pad_hidraw.rs. This handler only remains
                     // for the D-pad hat-switch case on non-Steam-Deck controllers.
-                    if self.settings.lpad.mode != "mt-trackpad" {
+                    if self.trackpad.left.mode != "mt-trackpad" {
                         match event.value() {
                             -1 => {
                                 self.convert_event(event, Event::Axis(Axis::BTN_DPAD_UP), 1, false)
@@ -1971,12 +1817,12 @@ impl EventReader {
         let lpad_mode = if gesture_touching {
             "gestures"
         } else {
-            self.settings.lpad.mode.as_str()
+            self.trackpad.left.mode.as_str()
         };
         let rpad_mode = if gesture_touching {
             "gestures"
         } else {
-            self.settings.rpad.mode.as_str()
+            self.trackpad.right.mode.as_str()
         };
         // During a gesture session the individual pad devices are not sending events —
         // suppress their touching flag so the HUD doesn't render them as independent
@@ -1999,7 +1845,7 @@ impl EventReader {
                 "pressed": rpad_pressed,
             },
             "gesture": {
-                "enabled": self.settings.combined_gesture_device,
+                "enabled": self.trackpad.combined_gesture_device,
                 "touching": gesture_touching,
             },
         });
