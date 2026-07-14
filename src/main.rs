@@ -3,6 +3,7 @@ mod analog;
 mod config;
 mod event_reader;
 mod gesture_pad;
+mod kde_input_defaults;
 mod kwin_watcher;
 mod lizard_mode;
 mod mt_trackpad;
@@ -81,6 +82,7 @@ async fn main() {
             default_config_path
         }
     };
+    kde_input_defaults::ensure_kde_input_defaults();
     let config_files = load_config_files(&config_dir);
     let tasks: Vec<JoinHandle<()>> = Vec::new();
     start_monitoring_udev(config_files, config_dir, tasks).await;

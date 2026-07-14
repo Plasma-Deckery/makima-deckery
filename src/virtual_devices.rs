@@ -1,7 +1,18 @@
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsoluteAxisType, AbsInfo, Key, PropType, UinputAbsSetup,
+    AbsoluteAxisType, AbsInfo, BusType, InputId, Key, PropType, UinputAbsSetup,
 };
+
+/// Stable uinput IDs for all Deckery virtual trackpad devices. KDE stores
+/// per-device libinput settings in kcminputrc keyed by (vendor, product, name),
+/// so fixed IDs ensure the same KDE settings apply on every boot. These values
+/// match the entries written by `kde_input_defaults::ensure_kde_input_defaults`.
+pub const DECKERY_VENDOR: u16  = 0x1234;
+pub const DECKERY_PRODUCT: u16 = 0x5678;
+
+fn deckery_input_id() -> InputId {
+    InputId::new(BusType::BUS_VIRTUAL, DECKERY_VENDOR, DECKERY_PRODUCT, 1)
+}
 
 pub struct VirtualDevices {
     pub keys: VirtualDevice,
@@ -42,6 +53,7 @@ fn build_gesture_pad_device() -> VirtualDevice {
     VirtualDeviceBuilder::new()
         .expect("Unable to create gesture pad device")
         .name("Deckery Combined Trackpad")
+        .input_id(deckery_input_id())
         .with_properties(&props).unwrap()
         .with_keys(&pad_keys).unwrap()
         .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType::ABS_X, range)).unwrap()
@@ -86,6 +98,7 @@ fn build_trackpad_device(name: &str) -> VirtualDevice {
     VirtualDeviceBuilder::new()
         .expect("Unable to create virtual trackpad device")
         .name(name)
+        .input_id(deckery_input_id())
         .with_properties(&props).unwrap()
         .with_keys(&pad_keys).unwrap()
         .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType::ABS_X, range)).unwrap()
