@@ -14,6 +14,19 @@
 //!     handler attached (`None`) so a disabled channel never blocks the loop.
 //!   - signaling `state.json` writes via `StateWrite`, rate-limited for
 //!     analog movement but immediate for digital transitions.
+//!
+//! ## Position discontinuity at gesture boundaries
+//!
+//! The combined gesture device is virtual — there is no physical sensor with
+//! continuous tracking behind it. When a gesture session starts or ends the
+//! MT slot positions jump: the gesture device gets assigned slots from scratch
+//! at session start, and the survivor pad re-enters its own single-pad channel
+//! at a potentially different logical position than when it left. libinput sees
+//! this as a sudden large delta and may produce a spurious scroll or pointer
+//! jump. This is an inherent limitation of routing across virtual devices and
+//! cannot be fully eliminated without libinput-side continuity support. The
+//! debounce in `run` mitigates brief session restarts that would otherwise
+//! multiply the effect.
 use crate::pad_hidraw::PadFrame;
 use crate::trackpad::PadState;
 use std::sync::Arc;
@@ -196,6 +209,18 @@ pub async fn run(
     // route to the combined gesture channel while active. Only meaningful
     // when a combined handler is attached at all (`combined_tx.is_some()`).
     let mut gesture_active = false;
+    // After GestureEvent::End, suppress single-pad routing for each pad until
+    // it has physically lifted (rtouch/ltouch → false). A pad that stays
+    // touching after a gesture (held as anchor) would otherwise deliver
+    // touching=true frames to its single-pad device, which KWin treats as a
+    // new touch and immediately cancels kinetic scroll from the gesture device.
+    // A lift event (touching=false) does NOT cancel kinetic, so we pass that
+    // through to clear the handler's state.
+    let mut suppress_left_until_lift = false;
+    let mut suppress_right_until_lift = false;
+    const SURVIVOR_MOVE_THRESHOLD: i64 = 4000;
+    let mut left_gesture_end_pos: (i32, i32) = (0, 0);
+    let mut right_gesture_end_pos: (i32, i32) = (0, 0);
     // Rate-limit state.json writes from trackpad movement to ~60 Hz. Touch
     // transitions (lift/touch-down) bypass this and write immediately.
     let mut last_state_write = std::time::Instant::now()
@@ -229,10 +254,7 @@ pub async fn run(
             let was_gesture_active = gesture_active;
             let transition = decide_gesture_transition(gesture_active, frame);
             gesture_active = transition.now_active;
-            eprintln!(
-                "[trackpad-debug] router transition: entering={} now_active={} exiting={} resume={:?}",
-                transition.entering, transition.now_active, transition.exiting, transition.resume_survivor
-            );
+
 
             // First frame of gesture session: lift any individual channel
             // that currently has a finger down so its handler sees a clean
@@ -264,37 +286,12 @@ pub async fn run(
                 };
                 let _ = combined_tx.send(event).await;
             } else if transition.exiting {
-                // Clean lift on the combined channel.
+                gesture_active = false;
                 let _ = combined_tx.send(GestureEvent::End).await;
-                // Immediately resume whichever pad is still touching on its
-                // own individual channel — synthetic touch-down.
-                match transition.resume_survivor {
-                    Some(Pad::Left) => {
-                        if let Some(tx) = &left_tx {
-                            let _ = tx
-                                .send(SinglePadFrame {
-                                    x: frame.lx,
-                                    y: frame.ly,
-                                    touching: true,
-                                    click: frame.lclick,
-                                })
-                                .await;
-                        }
-                    }
-                    Some(Pad::Right) => {
-                        if let Some(tx) = &right_tx {
-                            let _ = tx
-                                .send(SinglePadFrame {
-                                    x: frame.rx,
-                                    y: frame.ry,
-                                    touching: true,
-                                    click: frame.rclick,
-                                })
-                                .await;
-                        }
-                    }
-                    None => {}
-                }
+                suppress_left_until_lift = true;
+                suppress_right_until_lift = true;
+                left_gesture_end_pos = (frame.lx, frame.ly);
+                right_gesture_end_pos = (frame.rx, frame.ry);
             }
 
             if transition.now_active || transition.exiting {
@@ -308,30 +305,51 @@ pub async fn run(
             }
         }
 
-        // Individual channels — only when not currently in a gesture session.
         if !gesture_active {
             if l_changed {
-                if let Some(tx) = &left_tx {
-                    let _ = tx
-                        .send(SinglePadFrame {
-                            x: frame.lx,
-                            y: frame.ly,
-                            touching: frame.ltouch,
-                            click: frame.lclick,
-                        })
-                        .await;
+                if !frame.ltouch {
+                    suppress_left_until_lift = false;
+                } else if suppress_left_until_lift {
+                    let dx = (frame.lx - left_gesture_end_pos.0) as i64;
+                    let dy = (frame.ly - left_gesture_end_pos.1) as i64;
+                    if dx * dx + dy * dy > SURVIVOR_MOVE_THRESHOLD * SURVIVOR_MOVE_THRESHOLD {
+                        suppress_left_until_lift = false;
+                    }
+                }
+                if !suppress_left_until_lift {
+                    if let Some(tx) = &left_tx {
+                        let _ = tx
+                            .send(SinglePadFrame {
+                                x: frame.lx,
+                                y: frame.ly,
+                                touching: frame.ltouch,
+                                click: frame.lclick,
+                            })
+                            .await;
+                    }
                 }
             }
             if r_changed {
-                if let Some(tx) = &right_tx {
-                    let _ = tx
-                        .send(SinglePadFrame {
-                            x: frame.rx,
-                            y: frame.ry,
-                            touching: frame.rtouch,
-                            click: frame.rclick,
-                        })
-                        .await;
+                if !frame.rtouch {
+                    suppress_right_until_lift = false;
+                } else if suppress_right_until_lift {
+                    let dx = (frame.rx - right_gesture_end_pos.0) as i64;
+                    let dy = (frame.ry - right_gesture_end_pos.1) as i64;
+                    if dx * dx + dy * dy > SURVIVOR_MOVE_THRESHOLD * SURVIVOR_MOVE_THRESHOLD {
+                        suppress_right_until_lift = false;
+                    }
+                }
+                if !suppress_right_until_lift {
+                    if let Some(tx) = &right_tx {
+                        let _ = tx
+                            .send(SinglePadFrame {
+                                x: frame.rx,
+                                y: frame.ry,
+                                touching: frame.rtouch,
+                                click: frame.rclick,
+                            })
+                            .await;
+                    }
                 }
             }
         }

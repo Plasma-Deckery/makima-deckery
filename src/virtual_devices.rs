@@ -24,10 +24,20 @@ fn build_gesture_pad_device() -> VirtualDevice {
     pad_keys.insert(Key::BTN_TOOL_FINGER);
     pad_keys.insert(Key::BTN_TOOL_DOUBLETAP); // needed for 2-finger libinput recognition
     pad_keys.insert(Key::BTN_LEFT);
+    // BTN_RIGHT required alongside BTN_LEFT: without it libinput's tp_guess_clickpad()
+    // fires ("missing right button, assuming it is a clickpad") and activates
+    // button-areas anyway — reserving the bottom ~15% as software button zones
+    // and blocking vertical scroll there. With BTN_RIGHT present and no
+    // INPUT_PROP_BUTTONPAD, libinput treats the device as a regular touchpad
+    // with physical buttons and applies no click method at all.
+    pad_keys.insert(Key::BTN_RIGHT);
 
     let mut props = evdev::AttributeSet::<PropType>::new();
     props.insert(PropType::POINTER);
-    props.insert(PropType::BUTTONPAD);
+    // No INPUT_PROP_BUTTONPAD: Steam Deck pads have no physical click button
+    // under the surface. BUTTONPAD would cause libinput to default to
+    // button-areas click method, reserving the bottom strip. Clicks come from
+    // explicit BTN_LEFT emissions in emit_gesture_event, not libinput's logic.
 
     VirtualDeviceBuilder::new()
         .expect("Unable to create gesture pad device")
@@ -60,16 +70,18 @@ fn build_trackpad_device(name: &str) -> VirtualDevice {
     let id_info = AbsInfo::new(-1, -1, 65535, 0, 0, 0); // -1 = no touch
 
     let mut pad_keys = evdev::AttributeSet::new();
-    pad_keys.insert(Key::BTN_TOUCH);       // 0x14a = 330 — finger contact
-    pad_keys.insert(Key::BTN_TOOL_FINGER); // 0x145 = 325 — finger tool type
-    pad_keys.insert(Key::BTN_LEFT);        // 0x110 = 272 — physical click
+    pad_keys.insert(Key::BTN_TOUCH);       // finger contact
+    pad_keys.insert(Key::BTN_TOOL_FINGER); // finger tool type
+    pad_keys.insert(Key::BTN_LEFT);        // physical click
+    // BTN_RIGHT: prevents libinput tp_guess_clickpad() from treating this as a
+    // clickpad (which would activate button-areas and block the bottom strip).
+    pad_keys.insert(Key::BTN_RIGHT);
 
-    // INPUT_PROP_POINTER (0): tells libinput this device controls a pointer.
-    // INPUT_PROP_BUTTONPAD (2): tells libinput the click button is under the
-    // touch surface (clickpad), matching the Steam Deck trackpad hardware.
+    // INPUT_PROP_POINTER only — no BUTTONPAD. Without BUTTONPAD libinput does
+    // not apply any click method and the full pad surface is available for
+    // scrolling. Clicks arrive as explicit BTN_LEFT events from hidraw.
     let mut props = evdev::AttributeSet::<PropType>::new();
-    props.insert(PropType::POINTER);   // 0
-    props.insert(PropType::BUTTONPAD); // 2
+    props.insert(PropType::POINTER);
 
     VirtualDeviceBuilder::new()
         .expect("Unable to create virtual trackpad device")

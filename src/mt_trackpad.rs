@@ -46,6 +46,7 @@ pub struct HapticPulse {
 fn default_duration_us() -> u16 { 8000 }
 fn default_interval_us() -> u16 { 8000 }
 fn default_count() -> u16 { 3 }
+fn default_movement_pixel_interval() -> u32 { 3000 }
 
 impl Default for HapticPulse {
     fn default() -> Self {
@@ -60,18 +61,32 @@ impl Default for HapticPulse {
     }
 }
 
+/// Distance-gated movement haptic: the pulse to fire plus the raw-unit
+/// distance threshold that gates it. Kept as its own struct (not a bare
+/// `HapticPulse`) for the same reason as `gesture_pad::GestureMoveHaptic` —
+/// movement has no natural single trigger instant, so it needs its own firing
+/// policy alongside the pulse shape. Live-tested naive time-based throttling
+/// produced a continuous buzz; distance-gating means faster movement ticks
+/// more often and slow movement ticks rarely, matching Steam Input's own
+/// trackpad feedback feel.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct MovementHaptic {
+    #[serde(default = "default_movement_pixel_interval")]
+    pub pixel_interval: u32,
+    #[serde(flatten)]
+    pub pulse: HapticPulse,
+}
+
 /// Haptic policy for this handler: which events fire a pulse, and with what
 /// parameters. A physical click is really two distinct edges — press and
-/// release — and they deserve independent pulses (e.g. a firmer tick on
-/// press, nothing or a softer tick on release) rather than being collapsed
-/// into a single "on_click" that only ever fires once. `on_movement` is
-/// parsed but not yet wired up to anything — placeholder for the
-/// mode-specific haptic policy work tracked in issue #18.
+/// release — and they deserve independent pulses rather than being collapsed
+/// into a single "on_click". `on_movement` gates on cumulative pixel distance
+/// (see `MovementHaptic`) rather than time, to avoid continuous buzzing.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct HapticConfig {
     pub on_press: Option<HapticPulse>,
     pub on_release: Option<HapticPulse>,
-    pub on_movement: Option<HapticPulse>,
+    pub on_movement: Option<MovementHaptic>,
 }
 
 /// This handler's own config, self-deserialized from the raw `handler_config`
@@ -117,6 +132,13 @@ impl MtTrackpadConfig {
     pub fn release_pulse(&self) -> Option<HapticPulse> {
         Some(self.haptic.on_release.unwrap_or_default())
     }
+
+    /// The movement pulse/distance-gate policy, if configured. `None` by
+    /// default — movement haptics have no established "feel" to fall back to,
+    /// unlike click edges, so silence is the right default.
+    pub fn movement_pulse(&self) -> Option<MovementHaptic> {
+        self.haptic.on_movement
+    }
 }
 
 /// Fires a haptic pulse on `pad` per `pulse`, best-effort: a missing/failed
@@ -129,18 +151,16 @@ impl MtTrackpadConfig {
 /// is shared infrastructure, only the "when/with what parameters" policy is
 /// per-handler.
 pub(crate) async fn pulse(haptic_tx: &Option<mpsc::Sender<HapticCommand>>, pad: HapticPad, pulse: HapticPulse) {
-    eprintln!("[haptic-debug] pulse() called: pad={:?} pulse={:?} tx_present={}", pad, pulse, haptic_tx.is_some());
     if let Some(tx) = haptic_tx {
-        let send_result = tx
-            .send(HapticCommand {
-                pad,
-                duration_us: pulse.duration_us,
-                interval_us: pulse.interval_us,
-                count: pulse.count,
-                gain_db: pulse.gain_db,
-            })
-            .await;
-        eprintln!("[haptic-debug] pulse() send result: {:?}", send_result.is_ok());
+        tx.send(HapticCommand {
+            pad,
+            duration_us: pulse.duration_us,
+            interval_us: pulse.interval_us,
+            count: pulse.count,
+            gain_db: pulse.gain_db,
+        })
+        .await
+        .ok();
     }
 }
 
@@ -159,18 +179,42 @@ pub async fn run_single(
     haptic_pad: HapticPad,
     press_pulse: HapticPulse,
     release_pulse: Option<HapticPulse>,
+    movement_pulse: Option<MovementHaptic>,
 ) {
     let mut prev_click = false;
+    let mut prev_pos: Option<(i32, i32)> = None;
+    let mut move_accum: f64 = 0.0;
+
     while let Some(frame) = rx.recv().await {
         let press_edge = frame.click && !prev_click;
         let release_edge = !frame.click && prev_click;
         prev_click = frame.click;
+
         pad.emit(virt_dev, frame.x, frame.y, frame.touching, Some(frame.click)).await;
+
         if press_edge {
             pulse(&haptic_tx, haptic_pad, press_pulse).await;
         } else if release_edge {
-            if let Some(release_pulse) = release_pulse {
-                pulse(&haptic_tx, haptic_pad, release_pulse).await;
+            if let Some(p) = release_pulse {
+                pulse(&haptic_tx, haptic_pad, p).await;
+            }
+        }
+
+        if let Some(m) = movement_pulse {
+            if frame.touching {
+                if let Some((px, py)) = prev_pos {
+                    let dx = (frame.x - px) as f64;
+                    let dy = (frame.y - py) as f64;
+                    move_accum += (dx * dx + dy * dy).sqrt();
+                    if move_accum >= m.pixel_interval as f64 {
+                        pulse(&haptic_tx, haptic_pad, m.pulse).await;
+                        move_accum = 0.0;
+                    }
+                }
+                prev_pos = Some((frame.x, frame.y));
+            } else {
+                prev_pos = None;
+                move_accum = 0.0;
             }
         }
     }

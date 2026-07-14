@@ -502,9 +502,9 @@ impl EventReader {
         // policy, etc.) out of the raw TOML sub-table Core handed it — see
         // `mt_trackpad::MtTrackpadConfig` and `config.rs` for the ownership split.
         let left_mt_config = mt_trackpad::MtTrackpadConfig::from_toml_value(&self.settings.lpad.handler_config);
-        let (left_press_pulse, left_release_pulse) = (left_mt_config.press_pulse(), left_mt_config.release_pulse());
+        let (left_press_pulse, left_release_pulse, left_movement_pulse) = (left_mt_config.press_pulse(), left_mt_config.release_pulse(), left_mt_config.movement_pulse());
         let right_mt_config = mt_trackpad::MtTrackpadConfig::from_toml_value(&self.settings.rpad.handler_config);
-        let (right_press_pulse, right_release_pulse) = (right_mt_config.press_pulse(), right_mt_config.release_pulse());
+        let (right_press_pulse, right_release_pulse, right_movement_pulse) = (right_mt_config.press_pulse(), right_mt_config.release_pulse(), right_mt_config.movement_pulse());
         // The combined gesture device is its own handler with its own config
         // (`[trackpad.gestures]`) — see `gesture_pad.rs` for why it doesn't
         // borrow a per-pad haptic setting: unlike a single-finger click, a
@@ -569,6 +569,7 @@ impl EventReader {
                         pad_hidraw::HapticPad::Left,
                         left_press_pulse,
                         left_release_pulse,
+                        left_movement_pulse,
                     )
                     .await;
                 }
@@ -583,6 +584,7 @@ impl EventReader {
                         pad_hidraw::HapticPad::Right,
                         right_press_pulse,
                         right_release_pulse,
+                        right_movement_pulse,
                     )
                     .await;
                 }
