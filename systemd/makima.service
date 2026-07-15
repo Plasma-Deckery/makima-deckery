@@ -1,9 +1,9 @@
 [Unit]
-Description=makima input remapper
+Description=Deckery input remapper
 After=plasma-core.target
 
 [Service]
-ExecStart=%h/.local/bin/makima
+ExecStart=%h/.local/bin/makima-deckery
 Restart=on-failure
 RestartSec=3
 Environment=MAKIMA_CONFIG=%h/.config/makima

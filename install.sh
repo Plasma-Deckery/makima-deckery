@@ -47,6 +47,11 @@ if [ -f "$OLD_SCRIPT" ]; then
     echo "Removing obsolete makima-resume-watcher script..."
     rm -f "$OLD_SCRIPT"
 fi
+OLD_BIN="$HOME/.local/bin/makima"
+if [ -f "$OLD_BIN" ]; then
+    echo "Removing obsolete makima binary (renamed to makima-deckery)..."
+    rm -f "$OLD_BIN"
+fi
 
 # ── 3. Build + deploy ────────────────────────────────────────────────────────
 bash "$REPO/redeploy.sh"
