@@ -265,18 +265,15 @@ pub async fn run_pad_haptic_writer(path: PathBuf, mut rx: mpsc::Receiver<HapticC
         }
     };
     let fd = file.as_raw_fd();
-    eprintln!("[haptic-debug] writer opened {:?} fd={}", path, fd);
     while let Some(cmd) = rx.recv().await {
-        eprintln!("[haptic-debug] writer received cmd: {:?}", cmd);
         let mut buf = build_haptic_report(&cmd);
-        eprintln!("[haptic-debug] report bytes[0..12]: {:?}", &buf[0..12]);
         // ioctl is a blocking syscall; run it off the async executor thread.
         let result = tokio::task::spawn_blocking(move || {
             send_haptic_report(fd, &mut buf)
         })
         .await;
         match result {
-            Ok(Ok(())) => eprintln!("[haptic-debug] ioctl succeeded"),
+            Ok(Ok(())) => {}
             Ok(Err(e)) => eprintln!("makima: haptic pulse failed: {}", e),
             Err(e) => eprintln!("makima: haptic pulse task panicked: {}", e),
         }

@@ -222,11 +222,7 @@ sudo usermod -aG input $USER   # grants access to /dev/input/* and /dev/uinput
 
 The service environment variables (`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, etc.) are hardcoded in the unit because the service starts before the desktop session environment is fully inherited.
 
-**`makima-resume-watcher.service`** watches for the `PrepareForSleep(false)` DBus signal and restarts makima after suspend — the Steam Deck kernel silently freezes evdev file descriptors on suspend without returning an error, so makima cannot detect this on its own.
-
-```bash
-systemctl --user enable --now makima-resume-watcher.service
-```
+Suspend/resume is handled in-process: makima subscribes to the `PrepareForSleep(false)` D-Bus signal from `org.freedesktop.login1` and reinitialises the evdev/hidraw reader on resume without restarting the process or rebuilding the virtual uinput devices. The Steam Deck kernel silently freezes evdev file descriptors on suspend without returning an error, so an explicit resume signal is required. The former external `makima-resume-watcher.service` companion unit has been removed — `install.sh` disables and deletes it automatically on upgrade.
 
 ---
 

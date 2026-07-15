@@ -378,11 +378,17 @@ pub fn launch_tasks(
 /// reinit round instead of constructing a fresh one. Reuse was requested by
 /// the caller (a resume/read-error reinit, not a USB replug or config
 /// reload) — but only actually safe when exactly one physical device
-/// matched this round's configs. Handing every device the same reused
-/// instance when more than one device matches would give a second/third
-/// device virtual output devices built from a *different* device's
-/// capabilities. Doesn't affect Steam Deck (always exactly one matched
-/// device) but matters for generic multi-controller configs.
+/// matched this round's configs.
+///
+/// On Steam Deck there is always exactly one matched device (the built-in
+/// controller), so the guard never fires in practice. It exists for
+/// correctness in generic multi-controller configs: if two gamepads are
+/// both configured and a reinit runs, handing both the same reused
+/// `VirtualDevices` (built from the *previous* device's capabilities) would
+/// give the second device wrong uinput axis ranges, input IDs, etc. With
+/// `matched_device_count > 1` we fall back to the safe full-recreate path
+/// instead. Not live-tested with multiple devices — correctness follows from
+/// the logic, which is unit-tested below.
 fn should_reuse_virt_dev(matched_device_count: usize, reuse_requested: bool) -> bool {
     reuse_requested && matched_device_count == 1
 }
