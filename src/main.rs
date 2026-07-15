@@ -1,10 +1,20 @@
 mod active_client;
 mod analog;
 mod config;
+mod device_session;
 mod event_reader;
+mod gesture_pad;
+mod kde_input_defaults;
 mod kwin_watcher;
+mod lizard_mode;
+mod mt_trackpad;
+mod pad_hidraw;
 mod resolver;
+mod scroll_pad;
 mod state_export;
+mod trackball;
+mod trackpad;
+mod trackpad_router;
 mod udev_monitor;
 mod virtual_devices;
 
@@ -34,6 +44,15 @@ pub fn load_config_files(config_dir: &str) -> Vec<Config> {
 
 #[tokio::main]
 async fn main() {
+    // Any panic anywhere in the process must kill the whole process immediately.
+    // Without this, Tokio tasks are independent: a panic in the event reader
+    // would leave the Lizard Mode heartbeat running, keeping the Steam Deck
+    // trackpads suppressed with no input handling active.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::exit(1);
+    }));
     let config_dir = match env::var("MAKIMA_CONFIG") {
         Ok(path) => {
             println!("\nMAKIMA_CONFIG set to {:?}.\n", path);

@@ -1,7 +1,18 @@
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsoluteAxisType, AbsInfo, Key, PropType, UinputAbsSetup,
+    AbsoluteAxisType, AbsInfo, BusType, InputId, Key, PropType, UinputAbsSetup,
 };
+
+/// Stable uinput IDs for all Deckery virtual trackpad devices. KDE stores
+/// per-device libinput settings in kcminputrc keyed by (vendor, product, name),
+/// so fixed IDs ensure the same KDE settings apply on every boot. These values
+/// match the entries written by `kde_input_defaults::ensure_kde_input_defaults`.
+pub const DECKERY_VENDOR: u16  = 0x1234;
+pub const DECKERY_PRODUCT: u16 = 0x5678;
+
+fn deckery_input_id() -> InputId {
+    InputId::new(BusType::BUS_VIRTUAL, DECKERY_VENDOR, DECKERY_PRODUCT, 1)
+}
 
 pub struct VirtualDevices {
     pub keys: VirtualDevice,
@@ -9,6 +20,50 @@ pub struct VirtualDevices {
     pub abs: VirtualDevice,
     pub lpad: Option<VirtualDevice>,
     pub rpad: Option<VirtualDevice>,
+    /// Combined two-finger gesture device. Active when `combined_gesture_device = true`
+    /// in the config. Receives left pad as slot 0 and right pad as slot 1.
+    pub gesture_pad: Option<VirtualDevice>,
+}
+
+fn build_gesture_pad_device() -> VirtualDevice {
+    let range = AbsInfo::new(0, -32767, 32767, 256, 0, 1638);
+    let slot_info = AbsInfo::new(0, 0, 1, 0, 0, 0); // 2 slots (0..=1)
+    let id_info = AbsInfo::new(-1, -1, 65535, 0, 0, 0);
+
+    let mut pad_keys = evdev::AttributeSet::new();
+    pad_keys.insert(Key::BTN_TOUCH);
+    pad_keys.insert(Key::BTN_TOOL_FINGER);
+    pad_keys.insert(Key::BTN_TOOL_DOUBLETAP); // needed for 2-finger libinput recognition
+    pad_keys.insert(Key::BTN_LEFT);
+    // BTN_RIGHT required alongside BTN_LEFT: without it libinput's tp_guess_clickpad()
+    // fires ("missing right button, assuming it is a clickpad") and activates
+    // button-areas anyway — reserving the bottom ~15% as software button zones
+    // and blocking vertical scroll there. With BTN_RIGHT present and no
+    // INPUT_PROP_BUTTONPAD, libinput treats the device as a regular touchpad
+    // with physical buttons and applies no click method at all.
+    pad_keys.insert(Key::BTN_RIGHT);
+
+    let mut props = evdev::AttributeSet::<PropType>::new();
+    props.insert(PropType::POINTER);
+    // No INPUT_PROP_BUTTONPAD: Steam Deck pads have no physical click button
+    // under the surface. BUTTONPAD would cause libinput to default to
+    // button-areas click method, reserving the bottom strip. Clicks come from
+    // explicit BTN_LEFT emissions in emit_gesture_event, not libinput's logic.
+
+    VirtualDeviceBuilder::new()
+        .expect("Unable to create gesture pad device")
+        .name("Deckery Combined Trackpad")
+        .input_id(deckery_input_id())
+        .with_properties(&props).unwrap()
+        .with_keys(&pad_keys).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType::ABS_X, range)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType::ABS_Y, range)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(47), slot_info)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(53), range)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(54), range)).unwrap()
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType(57), id_info)).unwrap()
+        .build()
+        .unwrap()
 }
 
 fn build_trackpad_device(name: &str) -> VirtualDevice {
@@ -19,27 +74,31 @@ fn build_trackpad_device(name: &str) -> VirtualDevice {
     //   ABS_MT_POSITION_Y  = 0x36 = 54
     //   ABS_MT_TRACKING_ID = 0x39 = 57
     // Steam Deck trackpad raw range: signed 16-bit, -32767..32767.
-    // Physical size ~50x50mm → resolution = 65534 / 50 ≈ 1311 units/mm.
-    // libinput rejects devices with nonsensical dimensions (resolution=1 → 65m pad).
-    let range = AbsInfo::new(0, -32767, 32767, 0, 0, 1311);
+    // Physical size ~38x38mm → resolution = 65534 / 40 ≈ 1638 units/mm (matches kernel driver).
+    // fuzz=256 matches real Steam Deck trackpad hardware noise level, helps libinput
+    // tune adaptive acceleration correctly and filters minor thumb resting artefacts.
+    let range = AbsInfo::new(0, -32767, 32767, 256, 0, 1638);
     let slot_info = AbsInfo::new(0, 0, 1, 0, 0, 0);    // 2 slots (0..=1)
     let id_info = AbsInfo::new(-1, -1, 65535, 0, 0, 0); // -1 = no touch
 
     let mut pad_keys = evdev::AttributeSet::new();
-    pad_keys.insert(Key::BTN_TOUCH);       // 0x14a = 330 — finger contact
-    pad_keys.insert(Key::BTN_TOOL_FINGER); // 0x145 = 325 — finger tool type
-    pad_keys.insert(Key::BTN_LEFT);        // 0x110 = 272 — physical click
+    pad_keys.insert(Key::BTN_TOUCH);       // finger contact
+    pad_keys.insert(Key::BTN_TOOL_FINGER); // finger tool type
+    pad_keys.insert(Key::BTN_LEFT);        // physical click
+    // BTN_RIGHT: prevents libinput tp_guess_clickpad() from treating this as a
+    // clickpad (which would activate button-areas and block the bottom strip).
+    pad_keys.insert(Key::BTN_RIGHT);
 
-    // INPUT_PROP_POINTER (0): tells libinput this device controls a pointer.
-    // INPUT_PROP_BUTTONPAD (2): tells libinput the click button is under the
-    // touch surface (clickpad), matching the Steam Deck trackpad hardware.
+    // INPUT_PROP_POINTER only — no BUTTONPAD. Without BUTTONPAD libinput does
+    // not apply any click method and the full pad surface is available for
+    // scrolling. Clicks arrive as explicit BTN_LEFT events from hidraw.
     let mut props = evdev::AttributeSet::<PropType>::new();
-    props.insert(PropType::POINTER);   // 0
-    props.insert(PropType::BUTTONPAD); // 2
+    props.insert(PropType::POINTER);
 
     VirtualDeviceBuilder::new()
         .expect("Unable to create virtual trackpad device")
         .name(name)
+        .input_id(deckery_input_id())
         .with_properties(&props).unwrap()
         .with_keys(&pad_keys).unwrap()
         .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisType::ABS_X, range)).unwrap()
@@ -127,6 +186,7 @@ impl VirtualDevices {
             abs: virtual_device_abs,
             lpad: None,
             rpad: None,
+            gesture_pad: None,
         }
     }
 
@@ -139,5 +199,10 @@ impl VirtualDevices {
         if rpad {
             self.rpad = Some(build_trackpad_device("Deckery Right Trackpad"));
         }
+    }
+
+    /// Enable the combined two-finger gesture device.
+    pub fn enable_gesture_pad(&mut self) {
+        self.gesture_pad = Some(build_gesture_pad_device());
     }
 }

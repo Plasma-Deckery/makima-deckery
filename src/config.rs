@@ -3,6 +3,123 @@ use evdev::Key;
 use serde;
 use std::{collections::{HashMap, HashSet}, str::FromStr};
 
+// ── Trackpad configuration ────────────────────────────────────────────────────
+//
+// Config ownership is split between this module ("Core") and the per-mode
+// handler module (`mt_trackpad.rs`, `trackball.rs`, `scroll_pad.rs`, ...):
+//
+//   - Core owns `mode` (which handler gets spawned) and `click_pressure`
+//     (a HID feature-report value that lives on the physical sensor itself,
+//     independent of whichever handler is active — two handlers can never
+//     want different firmware thresholds at the same time), plus router-level
+//     settings like `combined_gesture_device`.
+//   - Everything else in a `[trackpad.left]`/`[trackpad.right]` table is
+//     handler-specific (haptics policy, movement algorithm, gesture
+//     semantics) and is passed through as a raw, unparsed `toml::Value` —
+//     Core never learns the shape of a handler's config. Each handler module
+//     defines its own `#[derive(Deserialize)]` struct and parses itself.
+
+/// Configuration for one trackpad side.
+#[derive(Debug, Clone)]
+pub struct TrackpadSideConfig {
+    /// Which handler to spawn: `"disabled"`, `"mt-trackpad"`, `"trackball"`,
+    /// `"scroll"`, ... — an unrecognised value behaves like `"disabled"`
+    /// (no handler spawned); see `event_reader::start` for the dispatch.
+    pub mode: String,
+    /// Physical click pressure threshold sent to firmware via HID.
+    /// Raw u16 firmware value. None = firmware default (0xFFFF = disabled).
+    pub click_pressure: Option<u16>,
+    /// The rest of this side's `[trackpad.left]`/`[trackpad.right]` TOML
+    /// table (including `mode`/`click_pressure`, which handlers are free to
+    /// ignore), handed unparsed to whichever handler `mode` selects.
+    pub handler_config: toml::Value,
+    /// Raw `[trackpad.left.kde]` / `[trackpad.right.kde]` sub-table, handed
+    /// unparsed to `kde_input_defaults`. Empty table when absent.
+    pub kde_config: toml::Value,
+}
+
+impl Default for TrackpadSideConfig {
+    fn default() -> Self {
+        TrackpadSideConfig {
+            mode: "disabled".to_string(),
+            click_pressure: None,
+            handler_config: toml::Value::Table(toml::value::Table::new()),
+            kde_config: toml::Value::Table(toml::value::Table::new()),
+        }
+    }
+}
+
+/// Configuration for both trackpad sides, parsed from `[trackpad.left]` /
+/// `[trackpad.right]` in the TOML config.
+#[derive(Debug, Clone)]
+pub struct TrackpadConfig {
+    pub left: TrackpadSideConfig,
+    pub right: TrackpadSideConfig,
+    /// When true, a third virtual MT device ("Deckery Gesture Pad") is created.
+    /// As soon as both pads are simultaneously touched, events are routed to that
+    /// device with left=slot 0 and right=slot 1 — enabling pinch-zoom, two-finger
+    /// scroll and pan via libinput. The gesture session persists until both fingers
+    /// are fully lifted.
+    pub combined_gesture_device: bool,
+    /// Raw `[trackpad.gestures]` TOML sub-table, handed unparsed to
+    /// `gesture_pad::GesturePadConfig::from_toml_value`. The combined gesture
+    /// device isn't a distinct physical sensor — it has no `mode`/
+    /// `click_pressure` of its own — so unlike `left`/`right` there's no
+    /// dedicated side-config type, just this raw passthrough.
+    pub gesture_handler_config: toml::Value,
+    /// Raw `[trackpad.gestures.kde]` sub-table, handed unparsed to
+    /// `kde_input_defaults`. Empty table when absent.
+    pub gesture_kde_config: toml::Value,
+}
+
+impl Default for TrackpadConfig {
+    fn default() -> Self {
+        TrackpadConfig {
+            left: TrackpadSideConfig::default(),
+            right: TrackpadSideConfig::default(),
+            combined_gesture_device: false,
+            gesture_handler_config: toml::Value::Table(toml::value::Table::new()),
+            gesture_kde_config: toml::Value::Table(toml::value::Table::new()),
+        }
+    }
+}
+
+// ── Raw deserialization types ─────────────────────────────────────────────────
+
+#[derive(serde::Deserialize, Default, Debug, Clone)]
+pub struct RawTrackpadConfig {
+    pub left: Option<toml::Value>,
+    pub right: Option<toml::Value>,
+    pub combined_gesture_device: Option<bool>,
+    pub gestures: Option<toml::Value>,
+}
+
+fn parse_trackpad_side(raw: Option<&toml::Value>, legacy_setting: Option<&String>) -> TrackpadSideConfig {
+    if let Some(toml::Value::Table(t)) = raw {
+        let mode = t.get("mode")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_else(|| "disabled".to_string());
+        let click_pressure = t.get("click_pressure")
+            .and_then(|v| v.as_integer())
+            .map(|i| i as u16);
+        let kde_config = t.get("kde")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new()));
+        TrackpadSideConfig {
+            mode,
+            click_pressure,
+            handler_config: toml::Value::Table(t.clone()),
+            kde_config,
+        }
+    } else if let Some(s) = legacy_setting {
+        // Backward-compat: LPAD/RPAD = "mt-trackpad" / "disabled"
+        TrackpadSideConfig { mode: s.trim().to_lowercase(), ..Default::default() }
+    } else {
+        TrackpadSideConfig::default()
+    }
+}
+
 /// Value for a `[remap]` entry — simple array or inline table with attributes.
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(untagged)]
@@ -152,6 +269,8 @@ pub struct RawConfig {
     pub movements: HashMap<String, String>,
     #[serde(default)]
     pub settings: HashMap<String, String>,
+    #[serde(default)]
+    pub trackpad: RawTrackpadConfig,
 }
 
 impl RawConfig {
@@ -167,11 +286,13 @@ impl RawConfig {
         let commands = raw_config.commands;
         let movements = raw_config.movements;
         let settings = raw_config.settings;
+        let trackpad = raw_config.trackpad;
         Self {
             remap,
             commands,
             movements,
             settings,
+            trackpad,
         }
     }
 }
@@ -188,13 +309,37 @@ pub struct Config {
     pub override_bindings: Option<Bindings>,
     pub settings: HashMap<String, String>,
     pub mapped_modifiers: MappedModifiers,
+    /// Trackpad configuration parsed from `[trackpad.left]` / `[trackpad.right]`.
+    /// Falls back to legacy `LPAD`/`RPAD` settings when `[trackpad]` is absent.
+    /// Only meaningful on the base config; app-specific configs inherit from base.
+    pub trackpad: TrackpadConfig,
 }
 
 impl Config {
     pub fn new_from_file(file: &str, file_name: String) -> Self {
         let raw_config = RawConfig::new_from_file(file);
+        let raw_trackpad = raw_config.trackpad.clone();
         let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config);
         let associations = Default::default();
+
+        // Parse [trackpad] section; fall back to legacy LPAD/RPAD settings.
+        let trackpad = TrackpadConfig {
+            left: parse_trackpad_side(
+                raw_trackpad.left.as_ref(),
+                settings.get("LPAD"),
+            ),
+            right: parse_trackpad_side(
+                raw_trackpad.right.as_ref(),
+                settings.get("RPAD"),
+            ),
+            combined_gesture_device: raw_trackpad.combined_gesture_device.unwrap_or(false),
+            gesture_kde_config: raw_trackpad.gestures.as_ref()
+                .and_then(|v| v.get("kde"))
+                .cloned()
+                .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
+            gesture_handler_config: raw_trackpad.gestures
+                .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
+        };
 
         Self {
             name: file_name,
@@ -203,6 +348,7 @@ impl Config {
             override_bindings: None,
             settings,
             mapped_modifiers,
+            trackpad,
         }
     }
 
@@ -214,6 +360,7 @@ impl Config {
             override_bindings: None,
             settings: Default::default(),
             mapped_modifiers: Default::default(),
+            trackpad: Default::default(),
         }
     }
 
@@ -287,6 +434,13 @@ impl Config {
         }
         for (key, value) in &base.settings {
             self.settings.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        // Trackpad config is device-level; always inherit from base for app configs.
+        // App-specific configs should not override hardware settings.
+        if self.trackpad.left.mode == "disabled"
+            && self.trackpad.right.mode == "disabled"
+        {
+            self.trackpad = base.trackpad.clone();
         }
         self.mapped_modifiers.all.clear();
         self.mapped_modifiers.all.extend(self.mapped_modifiers.default.clone());
@@ -447,6 +601,7 @@ mod tests {
             override_bindings: None,
             settings: HashMap::new(),
             mapped_modifiers: Default::default(),
+            trackpad: Default::default(),
         }
     }
 
