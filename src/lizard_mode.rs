@@ -13,7 +13,7 @@
 /// Protocol reference: SDL `SDL_hidapi_steamdeck.c` (`DisableDeckLizardMode` /
 /// `FeedDeckLizardWatchdog`) and Linux `drivers/hid/hid-steam.c`
 /// (`steam_set_lizard_mode`).
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use tokio::time::{self, Duration};
@@ -248,8 +248,7 @@ pub async fn run_lizard_mode_suppression(cfg: LizardModeSuppression) {
         path, cfg.suppress_buttons, cfg.suppress_mouse, crate::startup_ms()
     );
 
-    let fd = file.as_raw_fd();
-    // Drop fd immediately — holding it sets client_opened=true in hid-steam,
+    // Drop file immediately — holding it sets client_opened=true in hid-steam,
     // which stops the driver from emitting any cursor/scroll events.
     // On Steam Deck (STEAM_QUIRK_DECK) closing the fd does NOT reset firmware modes.
     drop(file);

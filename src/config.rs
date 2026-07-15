@@ -123,7 +123,7 @@ fn parse_trackpad_side(raw: Option<&toml::Value>, legacy_setting: Option<&String
 /// Value for a `[remap]` entry — simple array or inline table with attributes.
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(untagged)]
-enum RemapValue {
+pub(crate) enum RemapValue {
     Simple(Vec<Key>),
     WithAttrs { keys: Vec<Key>, #[serde(default)] no_pause: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool },
 }
@@ -131,7 +131,7 @@ enum RemapValue {
 /// Value for a `[commands]` entry — simple array or inline table with attributes.
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(untagged)]
-enum CommandValue {
+pub(crate) enum CommandValue {
     Simple(Vec<String>),
     WithAttrs { run: Vec<String>, #[serde(default)] no_pause: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool },
 }

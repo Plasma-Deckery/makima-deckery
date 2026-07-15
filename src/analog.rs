@@ -41,14 +41,6 @@ pub fn normalize_dz(raw: i32) -> f32 {
     r3((raw * 200) as f32 / AXIS_SCALE)
 }
 
-/// True when a trackpad has a finger on it.
-///
-/// `hid-steam` reports (0, 0) when no finger is present; any non-zero
-/// position means a finger is touching the pad.
-#[inline]
-pub fn is_touching(x: i32, y: i32) -> bool {
-    x != 0 || y != 0
-}
 
 /// True when the stick position exceeds the deadzone on either axis.
 ///
