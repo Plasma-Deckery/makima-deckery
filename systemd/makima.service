@@ -1,6 +1,7 @@
 [Unit]
 Description=Deckery input remapper
-After=plasma-core.target
+After=deckery-tray.service
+BindsTo=deckery-tray.service
 
 [Service]
 ExecStart=%h/.local/bin/makima-deckery
@@ -14,4 +15,4 @@ Environment=XDG_CURRENT_DESKTOP=KDE
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 
 [Install]
-WantedBy=plasma-core.target
+WantedBy=deckery-tray.service
