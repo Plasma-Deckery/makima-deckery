@@ -76,6 +76,7 @@ pub struct EventReader {
     modifiers: Arc<Mutex<Vec<Event>>>,
     modifier_was_activated: Arc<Mutex<bool>>,
     paused: Arc<Mutex<bool>>,
+    gaming_mode: Arc<Mutex<bool>>,
     last_action: Arc<Mutex<Option<LastAction>>>,
     held_keys: Arc<Mutex<Vec<Event>>>,
     /// Maps each currently held physical button to the output keys it last emitted.
@@ -130,6 +131,7 @@ impl EventReader {
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
         let active_layout: Arc<Mutex<u16>> = Arc::new(Mutex::new(0));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let gaming_mode: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -404,6 +406,7 @@ impl EventReader {
             modifiers,
             modifier_was_activated,
             paused,
+            gaming_mode,
             last_action,
             held_keys,
             emitted_outputs,
@@ -438,7 +441,7 @@ impl EventReader {
             self.key_scroll_loop(),
             self.window_changed_loop(),
             self.state_write_loop(state_rx),
-            session.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx),
+            session.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()),
         );
     }
 
@@ -1285,7 +1288,7 @@ impl EventReader {
         // ───────────────────────────────────────────────────────────────────────
 
         match resolve_binding(&config.bindings, event, &modifiers, self.settings.chain_only) {
-            ResolvedBinding::Keys { keys, label, no_pause, silent, is_combo, is_fallback } => {
+            ResolvedBinding::Keys { keys, label, no_pause, while_gaming: _, silent, is_combo, is_fallback } => {
                 // release_keys: release held modifier output keys before emitting.
                 //   true  → base binding with no modifiers held (normal press)
                 //   false → combo or fallback; modifier keys must stay held
@@ -1309,7 +1312,7 @@ impl EventReader {
                 self.emit_event(&keys, value, &modifiers, &config, false, false, false).await;
                 return;
             }
-            ResolvedBinding::Command { commands, label, no_pause, silent, .. } => {
+            ResolvedBinding::Command { commands, label, no_pause, while_gaming: _, silent, .. } => {
                 if value == 1 {
                     self.set_last_emitted_cmd(&event, &commands, label, silent).await;
                     if !paused || no_pause {
@@ -1458,6 +1461,23 @@ impl EventReader {
                 // so the HUD can display combo overlays while open.
                 // For non-modifier buttons, just write state to reflect active_buttons.
                 if config.mapped_modifiers.all.contains(&event) {
+                    self.toggle_modifiers(event, value, config).await;
+                } else {
+                    self.write_state().await;
+                }
+                return;
+            }
+        }
+        if *self.gaming_mode.lock().await {
+            // Check whether this binding has while_gaming = true.
+            // If so, fall through to normal processing so it executes in Gaming Mode.
+            // Key-up events (value=0) always fall through to flush held_keys / emitted_outputs.
+            let current_mods = self.modifiers.lock().await.clone();
+            let is_while_gaming = config.bindings.while_gaming.contains(&(event, current_mods.clone()))
+                || config.bindings.while_gaming.contains(&(event, vec![]));
+            if gaming_mode_suppresses(value, is_while_gaming) {
+                // Still track modifier buttons so combos remain consistent.
+                if gaming_mode_tracks_modifier(&event, &config.mapped_modifiers.all) {
                     self.toggle_modifiers(event, value, config).await;
                 } else {
                     self.write_state().await;
@@ -1750,6 +1770,13 @@ impl EventReader {
                 return;
             }
         };
+        let gaming_mode = match tokio::time::timeout(TIMEOUT, self.gaming_mode.lock()).await {
+            Ok(guard) => *guard,
+            Err(_) => {
+                eprintln!("makima: write_state: gaming_mode lock timed out — possible deadlock");
+                return;
+            }
+        };
         let last_action = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
@@ -1869,7 +1896,7 @@ impl EventReader {
             "x": crate::analog::normalize(imu_raw.0),
             "y": crate::analog::normalize(imu_raw.1),
         });
-        crate::state_export::write_state(&config, &modifiers, layout, paused, &held_keys, &last_action, &config_stack, trackpads, sticks, imu, analog_state_export).await;
+        crate::state_export::write_state(&config, &modifiers, layout, paused, gaming_mode, &held_keys, &last_action, &config_stack, trackpads, sticks, imu, analog_state_export).await;
     }
 
     /// Record the actual emitted key output for the HUD last-event display.
@@ -1916,6 +1943,7 @@ impl EventReader {
 
     async fn start_control_socket(&self) {
         let paused          = self.paused.clone();
+        let gaming_mode_ipc = self.gaming_mode.clone();
         let last_action     = self.last_action.clone();
         let current_config  = self.current_config.clone();
         let modifiers       = self.modifiers.clone();
@@ -1934,6 +1962,7 @@ impl EventReader {
             };
             while let Ok((stream, _addr)) = listener.accept().await {
                 let paused          = paused.clone();
+                let gaming_mode_ipc = gaming_mode_ipc.clone();
                 let last_action     = last_action.clone();
                 let current_config  = current_config.clone();
                 let modifiers       = modifiers.clone();
@@ -1947,11 +1976,16 @@ impl EventReader {
                     if reader.read_line(&mut line).is_ok() {
                         let cmd = line.trim();
                         match cmd {
-                            "pause" | "resume" => {
-                                let is_paused = cmd == "pause";
-                                *paused.lock().await = is_paused;
+                            "pause" | "resume" | "gaming_mode enable" | "gaming_mode disable" => {
+                                if cmd == "pause" || cmd == "resume" {
+                                    *paused.lock().await = cmd == "pause";
+                                } else {
+                                    *gaming_mode_ipc.lock().await = cmd == "gaming_mode enable";
+                                }
                                 // Write state immediately so the HUD sees the updated
-                                // paused flag without waiting for the next button event.
+                                // flag without waiting for the next button event.
+                                let is_paused   = *paused.lock().await;
+                                let is_gaming   = *gaming_mode_ipc.lock().await;
                                 const TIMEOUT: std::time::Duration =
                                     std::time::Duration::from_millis(200);
                                 let config = match tokio::time::timeout(
@@ -1989,7 +2023,7 @@ impl EventReader {
                                     vec![base_name, app_part]
                                 };
                                 crate::state_export::write_state(
-                                    &config, &mods, layout, is_paused, &hk, &la, &stack,
+                                    &config, &mods, layout, is_paused, is_gaming, &hk, &la, &stack,
                                     serde_json::Value::Null,
                                     serde_json::Value::Null,
                                     serde_json::Value::Null,
@@ -2037,7 +2071,7 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            if !*self.paused.lock().await || self.settings.cursor_when_paused {
+                            if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
                                 let (x_coord, y_coord) = if self.settings.invert_cursor_axis {
                                     (-stick_position[0], -stick_position[1])
                                 } else {
@@ -2091,7 +2125,7 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            if !*self.paused.lock().await || self.settings.cursor_when_paused {
+                            if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
                                 let (x_coord, y_coord) = if self.settings.invert_scroll_axis {
                                     (-stick_position[0], -stick_position[1])
                                 } else {
@@ -2139,7 +2173,7 @@ impl EventReader {
                     if current_speed > speed as f32 {
                         current_speed = speed as f32
                     }
-                    if !*self.paused.lock().await || self.settings.cursor_when_paused {
+                    if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
                         if cursor_movement.0 != 0 {
                             let mut virt_dev = self.virt_dev.lock().await;
                             let virtual_event_x: InputEvent = InputEvent::new_now(
@@ -2189,7 +2223,7 @@ impl EventReader {
                     if current_speed > speed as f32 {
                         current_speed = speed as f32
                     }
-                    if !*self.paused.lock().await || self.settings.cursor_when_paused {
+                    if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
                         let mut virt_dev = self.virt_dev.lock().await;
                         if scroll_movement.0 != 0 {
                             let virtual_event_x: InputEvent = InputEvent::new_now(
@@ -2215,6 +2249,47 @@ impl EventReader {
     }
 }
 
+// ── Pure guard helpers ────────────────────────────────────────────────────────
+//
+// These three predicates encode the key Gaming Mode invariants. Extracted from
+// the method bodies so they can be unit-tested in isolation without needing a
+// full EventReader — the caller logic in convert_event and the stick loops uses
+// these directly.
+
+/// Returns true if this event should be **suppressed** by the Gaming Mode guard.
+///
+/// Key-up events (`value == 0`) always return `false` — they must pass through
+/// the guard so `held_keys`/`emitted_outputs` are flushed and no keys remain
+/// stuck after Gaming Mode is enabled mid-hold.
+/// Bindings with `while_gaming = true` are also not suppressed (`is_while_gaming` true).
+#[inline]
+pub(crate) fn gaming_mode_suppresses(value: i32, is_while_gaming: bool) -> bool {
+    !is_while_gaming && value != 0
+}
+
+/// Returns true if a button pressed in Gaming Mode should still be **tracked as
+/// a modifier** (via `toggle_modifiers`) rather than silently dropped.
+///
+/// Modifier buttons (BTN_TL, BTN_MODE, …) are tracked even while Gaming Mode is
+/// active so that internal combo state remains consistent: if Gaming Mode is
+/// disabled mid-hold, the resolver immediately sees the correct modifier set
+/// without waiting for the user to re-press the modifier.
+#[inline]
+pub(crate) fn gaming_mode_tracks_modifier(event: &Event, mapped_modifiers: &[Event]) -> bool {
+    mapped_modifiers.contains(event)
+}
+
+/// Returns true if the stick cursor/scroll loop should emit movement events this
+/// tick.
+///
+/// Movement is suppressed when makima is paused (unless `cursor_when_paused`
+/// overrides this) **and** when Gaming Mode is active — in Gaming Mode the
+/// game reads the stick directly via Steam Input and makima must not
+/// simultaneously drive the desktop cursor.
+#[inline]
+pub(crate) fn stick_loop_active(paused: bool, cursor_when_paused: bool, gaming_mode: bool) -> bool {
+    (!paused || cursor_when_paused) && !gaming_mode
+}
 
 #[cfg(test)]
 mod tests {
@@ -2341,5 +2416,110 @@ mod tests {
             assert_eq!(released, Some(vec![Key::KEY_BACKSPACE]));
             assert!(eo.is_empty());
         }
+    }
+
+    // ── gaming_mode_suppresses ────────────────────────────────────────────────
+
+    /// Key-up (value=0) must NEVER be suppressed regardless of while_gaming.
+    /// Without this, releasing a held button in Gaming Mode leaves it stuck.
+    #[test]
+    fn key_up_never_suppressed() {
+        assert!(!gaming_mode_suppresses(0, false),
+            "key-up without while_gaming must not be suppressed");
+        assert!(!gaming_mode_suppresses(0, true),
+            "key-up with while_gaming must not be suppressed either");
+    }
+
+    /// Key-down of a normal (non-while_gaming) binding must be suppressed.
+    #[test]
+    fn key_down_suppressed_without_while_gaming() {
+        assert!(gaming_mode_suppresses(1, false),
+            "key-down without while_gaming must be suppressed");
+    }
+
+    /// Key-repeat (value=2) of a normal binding must also be suppressed.
+    #[test]
+    fn key_repeat_suppressed_without_while_gaming() {
+        assert!(gaming_mode_suppresses(2, false),
+            "key-repeat without while_gaming must be suppressed");
+    }
+
+    /// while_gaming bindings must pass through on both press and repeat.
+    #[test]
+    fn while_gaming_binding_not_suppressed() {
+        assert!(!gaming_mode_suppresses(1, true),
+            "key-down with while_gaming=true must NOT be suppressed");
+        assert!(!gaming_mode_suppresses(2, true),
+            "key-repeat with while_gaming=true must NOT be suppressed");
+    }
+
+    // ── gaming_mode_tracks_modifier ───────────────────────────────────────────
+
+    /// A mapped modifier (e.g. BTN_TL) must be tracked even in Gaming Mode
+    /// so combo state is consistent when Gaming Mode is disabled mid-hold.
+    #[test]
+    fn modifier_event_is_tracked_in_gaming_mode() {
+        let btn_tl = Event::Key(Key::BTN_TL);
+        let mapped = vec![btn_tl, Event::Key(Key::BTN_TR)];
+        assert!(gaming_mode_tracks_modifier(&btn_tl, &mapped),
+            "BTN_TL in mapped_modifiers must return true");
+    }
+
+    /// A non-modifier button must NOT be tracked as a modifier.
+    #[test]
+    fn non_modifier_event_not_tracked_in_gaming_mode() {
+        let btn_south = Event::Key(Key::BTN_SOUTH);
+        let mapped = vec![Event::Key(Key::BTN_TL), Event::Key(Key::BTN_TR)];
+        assert!(!gaming_mode_tracks_modifier(&btn_south, &mapped),
+            "BTN_SOUTH not in mapped_modifiers must return false");
+    }
+
+    /// Empty mapped_modifiers list → nothing is ever tracked.
+    #[test]
+    fn no_mapped_modifiers_nothing_tracked() {
+        let btn_tl = Event::Key(Key::BTN_TL);
+        assert!(!gaming_mode_tracks_modifier(&btn_tl, &[]),
+            "empty mapped_modifiers must never match");
+    }
+
+    // ── stick_loop_active ─────────────────────────────────────────────────────
+
+    /// Normal operating state — not paused, not gaming: stick loop runs.
+    #[test]
+    fn stick_loop_active_normally() {
+        assert!(stick_loop_active(false, false, false));
+    }
+
+    /// Gaming Mode active → stick loop must be suppressed.
+    #[test]
+    fn stick_loop_suppressed_in_gaming_mode() {
+        assert!(!stick_loop_active(false, false, true),
+            "gaming_mode=true must suppress stick loop");
+        // Even cursor_when_paused cannot override gaming_mode suppression.
+        assert!(!stick_loop_active(false, true, true),
+            "cursor_when_paused does not override gaming_mode");
+    }
+
+    /// Paused without cursor_when_paused → stick loop suppressed.
+    #[test]
+    fn stick_loop_suppressed_when_paused() {
+        assert!(!stick_loop_active(true, false, false),
+            "paused=true without cursor_when_paused must suppress stick loop");
+    }
+
+    /// cursor_when_paused restores stick loop while paused, but not in Gaming Mode.
+    #[test]
+    fn stick_loop_cursor_when_paused_overrides_pause_but_not_gaming_mode() {
+        assert!(stick_loop_active(true, true, false),
+            "cursor_when_paused must allow stick loop while paused");
+        assert!(!stick_loop_active(true, true, true),
+            "cursor_when_paused must NOT allow stick loop in Gaming Mode");
+    }
+
+    /// Both paused and gaming_mode — stick loop suppressed.
+    #[test]
+    fn stick_loop_suppressed_when_both_paused_and_gaming_mode() {
+        assert!(!stick_loop_active(true, false, true));
+        assert!(!stick_loop_active(true, true, true));
     }
 }

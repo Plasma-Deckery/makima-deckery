@@ -56,6 +56,13 @@ pub fn is_active(x: f32, y: f32, dz: f32) -> bool {
 mod tests {
     use super::*;
 
+    /// Returns true if either coordinate is non-zero (i.e. the pad is being touched).
+    /// Used only in tests — mirrors the semantics of the old `is_touching` check
+    /// before it was folded into the hidraw frame parsing.
+    fn is_touching(x: i32, y: i32) -> bool {
+        x != 0 || y != 0
+    }
+
     // --- r3 ---
 
     #[test]

@@ -21,6 +21,9 @@ pub enum ResolvedBinding {
         keys: Vec<Key>,
         label: Option<String>,
         no_pause: bool,
+        /// True if `while_gaming = true` was set — this binding fires even when
+        /// Gaming Mode is active (all other key-press events are suppressed).
+        while_gaming: bool,
         silent: bool,
         /// true when the match was an explicit combo (non-empty modifier set)
         is_combo: bool,
@@ -33,6 +36,9 @@ pub enum ResolvedBinding {
         commands: Vec<String>,
         label: Option<String>,
         no_pause: bool,
+        /// True if `while_gaming = true` was set — this binding fires even when
+        /// Gaming Mode is active (all other key-press events are suppressed).
+        while_gaming: bool,
         silent: bool,
         is_combo: bool,
     },
@@ -67,6 +73,8 @@ pub fn resolve_binding(
         if let Some(keys) = remap_map.get(&mods) {
             let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
                 || bindings.no_pause.contains(&(event, vec![]));
+            let while_gaming = bindings.while_gaming.contains(&(event, mods.clone()))
+                || bindings.while_gaming.contains(&(event, vec![]));
             let silent = bindings.silent.contains(&(event, mods.clone()))
                 || bindings.silent.contains(&(event, vec![]));
             let label = bindings.labels.get(&(event, mods.clone())).cloned();
@@ -74,6 +82,7 @@ pub fn resolve_binding(
                 keys: keys.clone(),
                 label,
                 no_pause,
+                while_gaming,
                 silent,
                 is_combo: !mods.is_empty(),
                 is_fallback: false,
@@ -95,6 +104,8 @@ pub fn resolve_binding(
             if let Some(commands) = cmd_map.get(&mods) {
                 let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
                     || bindings.no_pause.contains(&(event, vec![]));
+                let while_gaming = bindings.while_gaming.contains(&(event, mods.clone()))
+                    || bindings.while_gaming.contains(&(event, vec![]));
                 let silent = bindings.silent.contains(&(event, mods.clone()))
                     || bindings.silent.contains(&(event, vec![]));
                 let label = bindings.labels.get(&(event, mods.clone())).cloned();
@@ -102,6 +113,7 @@ pub fn resolve_binding(
                     commands: commands.clone(),
                     label,
                     no_pause,
+                    while_gaming,
                     silent,
                     is_combo: !mods.is_empty(),
                 };
@@ -123,12 +135,14 @@ pub fn resolve_binding(
         //    is responsible for keeping them held (e.g. Ctrl+Enter).
         if let Some(keys) = remap_map.get(&vec![]) {
             let no_pause = bindings.no_pause.contains(&(event, vec![]));
+            let while_gaming = bindings.while_gaming.contains(&(event, vec![]));
             let silent = bindings.silent.contains(&(event, vec![]));
             let label = bindings.labels.get(&(event, vec![])).cloned();
             return ResolvedBinding::Keys {
                 keys: keys.clone(),
                 label,
                 no_pause,
+                while_gaming,
                 silent,
                 is_combo: false,
                 is_fallback: !mods.is_empty(),
@@ -141,6 +155,8 @@ pub fn resolve_binding(
         if let Some(commands) = cmd_map.get(&mods) {
             let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
                 || bindings.no_pause.contains(&(event, vec![]));
+            let while_gaming = bindings.while_gaming.contains(&(event, mods.clone()))
+                || bindings.while_gaming.contains(&(event, vec![]));
             let silent = bindings.silent.contains(&(event, mods.clone()))
                 || bindings.silent.contains(&(event, vec![]));
             let label = bindings.labels.get(&(event, mods.clone())).cloned();
@@ -148,6 +164,7 @@ pub fn resolve_binding(
                 commands: commands.clone(),
                 label,
                 no_pause,
+                while_gaming,
                 silent,
                 is_combo: !mods.is_empty(),
             };
@@ -199,6 +216,7 @@ mod tests {
             commands: cmd_map,
             movements: HashMap::new(),
             no_pause: no_pause.into_iter().collect::<HashSet<_>>(),
+            while_gaming: HashSet::new(),
             labels: labels.into_iter().collect(),
             silent: HashSet::new(),
         }
@@ -218,6 +236,7 @@ mod tests {
             keys: vec![Key::KEY_ENTER],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: false,
             is_combo: false,
             is_fallback: false,
@@ -239,6 +258,7 @@ mod tests {
             keys: vec![Key::KEY_LEFTCTRL, Key::KEY_C],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: false,
             is_combo: true,
             is_fallback: false,
@@ -263,6 +283,7 @@ mod tests {
             keys: vec![Key::KEY_ENTER],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: false,
             is_combo: false,
             is_fallback: true,
@@ -287,6 +308,7 @@ mod tests {
             keys: vec![Key::KEY_LEFTCTRL, Key::KEY_C],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: false,
             is_combo: true,
             is_fallback: false,
@@ -324,6 +346,92 @@ mod tests {
         match result {
             ResolvedBinding::Command { no_pause, .. } => assert!(no_pause),
             _ => panic!("expected Command"),
+        }
+    }
+
+    // ── while_gaming ──────────────────────────────────────────────────────────
+
+    /// A remap with `while_gaming` in bindings.while_gaming must report
+    /// `while_gaming: true` in the resolved binding.
+    #[test]
+    fn while_gaming_remap_flagged() {
+        let btn_south = key_event(Key::BTN_SOUTH);
+        let mut bindings = make_bindings(
+            vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
+            vec![], vec![], vec![],
+        );
+        bindings.while_gaming.insert((btn_south, vec![]));
+        let result = resolve_binding(&bindings, btn_south, &[], false);
+        match result {
+            ResolvedBinding::Keys { while_gaming, .. } => {
+                assert!(while_gaming, "while_gaming must be true for a flagged remap")
+            }
+            _ => panic!("expected Keys"),
+        }
+    }
+
+    /// A remap *without* `while_gaming` must report `while_gaming: false`.
+    #[test]
+    fn while_gaming_remap_not_flagged() {
+        let btn_south = key_event(Key::BTN_SOUTH);
+        let bindings = make_bindings(
+            vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
+            vec![], vec![], vec![],
+        );
+        let result = resolve_binding(&bindings, btn_south, &[], false);
+        match result {
+            ResolvedBinding::Keys { while_gaming, .. } => {
+                assert!(!while_gaming, "while_gaming must be false for a non-flagged remap")
+            }
+            _ => panic!("expected Keys"),
+        }
+    }
+
+    /// A command with `while_gaming` in bindings.while_gaming must report
+    /// `while_gaming: true` in the resolved binding.
+    #[test]
+    fn while_gaming_command_flagged() {
+        let btn_thumbl = key_event(Key::BTN_THUMBL);
+        let mut bindings = make_bindings(
+            vec![],
+            vec![(btn_thumbl, vec![], vec!["deckery-hud-toggle".to_string()])],
+            vec![], vec![],
+        );
+        bindings.while_gaming.insert((btn_thumbl, vec![]));
+        let result = resolve_binding(&bindings, btn_thumbl, &[], false);
+        match result {
+            ResolvedBinding::Command { while_gaming, .. } => {
+                assert!(while_gaming, "while_gaming must be true for a flagged command")
+            }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    /// A combo binding with `while_gaming` on the base (no-modifier) entry must
+    /// still be flagged when resolved with modifiers held, because the resolver
+    /// checks both the combo-specific entry *and* the base (no-modifier) entry.
+    #[test]
+    fn while_gaming_base_entry_applies_to_combo_match() {
+        let btn_south = key_event(Key::BTN_SOUTH);
+        let btn_tl    = key_event(Key::BTN_TL);
+        let mut bindings = make_bindings(
+            vec![
+                (btn_south, vec![],         vec![Key::KEY_ENTER]),
+                (btn_south, vec![btn_tl],   vec![Key::KEY_SPACE]),
+            ],
+            vec![], vec![], vec![],
+        );
+        // Flag the base (no-modifier) entry — the resolver's while_gaming
+        // check uses `contains(_, vec![])` as a fallback, so the combo
+        // resolution must also pick this up.
+        bindings.while_gaming.insert((btn_south, vec![]));
+        let result = resolve_binding(&bindings, btn_south, &[btn_tl], false);
+        match result {
+            ResolvedBinding::Keys { while_gaming, is_combo, .. } => {
+                assert!(is_combo, "should be resolved as combo");
+                assert!(while_gaming, "while_gaming fallback from base entry must apply to combo");
+            }
+            _ => panic!("expected Keys"),
         }
     }
 
@@ -389,6 +497,7 @@ mod tests {
             keys: vec![Key::KEY_UP],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: false,
             is_combo: true,
             is_fallback: false,
@@ -447,6 +556,7 @@ mod tests {
             commands: HashMap::new(),
             movements,
             no_pause: std::collections::HashSet::new(),
+            while_gaming: std::collections::HashSet::new(),
             labels: HashMap::new(),
             silent: std::collections::HashSet::new(),
         };
@@ -467,6 +577,7 @@ mod tests {
             commands: HashMap::new(),
             movements,
             no_pause: std::collections::HashSet::new(),
+            while_gaming: std::collections::HashSet::new(),
             labels: HashMap::new(),
             silent: std::collections::HashSet::new(),
         };
@@ -490,6 +601,7 @@ mod tests {
             commands: vec!["hud-toggle".to_string()],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: false,
             is_combo: false,
         });
@@ -514,6 +626,7 @@ mod tests {
             commands: vec!["previous-desktop".to_string()],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: false,
             is_combo: true,
         });
@@ -535,6 +648,7 @@ mod tests {
             commands: vec!["hud-toggle".to_string()],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: true,
             is_combo: false,
         });
@@ -553,6 +667,7 @@ mod tests {
             commands: vec!["hud-toggle".to_string()],
             label: None,
             no_pause: false,
+            while_gaming: false,
             silent: false,
             is_combo: false,
         });

@@ -67,11 +67,16 @@ fn modifier_sort_key(key: &str) -> (u8, String) {
 ///
 /// Pure and side-effect-free — no I/O. Extracted from write_state so it can
 /// be called from unit tests without touching the filesystem.
+///
+/// `paused` — whether makima is currently in paused mode (all remaps suppressed).
+/// `gaming_mode` — whether makima is in Gaming Mode (remaps + trackpad routing
+/// suppressed so games can use the controller directly via Steam Input).
 pub fn build_state(
     config: &Config,
     modifiers: &[Event],
     layout: u16,
     paused: bool,
+    gaming_mode: bool,
     held_keys: &[Event],
     last_action: &Option<LastAction>,
     config_stack: &[String],
@@ -365,6 +370,7 @@ pub fn build_state(
             "config_stack": config_stack,
             "layout": layout,
             "paused": paused,
+            "gaming_mode": gaming_mode,
             "held_modifiers": held_modifiers,
             "active_buttons": active_buttons,
             "active_outputs": active_outputs,
@@ -383,6 +389,7 @@ pub async fn write_state(
     modifiers: &[Event],
     layout: u16,
     paused: bool,
+    gaming_mode: bool,
     held_keys: &[Event],
     last_action: &Option<LastAction>,
     config_stack: &[String],
@@ -391,7 +398,7 @@ pub async fn write_state(
     imu: serde_json::Value,
     analog_state_export: bool,
 ) {
-    let mut state = build_state(config, modifiers, layout, paused, held_keys, last_action, config_stack);
+    let mut state = build_state(config, modifiers, layout, paused, gaming_mode, held_keys, last_action, config_stack);
     state["trackpads"] = trackpads;
     state["sticks"] = sticks;
     state["imu"] = imu;
@@ -444,6 +451,7 @@ mod tests {
                 commands: cmd_map,
                 movements: HashMap::new(),
                 no_pause: HashSet::new(),
+                while_gaming: HashSet::new(),
                 labels: HashMap::new(),
                 silent: HashSet::new(),
             },
@@ -512,7 +520,7 @@ mod tests {
             vec![(key(Key::BTN_SOUTH), vec![], vec![Key::KEY_ENTER])],
             vec![], vec![],
         );
-        let state = build_state(&config, &[], 0, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()]);
+        let state = build_state(&config, &[], 0, false, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()]);
         assert_eq!(active_outputs(&state), vec!["KEY_ENTER"]);
     }
 
@@ -526,7 +534,7 @@ mod tests {
             vec![], vec![btn_tl],
         );
         // modifiers = [BTN_TL], held_keys = [BTN_NORTH]
-        let state = build_state(&config, &[btn_tl], 0, false, &[btn_north], &None, &["test".to_string()]);
+        let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_north], &None, &["test".to_string()]);
         // KEY_LEFTCTRL sorts before KEY_C
         assert_eq!(active_outputs(&state), vec!["KEY_LEFTCTRL", "KEY_C"]);
     }
@@ -541,7 +549,7 @@ mod tests {
             vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
             vec![], vec![btn_tl],
         );
-        let state = build_state(&config, &[btn_tl], 0, false, &[btn_south], &None, &["test".to_string()]);
+        let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_south], &None, &["test".to_string()]);
         assert_eq!(active_outputs(&state), vec!["KEY_ENTER"]);
     }
 
@@ -556,14 +564,14 @@ mod tests {
             vec![(btn_dpad_up, vec![btn_tl], vec!["previous-desktop".to_string()])],
             vec![btn_tl],
         );
-        let state = build_state(&config, &[btn_tl], 0, false, &[btn_dpad_up], &None, &["test".to_string()]);
+        let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_dpad_up], &None, &["test".to_string()]);
         assert_eq!(active_outputs(&state), Vec::<String>::new());
     }
 
     #[test]
     fn active_outputs_unbound_is_empty() {
         let config = make_config(vec![], vec![], vec![]);
-        let state = build_state(&config, &[], 0, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()]);
+        let state = build_state(&config, &[], 0, false, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()]);
         assert_eq!(active_outputs(&state), Vec::<String>::new());
     }
 
@@ -582,7 +590,7 @@ mod tests {
             ],
             vec![], vec![btn_tl, btn_tr],
         );
-        let state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
         let mut avail = available_modifiers(&state);
         avail.sort();
         assert!(avail.contains(&"BTN_TL".to_string()));
@@ -606,7 +614,7 @@ mod tests {
         );
         // BTN_TL is active_input_mod → filtered out of available_modifiers.
         // BTN_TR qualifies because BTN_TL-BTN_TR-BTN_SOUTH exists and BTN_TL ⊆ that combo.
-        let state = build_state(&config, &[btn_tl], 0, false, &[], &None, &["test".to_string()]);
+        let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()]);
         let avail = available_modifiers(&state);
         assert!(!avail.contains(&"BTN_TL".to_string()), "BTN_TL is already active");
         assert!(avail.contains(&"BTN_TR".to_string()), "BTN_TR unlocks a BTN_TL+BTN_TR combo");
@@ -628,7 +636,7 @@ mod tests {
             ],
             vec![], vec![btn_tl, btn_tr],
         );
-        let state = build_state(&config, &[btn_tl], 0, false, &[], &None, &["test".to_string()]);
+        let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()]);
         let keys = modifier_active_keys(&state);
         assert!(keys.contains(&"BTN_NORTH".to_string()), "BTN_TL-BTN_NORTH should appear");
         assert!(!keys.contains(&"BTN_SOUTH".to_string()), "BTN_TL-BTN_TR-BTN_SOUTH must not leak in");
@@ -644,7 +652,7 @@ mod tests {
             vec![(btn_dpad_up, vec![btn_tl], vec!["previous-desktop".to_string()])],
             vec![btn_tl],
         );
-        let state = build_state(&config, &[btn_tl], 0, false, &[], &None, &["test".to_string()]);
+        let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()]);
         let keys = modifier_active_keys(&state);
         assert!(keys.contains(&"BTN_DPAD_UP".to_string()));
         assert_eq!(
@@ -663,7 +671,7 @@ mod tests {
             vec![], vec![btn_tl],
         );
         config.bindings.labels.insert((btn_north, vec![btn_tl]), "Copy".to_string());
-        let state = build_state(&config, &[btn_tl], 0, false, &[], &None, &["test".to_string()]);
+        let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()]);
         assert_eq!(
             state["modifier_active"]["BTN_NORTH"]["label"].as_str().unwrap(),
             "Copy"
@@ -682,7 +690,7 @@ mod tests {
             vec![], vec![],
         );
         config.bindings.silent.insert((btn_south, vec![]));
-        let state = build_state(&config, &[], 0, false, &[btn_south], &None, &["test".to_string()]);
+        let state = build_state(&config, &[], 0, false, false, &[btn_south], &None, &["test".to_string()]);
         let tagged = active_outputs_tagged(&state);
         assert_eq!(tagged, vec![("BTN_LEFT".to_string(), true)],
             "silent binding must appear in active_outputs with silent=true");
@@ -699,7 +707,7 @@ mod tests {
             vec![], vec![btn_tl],
         );
         config.bindings.silent.insert((btn_south, vec![btn_tl]));
-        let state = build_state(&config, &[btn_tl], 0, false, &[btn_south], &None, &["test".to_string()]);
+        let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_south], &None, &["test".to_string()]);
         let tagged = active_outputs_tagged(&state);
         assert_eq!(tagged, vec![("BTN_LEFT".to_string(), true)],
             "silent combo must appear in active_outputs with silent=true");
@@ -713,7 +721,7 @@ mod tests {
             vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
             vec![], vec![],
         );
-        let state = build_state(&config, &[], 0, false, &[btn_south], &None, &["test".to_string()]);
+        let state = build_state(&config, &[], 0, false, false, &[btn_south], &None, &["test".to_string()]);
         let tagged = active_outputs_tagged(&state);
         assert_eq!(tagged, vec![("KEY_ENTER".to_string(), false)]);
     }
@@ -727,7 +735,7 @@ mod tests {
             vec![], vec![],
         );
         config.bindings.silent.insert((btn_south, vec![]));
-        let state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
         assert_eq!(
             state["bindings"]["BTN_SOUTH"]["silent"].as_bool().unwrap(),
             true,
@@ -743,7 +751,7 @@ mod tests {
             vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
             vec![], vec![],
         );
-        let state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
         assert_eq!(
             state["bindings"]["BTN_SOUTH"]["silent"].as_bool().unwrap(),
             false
@@ -762,7 +770,7 @@ mod tests {
             vec![],
         );
         config.bindings.no_pause.insert((btn_thumbl, vec![]));
-        let state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
         assert_eq!(
             state["bindings"]["BTN_THUMBL"]["no_pause"].as_bool().unwrap(),
             true
@@ -784,7 +792,7 @@ mod tests {
         let state = build_state(
             &config,
             &[btn_tl],
-            0, false,
+            0, false, false,
             &[btn_tl, btn_south],
             &None,
             &["test".to_string()],
@@ -819,7 +827,7 @@ mod tests {
         // Sort the modifier combo the same way resolve_binding expects it.
         let mut mods = vec![btn_tl, btn_tr];
         mods.sort();
-        let state = build_state(&config, &mods, 0, false, &[btn_dpad_up], &None, &["test".to_string()]);
+        let state = build_state(&config, &mods, 0, false, false, &[btn_dpad_up], &None, &["test".to_string()]);
         assert_eq!(active_outputs(&state), vec!["KEY_F1"]);
     }
 
@@ -843,7 +851,7 @@ mod tests {
         let state = build_state(
             &config,
             &[Event::Key(Key::KEY_LEFTCTRL)],
-            0, false, &[], &None, &["test".to_string()],
+            0, false, false, &[], &None, &["test".to_string()],
         );
         // BTN_TL should be detected as active → modifier_active shows BTN_TL-BTN_NORTH combo
         let keys = modifier_active_keys(&state);
@@ -911,7 +919,7 @@ mod tests {
         app.merge_base(&base);
 
         let state = build_state(
-            &app, &[btn_tl], 0, false, &[], &None,
+            &app, &[btn_tl], 0, false, false, &[], &None,
             &["Steam Deck".to_string(), "firefox".to_string()],
         );
 
@@ -973,7 +981,7 @@ mod tests {
         app.merge_base(&base);
 
         let state = build_state(
-            &app, &[btn_tl], 0, false, &[], &None,
+            &app, &[btn_tl], 0, false, false, &[], &None,
             &["Steam Deck".to_string(), "firefox".to_string()],
         );
 
@@ -1030,7 +1038,7 @@ mod tests {
         app.merge_base(&base);
 
         let state = build_state(
-            &app, &[btn_tl], 0, false, &[], &None,
+            &app, &[btn_tl], 0, false, false, &[], &None,
             &["Steam Deck".to_string(), "firefox".to_string()],
         );
 
@@ -1075,6 +1083,7 @@ mod tests {
                 commands: HashMap::new(),
                 movements: HashMap::new(),
                 no_pause: HashSet::new(),
+                while_gaming: HashSet::new(),
                 labels: HashMap::new(),
                 silent: HashSet::new(),
             },
@@ -1083,6 +1092,7 @@ mod tests {
                 commands: HashMap::new(),
                 movements: HashMap::new(),
                 no_pause: HashSet::new(),
+                while_gaming: HashSet::new(),
                 labels: HashMap::new(),
                 silent: HashSet::new(),
             }),
@@ -1096,7 +1106,7 @@ mod tests {
         };
 
         let state = build_state(
-            &config, &[], 0, false, &[], &None,
+            &config, &[], 0, false, false, &[], &None,
             &["Steam Deck".to_string(), "firefox".to_string()],
         );
 
@@ -1128,7 +1138,7 @@ mod tests {
         analog_state_export: bool,
     ) -> serde_json::Value {
         let config = empty_config();
-        let mut state = build_state(&config, &[], 0, false, &[], &None, &["test".to_string()]);
+        let mut state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
         state["trackpads"] = trackpads;
         state["sticks"] = sticks;
         state["imu"] = imu;
@@ -1200,5 +1210,58 @@ mod tests {
         assert!(state["trackpads"].is_null());
         assert!(state["sticks"].is_null());
         assert!(state["imu"].is_null());
+    }
+
+    // ── paused / gaming_mode independence ─────────────────────────────────────
+    //
+    // The two flags are orthogonal: each can be true or false independently.
+    // These tests guard against accidental coupling in build_state (e.g. one
+    // flag leaking into the other's JSON field, or both flags sharing a single
+    // bool).
+
+    fn ctx_flags(paused: bool, gaming_mode: bool) -> (bool, bool) {
+        let config = make_config(vec![], vec![], vec![]);
+        let state = build_state(&config, &[], 0, paused, gaming_mode, &[], &None, &["test".to_string()]);
+        let p = state["context"]["paused"].as_bool().expect("paused must be bool");
+        let g = state["context"]["gaming_mode"].as_bool().expect("gaming_mode must be bool");
+        (p, g)
+    }
+
+    /// Neither flag active — both false in context.
+    #[test]
+    fn flags_both_false() {
+        assert_eq!(ctx_flags(false, false), (false, false));
+    }
+
+    /// Only paused — gaming_mode stays false.
+    #[test]
+    fn paused_only_gaming_mode_unaffected() {
+        assert_eq!(ctx_flags(true, false), (true, false));
+    }
+
+    /// Only gaming_mode — paused stays false.
+    #[test]
+    fn gaming_mode_only_paused_unaffected() {
+        assert_eq!(ctx_flags(false, true), (false, true));
+    }
+
+    /// Both active simultaneously — both appear true in context.
+    #[test]
+    fn both_flags_simultaneously() {
+        assert_eq!(ctx_flags(true, true), (true, true));
+    }
+
+    /// Clearing gaming_mode while paused leaves paused true.
+    #[test]
+    fn clear_gaming_mode_while_paused() {
+        // paused=true, gaming_mode=false (gaming_mode was cleared)
+        assert_eq!(ctx_flags(true, false), (true, false));
+    }
+
+    /// Clearing paused while gaming_mode is active leaves gaming_mode true.
+    #[test]
+    fn clear_paused_while_gaming_mode_active() {
+        // paused=false (resumed), gaming_mode=true
+        assert_eq!(ctx_flags(false, true), (false, true));
     }
 }

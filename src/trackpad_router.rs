@@ -198,6 +198,7 @@ pub async fn run(
     left_tx: Option<mpsc::Sender<SinglePadFrame>>,
     right_tx: Option<mpsc::Sender<SinglePadFrame>>,
     combined_tx: Option<mpsc::Sender<GestureEvent>>,
+    gaming_mode: Arc<Mutex<bool>>,
 ) {
     // Previous frame, to know which pad(s) actually changed and whether a
     // touch transition happened — every recv() is already a real change vs.
@@ -226,8 +227,38 @@ pub async fn run(
     let mut last_state_write = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_millis(17))
         .unwrap_or_else(std::time::Instant::now);
+    // Track whether gaming mode was active in the previous iteration so we
+    // can detect the transition and send touch-release frames exactly once.
+    let mut gaming_mode_was_active = false;
 
     while let Some(frame) = rx.recv().await {
+        // ── Gaming Mode guard ────────────────────────────────────────────────
+        let gaming_mode_active = *gaming_mode.lock().await;
+        if gaming_mode_active {
+            if !gaming_mode_was_active {
+                // Transition into gaming mode: send synthetic lift to all
+                // three virtual devices to prevent stuck-touch in the kernel.
+                gaming_mode_was_active = true;
+                // SinglePadFrame::default() = touching:false, click:false, x:0, y:0
+                // — a synthetic lift frame that clears the handler's touch state.
+                if let Some(ref tx) = left_tx {
+                    let _ = tx.send(SinglePadFrame::default()).await;
+                }
+                if let Some(ref tx) = right_tx {
+                    let _ = tx.send(SinglePadFrame::default()).await;
+                }
+                if let Some(ref tx) = combined_tx {
+                    let _ = tx.send(GestureEvent::End).await;
+                }
+                gesture_active = false;
+                suppress_left_until_lift = false;
+                suppress_right_until_lift = false;
+            }
+            // Skip forwarding while gaming mode is active.
+            continue;
+        }
+        gaming_mode_was_active = false;
+        // ── End gaming mode guard ────────────────────────────────────────────
         let delta = diff_frames(prev, frame);
         let (l_changed, r_changed, touch_transition) =
             (delta.l_changed, delta.r_changed, delta.touch_transition);
@@ -509,5 +540,118 @@ mod tests {
         assert!(!transition.entering);
         assert!(!transition.exiting);
         assert_eq!(transition.resume_survivor, None);
+    }
+
+    // ── Gaming Mode synthetic lift — async stub tests ─────────────────────────
+    //
+    // `run()` takes `Option<mpsc::Sender<…>>` for each virtual device, so we
+    // can pass real tokio channels as stubs and inspect what was sent without
+    // ever touching hardware.  The pattern: pre-load the pad_tx channel, drop
+    // it to close rx after the desired frames, then `.await` run() to
+    // completion in the same task.
+
+    use crate::trackpad::PadState;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Mutex};
+
+    /// Enabling Gaming Mode must immediately send a synthetic lift to every
+    /// virtual device so no touch gets stuck in the kernel.
+    #[tokio::test]
+    async fn gaming_mode_activation_sends_synthetic_lift_to_all_devices() {
+        let (left_tx,     mut left_rx)  = mpsc::channel::<SinglePadFrame>(8);
+        let (right_tx,    mut right_rx) = mpsc::channel::<SinglePadFrame>(8);
+        let (combined_tx, mut comb_rx)  = mpsc::channel::<GestureEvent>(8);
+        let (pad_tx,          pad_rx)   = mpsc::channel::<PadFrame>(8);
+        let (state_tx,   _state_rx)     = mpsc::channel::<StateWrite>(8);
+
+        let gaming_mode     = Arc::new(Mutex::new(true)); // already active
+        let gesture_session = Arc::new(Mutex::new(false));
+        let lpad            = PadState::new(true);
+        let rpad            = PadState::new(false);
+
+        // One frame — triggers the gaming_mode_was_active=false→true transition,
+        // which is the only transition that sends the lift events.
+        pad_tx.send(PadFrame::default()).await.unwrap();
+        drop(pad_tx); // close rx so run() exits after this one frame
+
+        run(
+            pad_rx, &lpad, &rpad, &gesture_session, state_tx,
+            Some(left_tx), Some(right_tx), Some(combined_tx), gaming_mode,
+        ).await;
+
+        assert_eq!(left_rx.try_recv().unwrap(), SinglePadFrame::default(),
+            "left pad: synthetic lift (touching=false) must be sent on Gaming Mode activation");
+        assert_eq!(right_rx.try_recv().unwrap(), SinglePadFrame::default(),
+            "right pad: synthetic lift (touching=false) must be sent on Gaming Mode activation");
+        assert_eq!(comb_rx.try_recv().unwrap(), GestureEvent::End,
+            "gesture device: GestureEvent::End must be sent on Gaming Mode activation");
+    }
+
+    /// The synthetic lift must be sent **only once** when Gaming Mode is
+    /// activated — subsequent frames while Gaming Mode stays active must not
+    /// send additional lifts (the `gaming_mode_was_active` flag guards this).
+    #[tokio::test]
+    async fn gaming_mode_lift_fires_only_once_across_multiple_frames() {
+        let (left_tx,  mut left_rx) = mpsc::channel::<SinglePadFrame>(8);
+        let (pad_tx,       pad_rx)  = mpsc::channel::<PadFrame>(8);
+        let (state_tx, _state_rx)   = mpsc::channel::<StateWrite>(8);
+
+        let gaming_mode     = Arc::new(Mutex::new(true));
+        let gesture_session = Arc::new(Mutex::new(false));
+        let lpad            = PadState::new(true);
+        let rpad            = PadState::new(false);
+
+        // Three frames while gaming_mode stays true throughout.
+        for _ in 0..3 {
+            pad_tx.send(PadFrame::default()).await.unwrap();
+        }
+        drop(pad_tx);
+
+        run(
+            pad_rx, &lpad, &rpad, &gesture_session, state_tx,
+            Some(left_tx), None, None, gaming_mode,
+        ).await;
+
+        // Exactly one lift expected (from the first frame transition).
+        assert_eq!(left_rx.try_recv().unwrap(), SinglePadFrame::default(),
+            "first frame: lift must arrive");
+        assert!(left_rx.try_recv().is_err(),
+            "frames 2 and 3 must not produce additional lifts");
+    }
+
+    /// While Gaming Mode is active, normal pad frames must NOT be forwarded
+    /// to the per-pad handler channels — the game reads them directly.
+    #[tokio::test]
+    async fn gaming_mode_suppresses_normal_pad_frames() {
+        let (left_tx,  mut left_rx) = mpsc::channel::<SinglePadFrame>(8);
+        let (pad_tx,       pad_rx)  = mpsc::channel::<PadFrame>(8);
+        let (state_tx, _state_rx)   = mpsc::channel::<StateWrite>(8);
+
+        // Start with gaming_mode already active AND gaming_mode_was_active
+        // already true — simulate steady state, not the activation transition.
+        // We do this by sending one "activation" frame first, then our test frame.
+        let gaming_mode     = Arc::new(Mutex::new(true));
+        let gesture_session = Arc::new(Mutex::new(false));
+        let lpad            = PadState::new(true);
+        let rpad            = PadState::new(false);
+
+        // Frame 1: activation (produces the synthetic lift — we'll drain it)
+        // Frame 2: steady-state gaming_mode frame with non-zero position (the
+        //          one we care about — it must NOT reach left_rx)
+        pad_tx.send(PadFrame::default()).await.unwrap();
+        pad_tx.send(PadFrame { lx: 1000, ly: 2000, ltouch: true, ..PadFrame::default() }).await.unwrap();
+        drop(pad_tx);
+
+        run(
+            pad_rx, &lpad, &rpad, &gesture_session, state_tx,
+            Some(left_tx), None, None, gaming_mode,
+        ).await;
+
+        // Drain the activation lift from frame 1.
+        let _ = left_rx.try_recv();
+
+        // Frame 2 must NOT have produced a routing event.
+        assert!(left_rx.try_recv().is_err(),
+            "pad frame during steady-state Gaming Mode must not be forwarded to the handler");
     }
 }

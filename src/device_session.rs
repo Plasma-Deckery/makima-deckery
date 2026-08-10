@@ -18,6 +18,7 @@ use crate::gesture_pad::{self, GesturePadConfig};
 use crate::kde_input_defaults::{self, GestureKdeConfig, PadKdeConfig};
 use crate::mt_trackpad::{self, HapticPulse, MovementHaptic, MtTrackpadConfig};
 use crate::pad_hidraw::{self, HapticCommand, HapticPad, PadFrame};
+use crate::trackball::{self, TrackballConfig};
 use crate::trackpad::PadState;
 use crate::trackpad_router::{self, GestureEvent, SinglePadFrame, StateWrite};
 use crate::virtual_devices::VirtualDevices;
@@ -43,6 +44,12 @@ pub struct TrackpadSession {
     right_movement_pulse: Option<MovementHaptic>,
 
     gesture_pad_config: GesturePadConfig,
+
+    // Trackball channels and configs (None when mode != "trackball").
+    lball_rx: Option<mpsc::Receiver<SinglePadFrame>>,
+    rball_rx: Option<mpsc::Receiver<SinglePadFrame>>,
+    left_trackball_config:  TrackballConfig,
+    right_trackball_config: TrackballConfig,
 }
 
 impl TrackpadSession {
@@ -79,6 +86,10 @@ impl TrackpadSession {
                 trackpad.left.mode == "mt-trackpad",
                 trackpad.right.mode == "mt-trackpad",
             );
+            vd.enable_trackballs(
+                trackpad.left.mode == "trackball",
+                trackpad.right.mode == "trackball",
+            );
             if trackpad.combined_gesture_device {
                 vd.enable_gesture_pad();
             }
@@ -101,6 +112,8 @@ impl TrackpadSession {
         // mode and click_pressure; everything else is handler-owned.
         let left_mt  = MtTrackpadConfig::from_toml_value(&trackpad.left.handler_config);
         let right_mt = MtTrackpadConfig::from_toml_value(&trackpad.right.handler_config);
+        let left_ball  = TrackballConfig::from_toml_value(&trackpad.left.handler_config);
+        let right_ball = TrackballConfig::from_toml_value(&trackpad.right.handler_config);
         let gesture_pad_config = GesturePadConfig::from_toml_value(&trackpad.gesture_handler_config);
 
         let (left_tx, left_rx) = if trackpad.left.mode == "mt-trackpad" {
@@ -121,6 +134,24 @@ impl TrackpadSession {
         } else {
             (None, None)
         };
+        let (lball_tx, lball_rx) = if trackpad.left.mode == "trackball" {
+            let (tx, rx) = mpsc::channel(64);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let (rball_tx, rball_rx) = if trackpad.right.mode == "trackball" {
+            let (tx, rx) = mpsc::channel(64);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // Merge trackball senders into the router's left/right channels.
+        // The router uses whichever of left_tx / lball_tx is Some (only one
+        // can be Some at a time since mode is exclusive).
+        let left_tx  = left_tx.or(lball_tx);
+        let right_tx = right_tx.or(rball_tx);
 
         Self {
             pad_rx,
@@ -138,6 +169,10 @@ impl TrackpadSession {
             right_release_pulse:  right_mt.release_pulse(),
             right_movement_pulse: right_mt.movement_pulse(),
             gesture_pad_config,
+            lball_rx,
+            rball_rx,
+            left_trackball_config:  left_ball,
+            right_trackball_config: right_ball,
         }
     }
 
@@ -150,9 +185,12 @@ impl TrackpadSession {
         rpad: &PadState,
         gesture_session: &Arc<Mutex<bool>>,
         state_tx: mpsc::Sender<StateWrite>,
+        gaming_mode: Arc<Mutex<bool>>,
     ) {
         let left_haptic    = self.haptic_tx.clone();
         let right_haptic   = self.haptic_tx.clone();
+        let lball_haptic   = self.haptic_tx.clone();
+        let rball_haptic   = self.haptic_tx.clone();
         let gesture_haptic = self.haptic_tx;
 
         tokio::join!(
@@ -161,6 +199,7 @@ impl TrackpadSession {
                     trackpad_router::run(
                         rx, lpad, rpad, gesture_session,
                         state_tx, self.left_tx, self.right_tx, self.combined_tx,
+                        gaming_mode,
                     )
                     .await;
                 }
@@ -192,6 +231,26 @@ impl TrackpadSession {
             async {
                 if let Some(rx) = self.combined_rx {
                     gesture_pad::run(rx, virt_dev, gesture_haptic, self.gesture_pad_config).await;
+                }
+            },
+            async {
+                if let Some(rx) = self.lball_rx {
+                    trackball::run_single(
+                        rx, virt_dev, true,
+                        lball_haptic, HapticPad::Left,
+                        self.left_trackball_config,
+                    )
+                    .await;
+                }
+            },
+            async {
+                if let Some(rx) = self.rball_rx {
+                    trackball::run_single(
+                        rx, virt_dev, false,
+                        rball_haptic, HapticPad::Right,
+                        self.right_trackball_config,
+                    )
+                    .await;
                 }
             },
         );
