@@ -1,32 +1,38 @@
-//! Steam game-running detection + Gaming Mode auto-apply task.
+//! Steam game-running detection and the async detection task.
+//!
+//! `steam_detection_task` is the live async loop that bridges kwin_watcher
+//! focus events with the `gaming_mode_set_loop` in EventReader.
 //!
 //! Answers one question: "should Gaming Mode be active right now?"
 //!
 //! Two independent signals are combined (OR):
-//!   1. **Process tree** — a `reaper` process exists whose ancestor is the
-//!      `steam` client and that reaper has live child processes.  This is the
-//!      reliable signal that a game is actually running.  Uses `sysinfo` rather
-//!      than raw `/proc` reads to avoid TOCTOU races and handle processes that
-//!      disappear between iterations.
-//!   2. **Window class** — the currently focused window is Steam Big Picture
-//!      Mode (`"steam"` class + BPM caption forwarded by the KWin script as
-//!      `"steam-bpm"`).  Covers the BPM case where no reaper exists yet but
-//!      the user is clearly in a gaming context.
+//!   1. **Window class** — the currently focused window is Steam Big Picture
+//!      Mode (`"steam"` class + BPM caption forwarded by the KWin script).
+//!   2. **Process tree** — walk upward from the focused window's PID via
+//!      `/proc/{pid}/status` and check whether `reaper → steam` appears in
+//!      the ancestor chain.  This is the reliable signal that a Steam game is
+//!      actually running.
+//!
+//! ## Why /proc instead of sysinfo
+//!
+//! sysinfo's `refresh_processes(All)` reads every field of every process on
+//! the system (~160-340 ms).  We only need to answer one question: "is this
+//! PID a descendant of steam via reaper?"  Reading a handful of
+//! `/proc/{pid}/status` files (one per ancestor level, typically 3-7) takes
+//! under 1 ms — the whole sysinfo dependency is gone.
 //!
 //! ## Module structure
 //!
-//! The pure detection logic (`is_steam_bpm`, `is_game_running`,
-//! `should_be_gaming`) is side-effect-free and unit-tested.
-//!
-//! `SteamDetector` bundles the sysinfo handle so callers just call
-//! `detector.update(class, caption)` and get a `bool` back.
+//! All functions are pure and side-effect-free (filesystem reads only, no
+//! global state).  `should_be_gaming` is the single public entry point used
+//! by `steam_detection_task`.
 
-use sysinfo::{ProcessStatus, System};
+use crate::udev_monitor::Client;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex, Notify};
 
 /// Returns `true` if the focused window is Steam Big Picture Mode.
 ///
-/// The KWin script forwards raw class and caption without modification —
-/// all classification logic lives here in Rust.
 /// BPM is identified by: class == "steam" AND caption contains "Big Picture"
 /// or "Big-Picture" (KWin uses either form depending on the Steam version).
 pub fn is_steam_bpm(class_name: &str, caption: &str) -> bool {
@@ -34,108 +40,83 @@ pub fn is_steam_bpm(class_name: &str, caption: &str) -> bool {
         && (caption.contains("Big Picture") || caption.contains("Big-Picture"))
 }
 
-/// Returns `true` if a Steam game is currently running, determined by
-/// inspecting the process tree in `sys`.
+/// Walk upward from `focused_pid` through the process tree via
+/// `/proc/{pid}/status` and return `true` if `reaper → steam` appears in the
+/// ancestor chain, meaning a Steam game is running.
 ///
-/// Algorithm (mirrors `game_detector.py::detect()`):
-///   1. Find the `steam` client process.
-///   2. Find all `reaper` processes that have `steam` anywhere in their
-///      ancestor chain.
-///   3. If any such reaper has at least one live child → a game is running.
+/// Process tree structure:
+/// ```
+/// steam  →  reaper  →  [game process / proton / wine / bwrap / …]
+/// ```
 ///
-/// `sys` must have been refreshed with `ProcessesToUpdate::All` before this
-/// call — the caller is responsible for that to avoid redundant refreshes
-/// when multiple signals are checked in the same focus event.
-pub fn is_game_running(sys: &System) -> bool {
-    // Collect all PIDs whose process name is "steam".
-    let steam_pids: std::collections::HashSet<sysinfo::Pid> = sys
-        .processes()
-        .iter()
-        .filter(|(_, p)| p.name() == "steam")
-        .map(|(pid, _)| *pid)
-        .collect();
-
-    if steam_pids.is_empty() {
-        return false;
+/// Reads only `Name:` and `PPid:` from each `/proc/{pid}/status` — one file
+/// per ancestor level.  Handles disappeared processes gracefully (returns
+/// `false`).  Stops at PID 1 (init).
+pub fn is_game_running(focused_pid: u32) -> bool {
+    let mut current = focused_pid;
+    loop {
+        let (name, ppid) = match read_proc_status(current) {
+            Some(v) => v,
+            None => return false, // process disappeared
+        };
+        if ppid <= 1 {
+            return false; // reached init without finding steam/reaper
+        }
+        if name == "reaper" {
+            // Confirm the reaper's parent is steam.
+            return read_proc_status(ppid)
+                .map(|(parent_name, _)| parent_name == "steam")
+                .unwrap_or(false);
+        }
+        current = ppid;
     }
-
-    // For each process named "reaper", walk its ancestor chain.
-    // If any ancestor is a steam process AND the reaper has live children
-    // → a game is running.
-    for (_, proc) in sys.processes() {
-        if proc.name() != "reaper" {
-            continue;
-        }
-        if !has_steam_ancestor(proc, &steam_pids, sys) {
-            continue;
-        }
-        // Check for live children of this reaper.
-        let reaper_pid = proc.pid();
-        let has_children = sys.processes().values().any(|child| {
-            child.parent() == Some(reaper_pid)
-                && child.status() != ProcessStatus::Zombie
-        });
-        if has_children {
-            return true;
-        }
-    }
-
-    false
 }
 
-/// Walk `proc`'s parent chain; return `true` if any ancestor PID is in
-/// `steam_pids`.  Stops at PID 1 or when the parent is no longer found in
-/// `sys` (handles processes that disappeared between the refresh and this
-/// call).
-fn has_steam_ancestor(
-    proc: &sysinfo::Process,
-    steam_pids: &std::collections::HashSet<sysinfo::Pid>,
-    sys: &System,
-) -> bool {
-    let mut current = proc.parent();
-    while let Some(ppid) = current {
-        if steam_pids.contains(&ppid) {
-            return true;
+/// Read `Name:` and `PPid:` from `/proc/{pid}/status`.
+/// Returns `None` if the file cannot be read (process gone).
+fn read_proc_status(pid: u32) -> Option<(String, u32)> {
+    let content = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    let name = parse_field(&content, "Name")?;
+    let ppid: u32 = parse_field(&content, "PPid")?.parse().ok()?;
+    Some((name, ppid))
+}
+
+/// Extract the value of `Field:` from a `/proc/.../status` file.
+fn parse_field(content: &str, field: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let rest = line.strip_prefix(field)?.strip_prefix(':')?;
+        Some(rest.trim().to_string())
+    })
+}
+
+/// Async loop that watches for window-focus changes and sends the desired
+/// Gaming Mode state (`true` = gaming) over `tx`.
+///
+/// Spawned once per session from `launch_tasks` in `udev_monitor`.
+/// Compositor-agnostic: on non-KDE systems `window_changed` is never fired
+/// and the task simply blocks on `notified()` forever — zero overhead.
+/// Only sends when the state actually changes to avoid flooding the channel.
+pub async fn steam_detection_task(
+    window_changed: Arc<Notify>,
+    active_client: Arc<Mutex<Client>>,
+    tx: mpsc::Sender<bool>,
+) {
+    let mut last_sent: Option<bool> = None;
+    loop {
+        window_changed.notified().await;
+        let (class, caption, pid) = match &*active_client.lock().await {
+            Client::Class(c, cap, p) => (c.clone(), cap.clone(), *p),
+            Client::Default => (String::new(), String::new(), None),
+        };
+        let bpm       = is_steam_bpm(&class, &caption);
+        let game      = pid.map(is_game_running).unwrap_or(false);
+        let new_state = bpm || game;
+        if Some(new_state) != last_sent {
+            if tx.send(new_state).await.is_err() {
+                break; // all receivers gone, stop
+            }
+            last_sent = Some(new_state);
         }
-        current = sys.process(ppid).and_then(|p| p.parent());
-    }
-    false
-}
-
-/// Combined check: should Gaming Mode be active given the current focus and
-/// process snapshot?
-///
-/// `class_name` and `caption` are forwarded raw by the KWin script.
-/// `sys` is a freshly-refreshed `sysinfo::System`.
-pub fn should_be_gaming(class_name: &str, caption: &str, sys: &System) -> bool {
-    is_steam_bpm(class_name, caption) || is_game_running(sys)
-}
-
-/// Stateful detector: owns the sysinfo handle and last-known state.
-///
-/// Call `update()` on every focus change; it refreshes the process list,
-/// runs detection, debounces, and returns `Some(new_state)` only when the
-/// gaming state actually changes.  Returns `None` when the state is unchanged.
-/// Stateful detector: owns the sysinfo handle so it isn't recreated on every call.
-///
-/// Call `update(class, caption)` on every focus change; it refreshes the
-/// process list, runs detection, and returns whether Gaming Mode should be active.
-/// The caller decides whether the state actually changed.
-pub struct SteamDetector {
-    sys: System,
-}
-
-impl SteamDetector {
-    pub fn new() -> Self {
-        let mut sys = System::new();
-        sys.refresh_all();
-        Self { sys }
-    }
-
-    /// Returns `true` if Gaming Mode should be active right now.
-    pub fn update(&mut self, class: &str, caption: &str) -> bool {
-        self.sys.refresh_all();
-        should_be_gaming(class, caption, &self.sys)
     }
 }
 
@@ -153,7 +134,6 @@ mod tests {
 
     #[test]
     fn steam_class_without_bpm_caption_does_not_trigger() {
-        // Regular Steam desktop client — class is "steam" but caption is "Steam"
         assert!(!is_steam_bpm("steam", "Steam"));
         assert!(!is_steam_bpm("steam", ""));
     }
@@ -168,14 +148,64 @@ mod tests {
         assert!(!is_steam_bpm("", ""));
     }
 
-    // Process-tree tests run against the live system — they can only assert
-    // that the function returns without panicking, since whether a game is
-    // actually running is non-deterministic in CI.  The logic is verified by
-    // the unit tests above and by on-device manual testing.
     #[test]
-    fn is_game_running_does_not_panic() {
-        let mut sys = System::new();
-        sys.refresh_all();
-        let _ = is_game_running(&sys);
+    fn no_pid_means_not_gaming() {
+        assert!(!is_steam_bpm("", "") && !is_game_running(1));
+        assert!(!is_steam_bpm("org.mozilla.firefox", "Firefox"));
+    }
+
+    #[test]
+    fn bpm_wins_even_without_pid() {
+        assert!(is_steam_bpm("steam", "Steam Big Picture"));
+    }
+
+    #[test]
+    fn parse_field_extracts_name_and_ppid() {
+        let status = "Name:\tfoo\nPPid:\t42\nVmRSS:\t1234 kB\n";
+        assert_eq!(parse_field(status, "Name").as_deref(), Some("foo"));
+        assert_eq!(parse_field(status, "PPid").as_deref(), Some("42"));
+        assert_eq!(parse_field(status, "Missing"), None);
+    }
+
+    // Live process-tree test: only verifies no panic; whether a game is
+    // running is non-deterministic in CI.
+    #[test]
+    fn is_game_running_pid1_returns_false() {
+        assert!(!is_game_running(1));
+    }
+
+    /// Measures how long a full /proc walk takes on the live system.
+    /// Run with: cargo test -- --nocapture proc_walk_timing
+    ///
+    /// Expected: < 1ms even walking all the way to PID 1.
+    /// If consistently > 5ms the spawn_blocking wrapper should be reconsidered.
+    #[test]
+    fn proc_walk_timing() {
+        let own_pid = std::process::id();
+
+        // Warm up (first read may be slower due to page cache cold start).
+        let _ = is_game_running(own_pid);
+
+        const RUNS: u32 = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..RUNS {
+            let _ = is_game_running(own_pid);
+        }
+        let total = start.elapsed();
+        let avg_us = total.as_micros() / RUNS as u128;
+
+        println!(
+            "proc_walk_timing: {} runs, total={:.2}ms, avg={}µs per call",
+            RUNS,
+            total.as_secs_f64() * 1000.0,
+            avg_us,
+        );
+
+        // Soft assertion — if this fires, re-evaluate spawn_blocking.
+        assert!(
+            avg_us < 5000,
+            "proc walk took {}µs on average — consider spawn_blocking if > 5ms",
+            avg_us
+        );
     }
 }

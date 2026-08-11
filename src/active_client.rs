@@ -9,10 +9,10 @@ use x11rb::protocol::xproto::{get_input_focus, get_property, Atom, AtomEnum};
 /// otherwise `Client::Default`.
 fn match_class(class: String, config: &[Config]) -> Client {
     if config.iter().any(|x| match &x.associations.client {
-        Client::Class(c, _) => c == &class,
+        Client::Class(c, _, _) => c == &class,
         Client::Default => false,
     }) {
-        Client::Class(class, String::new())
+        Client::Class(class, String::new(), None)
     } else {
         Client::Default
     }

@@ -4,7 +4,7 @@ use crate::virtual_devices::VirtualDevices;
 use crate::Config;
 use evdev::{Device, EventStream};
 use std::{env, path::Path, process::Command, sync::Arc};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use crate::kwin_watcher;
 use tokio_stream::StreamExt;
@@ -14,8 +14,9 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 pub enum Client {
     #[default]
     Default,
-    /// Window class + caption, both forwarded raw by the KWin script.
-    Class(String, String),
+    /// Window class + caption (both forwarded raw by the KWin script) +
+    /// the PID of the focused window's owning process (KDE only; None elsewhere).
+    Class(String, String, Option<u32>),
 }
 
 #[derive(Clone)]
@@ -224,6 +225,24 @@ pub fn launch_tasks(
     reuse_virt_dev: Option<Arc<Mutex<VirtualDevices>>>,
     gaming_mode: Arc<Mutex<bool>>,
 ) -> (Option<Arc<Mutex<VirtualDevices>>>, Arc<Mutex<Vec<Event>>>) {
+    // Unified Gaming Mode channel: steam detection and IPC both send here.
+    // The EventReader's gaming_mode_set_loop is the sole consumer.
+    let (gaming_mode_tx, gaming_mode_rx) = mpsc::channel::<bool>(32);
+
+    // Steam detection task — spawned once per session, outside any EventReader.
+    // Sends detected gaming state changes via gaming_mode_tx.
+    // No compositor check needed: if window_changed is never fired (non-KDE),
+    // the task simply blocks on notified().await forever — zero overhead.
+    tokio::spawn(crate::steam_detector::steam_detection_task(
+        window_changed.clone(),
+        active_client.clone(),
+        gaming_mode_tx.clone(),
+    ));
+
+    // The rx goes to the first matched reader (wrapped in Option so only one
+    // reader takes it). Subsequent readers (multi-device) get a dead receiver.
+    let mut gaming_mode_rx_opt = Some(gaming_mode_rx);
+
     let modifiers: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Default::default()));
     let modifier_was_activated: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
     let mut virt_dev_holder: Option<Arc<Mutex<VirtualDevices>>> = None;
@@ -281,14 +300,14 @@ pub fn launch_tasks(
                         if let Ok(layout) = split_config_name[1].parse::<u16>() {
                             (Client::Default, layout)
                         } else {
-                            (Client::Class(split_config_name[1].to_string(), String::new()), 0)
+                            (Client::Class(split_config_name[1].to_string(), String::new(), None), 0)
                         }
                     }
                     3 => {
                         if let Ok(layout) = split_config_name[1].parse::<u16>() {
-                            (Client::Class(split_config_name[2].to_string(), String::new()), layout)
+                            (Client::Class(split_config_name[2].to_string(), String::new(), None), layout)
                         } else if let Ok(layout) = split_config_name[2].parse::<u16>() {
-                            (Client::Class(split_config_name[1].to_string(), String::new()), layout)
+                            (Client::Class(split_config_name[1].to_string(), String::new(), None), layout)
                         } else {
                             println!("Warning: unable to parse layout number in {}, treating it as default.", config.name);
                             (Client::Default, 0)
@@ -342,6 +361,11 @@ pub fn launch_tasks(
                 Arc::new(Mutex::new(VirtualDevices::new(device.1)))
             };
             virt_dev_holder = Some(virt_dev.clone());
+            // First reader takes the real rx; subsequent readers get a dead one.
+            let rx = gaming_mode_rx_opt.take().unwrap_or_else(|| {
+                let (_, dead_rx) = mpsc::channel(1);
+                dead_rx
+            });
             let reader = EventReader::new(
                 config_list.clone(),
                 virt_dev,
@@ -354,8 +378,9 @@ pub fn launch_tasks(
                 window_changed.clone(),
                 std::path::PathBuf::from(&event_device),
                 gaming_mode.clone(),
+                gaming_mode_tx.clone(),
             );
-            tasks.push(tokio::spawn(start_reader(reader)));
+            tasks.push(tokio::spawn(start_reader(reader, rx)));
             devices_found += 1
         }
     }
@@ -396,8 +421,8 @@ fn should_reuse_virt_dev(matched_device_count: usize, reuse_requested: bool) -> 
     reuse_requested && matched_device_count == 1
 }
 
-pub async fn start_reader(reader: EventReader) {
-    reader.start().await;
+pub async fn start_reader(reader: EventReader, gaming_rx: mpsc::Receiver<bool>) {
+    reader.start(gaming_rx).await;
 }
 
 fn set_environment() -> Environment {

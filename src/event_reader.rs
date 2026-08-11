@@ -111,6 +111,10 @@ pub struct EventReader {
     /// Haptic command channel, wired from `TrackpadSession` after setup.
     /// `None` when the hidraw sibling was not found (trackpad position unavailable).
     haptic_tx: Arc<Mutex<Option<mpsc::Sender<HapticCommand>>>>,
+    /// Sender half of the unified Gaming Mode channel.  Cloned into the IPC
+    /// handler so external commands (`gaming_mode enable/disable`) go through
+    /// the same `gaming_mode_set_loop` as steam auto-detection.
+    gaming_mode_tx: mpsc::Sender<bool>,
 }
 
 /// Sets Gaming Mode to `new_state`, logs the transition, and fires the
@@ -149,6 +153,7 @@ impl EventReader {
         window_changed: Arc<Notify>,
         device_path: std::path::PathBuf,
         gaming_mode: Arc<Mutex<bool>>,
+        gaming_mode_tx: mpsc::Sender<bool>,
     ) -> Self {
         let mut position_vector: Vec<i32> = Vec::new();
         for i in [0, 0] {
@@ -466,10 +471,11 @@ impl EventReader {
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
             haptic_tx: Arc::new(Mutex::new(None)),
+            gaming_mode_tx,
         }
     }
 
-    pub async fn start(&self) {
+    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>) {
         let name = &self.config.iter().find(|&x| x.associations == Associations::default()).unwrap().name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
@@ -478,6 +484,7 @@ impl EventReader {
         *self.haptic_tx.lock().await = session.haptic_tx();
         self.write_state().await;
         self.start_control_socket().await;
+
         tokio::join!(
             self.event_loop(),
             self.cursor_loop(),
@@ -485,7 +492,7 @@ impl EventReader {
             self.key_cursor_loop(),
             self.key_scroll_loop(),
             self.window_changed_loop(),
-            self.steam_detection_loop(),
+            self.gaming_mode_set_loop(gaming_rx),
             self.state_write_loop(state_rx),
             session.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()),
         );
@@ -504,28 +511,19 @@ impl EventReader {
         }
     }
 
-    /// Auto-detects whether a Steam game is running on every window-activation
-    /// event (KDE only) and toggles Gaming Mode accordingly.
+    /// Unified Gaming Mode setter — the single consumer of the `gaming_mode_tx`
+    /// channel.  Both steam auto-detection and IPC commands send `bool` here;
+    /// this loop applies the change (flag + haptic + state write) when the
+    /// desired state differs from the current one.
     ///
-    /// Reads class + caption from `active_client` (set by kwin_watcher), then
-    /// calls `steam_detector::should_be_gaming()`.  When the detected state
-    /// changes, `apply_gaming_mode()` is called and `write_state()` persists
-    /// the result — exactly as the manual double-click path does.
-    async fn steam_detection_loop(&self) {
-        if !matches!(&self.environment.server, Server::Connected(s) if s == "KDE") {
-            return;
-        }
-        let mut detector = crate::steam_detector::SteamDetector::new();
-        loop {
-            self.window_changed.notified().await;
-            let (class, caption) = match &*self.active_client.lock().await {
-                Client::Class(c, cap) => (c.clone(), cap.clone()),
-                Client::Default => (String::new(), String::new()),
-            };
-            let new_state = detector.update(&class, &caption);
+    /// Has full `self` access, so `write_state()` works without any workarounds.
+    /// Returns when all senders are dropped (device disconnected / non-KDE).
+    async fn gaming_mode_set_loop(&self, mut rx: mpsc::Receiver<bool>) {
+        while let Some(new_state) = rx.recv().await {
             if new_state != *self.gaming_mode.lock().await {
                 let chain = if new_state { &self.gaming_mode_config.haptic_on }
                             else        { &self.gaming_mode_config.haptic_off };
+                println!("makima: Gaming Mode trigger — channel, new_state={}", new_state);
                 apply_gaming_mode(&self.gaming_mode, new_state, &self.haptic_tx, chain).await;
                 self.write_state().await;
             }
@@ -533,6 +531,7 @@ impl EventReader {
     }
 
     pub async fn event_loop(&self) {
+        println!("makima: event_loop: started.");
         let (
             mut dpad_values,
             mut lstick_values,
@@ -1290,7 +1289,6 @@ impl EventReader {
         value: i32,
         send_zero: bool,
     ) {
-
         // TODO: structural debt — gaming_mode is read here early because the
         // Custom Modifier Intercept and held_keys update both sit before the
         // Gaming Mode guard. Ideally the guard would be the first thing after
@@ -1360,13 +1358,13 @@ impl EventReader {
                 if within_window {
                     *ts = None;
                     drop(ts);
-                    // Flip Gaming Mode, log, and fire the appropriate haptic chain.
                     let new_state = !*self.gaming_mode.lock().await;
                     let chain = if new_state {
                         &self.gaming_mode_config.haptic_on
                     } else {
                         &self.gaming_mode_config.haptic_off
                     };
+                    println!("makima: Gaming Mode trigger — double-click");
                     apply_gaming_mode(&self.gaming_mode, new_state, &self.haptic_tx, chain).await;
                     self.write_state().await;
                     return;
@@ -1808,8 +1806,23 @@ impl EventReader {
 
     async fn change_active_layout(&self) {
         let mut active_layout = self.active_layout.lock().await;
-        let active_window = get_active_window(&self.environment, &self.config).await;
-        let active_class = match &active_window { Client::Class(c, _) => c.as_str(), Client::Default => "" };
+        // For KDE: use the event-driven active_client (same source as update_config).
+        // For all other compositors: fall back to get_active_window().
+        // Never call get_active_window() on KDE — it spawns `systemd-run … kdotool`
+        // which blocks the tokio thread for several seconds.
+        let active_class_owned: String = match &self.environment.server {
+            Server::Connected(s) if s == "KDE" => {
+                match &*self.active_client.lock().await {
+                    Client::Class(c, _, _) => c.clone(),
+                    Client::Default => String::new(),
+                }
+            }
+            _ => match get_active_window(&self.environment, &self.config).await {
+                Client::Class(c, _, _) => c,
+                Client::Default => String::new(),
+            },
+        };
+        let active_class = active_class_owned.as_str();
         loop {
             if *active_layout == 3 {
                 *active_layout = 0
@@ -1818,7 +1831,7 @@ impl EventReader {
             };
             if self.config.iter().any(|x| {
                 x.associations.layout == *active_layout && match &x.associations.client {
-                    Client::Class(c, _) => c == active_class,
+                    Client::Class(c, _, _) => c == active_class,
                     Client::Default => active_class.is_empty(),
                 }
             }) {
@@ -1836,33 +1849,47 @@ impl EventReader {
 
     fn update_config(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let active_layout = self.active_layout.lock().await.clone();
-            // For KDE: the window class is maintained by the kwin_watcher task
-            // (event-driven, no subprocess). For all other compositors: call
-            // get_active_window() on every button-press as before.
-            let active_window = match &self.environment.server {
+            let active_layout = *self.active_layout.lock().await;
+            // For KDE: window class is maintained event-driven by kwin_watcher.
+            // For all other compositors: call get_active_window() on every button-press.
+            // In both cases we extract only the class string — caption and pid are not
+            // stored in config associations, so there is no point constructing a full
+            // Client / Associations value and comparing with PartialEq.
+            let active_class: String = match &self.environment.server {
                 Server::Connected(s) if s == "KDE" => {
-                    let client = self.active_client.lock().await.clone();
-                    let class = match &client { Client::Class(c, _) => c.as_str(), Client::Default => "" };
-                    if self.config.iter().any(|x| match &x.associations.client {
-                        Client::Class(c, _) => c == class,
-                        Client::Default => class.is_empty(),
-                    }) {
-                        client
-                    } else {
-                        Client::Default
+                    match &*self.active_client.lock().await {
+                        Client::Class(c, _, _) => c.clone(),
+                        Client::Default => String::new(),
                     }
                 }
-                _ => get_active_window(&self.environment, &self.config).await,
+                _ => match get_active_window(&self.environment, &self.config).await {
+                    Client::Class(c, _, _) => c,
+                    Client::Default => String::new(),
+                },
             };
-            let associations = Associations {
-                client: active_window,
-                layout: active_layout,
-            };
-            match self.config.iter().find(|&x| x.associations == associations) {
+            // Primary lookup: exact match for (layout, class).
+            // Fallback: default config for this layout (no class association) — used
+            // when the focused window has no specific config entry.  Only if that
+            // also doesn't exist do we change the active layout.
+            // NOTE: The old code produced Client::Default for unknown classes and
+            // matched the base config via Associations PartialEq.  Replicating that
+            // behaviour here without constructing any Client / Associations objects.
+            let found = self.config.iter().find(|&x| {
+                x.associations.layout == active_layout
+                    && match &x.associations.client {
+                        Client::Class(c, _, _) => c == &active_class,
+                        Client::Default => active_class.is_empty(),
+                    }
+            }).or_else(|| {
+                // Fallback: layout matches, association is Default (base config).
+                self.config.iter().find(|&x| {
+                    x.associations.layout == active_layout
+                        && matches!(&x.associations.client, Client::Default)
+                })
+            });
+            match found {
                 Some(config) => {
-                    let mut current_config = self.current_config.lock().await;
-                    *current_config = config.clone();
+                    *self.current_config.lock().await = config.clone();
                 }
                 None => {
                     self.change_active_layout().await;
@@ -2091,10 +2118,8 @@ impl EventReader {
     }
 
     async fn start_control_socket(&self) {
-        let paused          = self.paused.clone();
-        let gaming_mode_ipc      = self.gaming_mode.clone();
-        let haptic_tx_ipc        = self.haptic_tx.clone();
-        let gaming_mode_cfg_ipc  = self.gaming_mode_config.clone();
+        let paused               = self.paused.clone();
+        let gaming_mode_tx_ipc   = self.gaming_mode_tx.clone();
         let last_action          = self.last_action.clone();
         let current_config       = self.current_config.clone();
         let modifiers            = self.modifiers.clone();
@@ -2102,6 +2127,8 @@ impl EventReader {
         let held_keys            = self.held_keys.clone();
         let all_configs          = self.config.clone();
         let analog_state_export  = self.analog_state_export.clone();
+        // paused state still needs an immediate write (no channel for it yet).
+        let gaming_mode_for_write = self.gaming_mode.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file("/tmp/makima-control.sock");
             let listener = match UnixListener::bind("/tmp/makima-control.sock") {
@@ -2113,9 +2140,7 @@ impl EventReader {
             };
             while let Ok((stream, _addr)) = listener.accept().await {
                 let paused               = paused.clone();
-                let gaming_mode_ipc      = gaming_mode_ipc.clone();
-                let haptic_tx_ipc        = haptic_tx_ipc.clone();
-                let gaming_mode_cfg_ipc  = gaming_mode_cfg_ipc.clone();
+                let gaming_mode_tx_ipc   = gaming_mode_tx_ipc.clone();
                 let last_action          = last_action.clone();
                 let current_config       = current_config.clone();
                 let modifiers            = modifiers.clone();
@@ -2123,6 +2148,7 @@ impl EventReader {
                 let held_keys            = held_keys.clone();
                 let all_configs          = all_configs.clone();
                 let analog_state_export  = analog_state_export.clone();
+                let gaming_mode_for_write = gaming_mode_for_write.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream.into_std().unwrap());
                     let mut line = String::new();
@@ -2133,24 +2159,17 @@ impl EventReader {
                                 if cmd == "pause" || cmd == "resume" {
                                     *paused.lock().await = cmd == "pause";
                                 } else {
-                                    // Set Gaming Mode, log, and fire haptic feedback.
+                                    // Route through the unified Gaming Mode channel.
+                                    // gaming_mode_set_loop applies the change,
+                                    // fires haptics, and writes state.
                                     let new_state = cmd == "gaming_mode enable";
-                                    let chain = if new_state {
-                                        &gaming_mode_cfg_ipc.haptic_on
-                                    } else {
-                                        &gaming_mode_cfg_ipc.haptic_off
-                                    };
-                                    apply_gaming_mode(
-                                        &gaming_mode_ipc,
-                                        new_state,
-                                        &haptic_tx_ipc,
-                                        chain,
-                                    ).await;
+                                    println!("makima: Gaming Mode trigger — IPC command: {}", cmd);
+                                    let _ = gaming_mode_tx_ipc.send(new_state).await;
+                                    return; // state write handled by gaming_mode_set_loop
                                 }
-                                // Write state immediately so the HUD sees the updated
-                                // flag without waiting for the next button event.
+                                // Write state for pause/resume immediately.
                                 let is_paused   = *paused.lock().await;
-                                let is_gaming   = *gaming_mode_ipc.lock().await;
+                                let is_gaming   = *gaming_mode_for_write.lock().await;
                                 const TIMEOUT: std::time::Duration =
                                     std::time::Duration::from_millis(200);
                                 let config = match tokio::time::timeout(

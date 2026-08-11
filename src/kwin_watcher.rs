@@ -31,7 +31,8 @@ const KWIN_SCRIPT: &str = r#"
 workspace.windowActivated.connect(function(w) {
     var cls = (w && w.resourceClass) ? w.resourceClass : "";
     var cap = (w && w.caption)       ? w.caption       : "";
-    callDBus("org.makima.watcher", "/watcher", "org.makima.watcher", "WindowActivated", cls, cap);
+    var pid = (w && w.pid)           ? w.pid           : 0;
+    callDBus("org.makima.watcher", "/watcher", "org.makima.watcher", "WindowActivated", cls, cap, pid);
 });
 "#;
 
@@ -52,13 +53,17 @@ struct WatcherIface {
 #[dbus_interface(name = "org.makima.watcher")]
 impl WatcherIface {
     /// Called by the KWin script on every window-activation change.
-    /// Stores raw class + caption in active_client and fires notify.
-    /// No detection logic here — that lives in EventReader::steam_detection_loop().
-    async fn window_activated(&self, class_name: String, caption: String) {
+    /// Stores raw class, caption, and PID in active_client and fires notify.
+    /// No detection logic here — that lives in steam_detection_task.
+    ///
+    /// Note: KWin's callDBus sends JavaScript numbers as D-Bus int32 (i),
+    /// so pid must be i32 here — not u32 — to avoid a silent type mismatch
+    /// that would cause the entire D-Bus call to be silently dropped.
+    async fn window_activated(&self, class_name: String, caption: String, pid: i32) {
         *self.active_client.lock().await = if class_name.is_empty() {
             Client::Default
         } else {
-            Client::Class(class_name, caption)
+            Client::Class(class_name, caption, if pid <= 0 { None } else { Some(pid as u32) })
         };
         self.notify.notify_waiters();
     }
@@ -180,11 +185,11 @@ mod tests {
         let wait_task = tokio::spawn(async move { notify_clone.notified().await; });
         tokio::task::yield_now().await;
 
-        iface.window_activated("org.mozilla.firefox".to_string(), "Firefox".to_string()).await;
+        iface.window_activated("org.mozilla.firefox".to_string(), "Firefox".to_string(), 12345).await;
 
         assert_eq!(
             *active_client.lock().await,
-            Client::Class("org.mozilla.firefox".to_string(), "Firefox".to_string()),
+            Client::Class("org.mozilla.firefox".to_string(), "Firefox".to_string(), Some(12345)),
         );
         assert!(timeout(Duration::from_millis(100), wait_task).await.is_ok());
     }
@@ -193,29 +198,29 @@ mod tests {
     async fn window_activated_empty_string_resets_to_default() {
         let iface = make_iface();
         *iface.active_client.lock().await =
-            Client::Class("some.other.app".to_string(), String::new());
-        iface.window_activated("".to_string(), "".to_string()).await;
+            Client::Class("some.other.app".to_string(), String::new(), None);
+        iface.window_activated("".to_string(), "".to_string(), 0).await;
         assert_eq!(*iface.active_client.lock().await, Client::Default);
     }
 
     #[tokio::test]
     async fn window_activated_stores_bpm_caption() {
         let iface = make_iface();
-        iface.window_activated("steam".to_string(), "Steam Big Picture".to_string()).await;
+        iface.window_activated("steam".to_string(), "Steam Big Picture".to_string(), 5678).await;
         assert_eq!(
             *iface.active_client.lock().await,
-            Client::Class("steam".to_string(), "Steam Big Picture".to_string()),
+            Client::Class("steam".to_string(), "Steam Big Picture".to_string(), Some(5678)),
         );
     }
 
     #[tokio::test]
     async fn window_activated_fires_notify_for_every_focus_change() {
         let iface = make_iface();
-        iface.window_activated("org.mozilla.firefox".to_string(), "Firefox".to_string()).await;
+        iface.window_activated("org.mozilla.firefox".to_string(), "Firefox".to_string(), 111).await;
         let notify_clone = iface.notify.clone();
         let wait_task = tokio::spawn(async move { notify_clone.notified().await; });
         tokio::task::yield_now().await;
-        iface.window_activated("org.kde.dolphin".to_string(), "Dolphin".to_string()).await;
+        iface.window_activated("org.kde.dolphin".to_string(), "Dolphin".to_string(), 222).await;
         assert!(timeout(Duration::from_millis(100), wait_task).await.is_ok());
     }
 }

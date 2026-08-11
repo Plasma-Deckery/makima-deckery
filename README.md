@@ -17,7 +17,7 @@ The heart of Deckery — the input remapper. Reads raw evdev events directly fro
 - **Lizard Mode suppression** — periodic hidraw heartbeat keeps the `hid-steam` kernel driver's built-in mouse/scroll fallback disabled without Steam running; configurable via `SUPPRESS_LIZARD_MODE`
 - **Pause / Resume IPC** — runtime control via Unix socket at `/tmp/makima-control.sock`
 - **Steam Deck keycodes** — `BTN_GRIPL/R/L2/R2` for the back paddles via patched `evdev` crate
-- **Unit test suite** — 69 tests covering resolver, state export, analog helpers, and config parsing
+- **Unit test suite** — 140 tests covering resolver, state export, analog helpers, config parsing, trackpad routing, and haptic report encoding
 
 → [Full documentation](https://plasma-deckery.github.io/deckery/projects/makima-deckery/)
 
@@ -66,9 +66,9 @@ trackpad_router.rs   — Core routing: always mirrors raw position/touch/click i
                         pads are touching simultaneously.
 mt_trackpad.rs        — handler(s): turn one channel's frame stream into an
                         emulated MT device, including click-edge detection and
-                        haptic click-tick policy. A future trackball or
-                        multi-zone handler would be a sibling module here,
-                        without touching the two layers above.
+                        haptic policy. A future trackball or multi-zone handler
+                        would be a sibling module here, without touching the
+                        two layers above.
 ```
 
 With `mode = "mt-trackpad"` under `[trackpad.left]`/`[trackpad.right]` in the config, makima exposes each pad as its own standard uinput touchpad device — `Deckery Left Trackpad` / `Deckery Right Trackpad`. Setting `combined_gesture_device = true` additionally exposes a third two-slot MT device, `Deckery Combined Trackpad`, active only while both pads are touching at once (e.g. for pinch-zoom) — individual pads seamlessly resume their own device the instant one finger lifts.
@@ -89,7 +89,7 @@ The legacy `[settings] LPAD = "trackpad"` / `RPAD = "trackpad"` syntax is still 
 
 Position is Y-corrected to libinput convention (hardware reports up as negative; the virtual device flips this) and split into left/right halves of a shared X axis on the combined device so a pinch gesture tracks correctly across both slots. Trackpad position, touch state, and press state are always tracked and exported to `state.json` regardless of the mode setting — the HUD can visualize trackpad input even when `"disabled"`.
 
-Each pad's virtual device also emits a short haptic "click tick" (via the Steam Deck's trackpad actuators) on the rising edge of a click, independent of whichever handler mode is active.
+Haptic feedback is configurable per pad: press and release edges are independent events with separate pulse shapes, and distance-gated movement haptics are also supported. See the [trackpad configuration docs](https://plasma-deckery.github.io/deckery/projects/makima-deckery/trackpad/) for the full config reference.
 
 > **Tip:** if you enable `combined_gesture_device` and use quick two-hand gestures (e.g. pinch-zoom), disable "Tap to click" on the individual `Deckery Left/Right Trackpad` devices in your desktop's touchpad settings. Touching down with one pad slightly before the other briefly routes through that pad's individual channel before gesture mode activates; the router's forced clean-lift on gesture entry looks like a fast tap-and-release to libinput, which tap-to-click would otherwise turn into a spurious click.
 
@@ -222,7 +222,7 @@ sudo usermod -aG input $USER   # grants access to /dev/input/* and /dev/uinput
 
 The service environment variables (`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, etc.) are hardcoded in the unit because the service starts before the desktop session environment is fully inherited.
 
-Suspend/resume is handled in-process: makima subscribes to the `PrepareForSleep(false)` D-Bus signal from `org.freedesktop.login1` and reinitialises the evdev/hidraw reader on resume without restarting the process or rebuilding the virtual uinput devices. The Steam Deck kernel silently freezes evdev file descriptors on suspend without returning an error, so an explicit resume signal is required. The former external `makima-resume-watcher.service` companion unit has been removed — `install.sh` disables and deletes it automatically on upgrade.
+Suspend/resume is handled in-process (see feature list above). The former external `makima-resume-watcher.service` companion unit has been removed — `install.sh` disables and deletes it automatically on upgrade.
 
 ---
 
