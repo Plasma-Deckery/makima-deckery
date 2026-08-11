@@ -5,6 +5,19 @@ use std::process::{Command, Stdio};
 use swayipc_async::Connection;
 use x11rb::protocol::xproto::{get_input_focus, get_property, Atom, AtomEnum};
 
+/// Returns `Client::Class(class, "")` if `class` matches any loaded config,
+/// otherwise `Client::Default`.
+fn match_class(class: String, config: &[Config]) -> Client {
+    if config.iter().any(|x| match &x.associations.client {
+        Client::Class(c, _) => c == &class,
+        Client::Default => false,
+    }) {
+        Client::Class(class, String::new())
+    } else {
+        Client::Default
+    }
+}
+
 pub async fn get_active_window(environment: &Environment, config: &Vec<Config>) -> Client {
     match &environment.server {
         Server::Connected(server) => {
@@ -18,45 +31,27 @@ pub async fn get_active_window(environment: &Environment, config: &Vec<Config>) 
                     if let Ok(reply) = serde_json::from_str::<serde_json::Value>(
                         std::str::from_utf8(query.stdout.as_slice()).unwrap(),
                     ) {
-                        let active_window =
-                            Client::Class(reply["class"].to_string().replace("\"", ""));
-                        if let Some(_) = config
-                            .iter()
-                            .find(|&x| x.associations.client == active_window)
-                        {
-                            active_window
-                        } else {
-                            Client::Default
-                        }
+                        let class = reply["class"].to_string().replace("\"", "");
+                        match_class(class, config)
                     } else {
                         Client::Default
                     }
                 }
                 "sway" => {
-                    let mut connection = Connection::new().await.unwrap();
-                    let active_window = match connection
-                        .get_tree()
-                        .await
-                        .unwrap()
+                    let class = match Connection::new().await.unwrap()
+                        .get_tree().await.unwrap()
                         .find_focused(|window| window.focused)
                     {
                         Some(window) => match window.app_id {
-                            Some(id) => Client::Class(id),
+                            Some(id) => id,
                             None => window
                                 .window_properties
-                                .and_then(|window_properties| window_properties.class)
-                                .map_or(Client::Default, Client::Class),
+                                .and_then(|p| p.class)
+                                .unwrap_or_default(),
                         },
-                        None => Client::Default,
+                        None => return Client::Default,
                     };
-                    if let Some(_) = config
-                        .iter()
-                        .find(|&x| x.associations.client == active_window)
-                    {
-                        active_window
-                    } else {
-                        Client::Default
-                    }
+                    match_class(class, config)
                 }
                 "niri" => {
                     let query = Command::new("niri")
@@ -66,16 +61,8 @@ pub async fn get_active_window(environment: &Environment, config: &Vec<Config>) 
                     if let Ok(reply) = serde_json::from_str::<serde_json::Value>(
                         std::str::from_utf8(query.stdout.as_slice()).unwrap(),
                     ) {
-                        let active_window =
-                            Client::Class(reply["app_id"].to_string().replace("\"", ""));
-                        if let Some(_) = config
-                            .iter()
-                            .find(|&x| x.associations.client == active_window)
-                        {
-                            active_window
-                        } else {
-                            Client::Default
-                        }
+                        let class = reply["app_id"].to_string().replace("\"", "");
+                        match_class(class, config)
                     } else {
                         Client::Default
                     }
@@ -89,47 +76,27 @@ pub async fn get_active_window(environment: &Environment, config: &Vec<Config>) 
                         } else {
                             (Option::None, false)
                         };
-                    let active_window = {
-                        if let Some(user) = user {
-                            if running_as_root {
-                                let output = Command::new("runuser")
-                                    .arg(user)
-                                    .arg("-c")
-                                    .arg("kdotool getactivewindow getwindowclassname")
-                                    .output()
-                                    .unwrap();
-                                Client::Class(
-                                    std::str::from_utf8(output.stdout.as_slice())
-                                        .unwrap()
-                                        .trim()
-                                        .to_string(),
-                                )
-                            } else {
-                                let output = Command::new("sh")
-                                    .arg("-c")
-                                    .arg(format!("systemd-run --user --scope -M {}@ kdotool getactivewindow getwindowclassname", user))
-                                    .stderr(Stdio::null())
-                                    .output()
-                                    .unwrap();
-                                Client::Class(
-                                    std::str::from_utf8(output.stdout.as_slice())
-                                        .unwrap()
-                                        .trim()
-                                        .to_string(),
-                                )
-                            }
-                        } else {
-                            Client::Default
-                        }
-                    };
-                    if let Some(_) = config
-                        .iter()
-                        .find(|&x| x.associations.client == active_window)
-                    {
-                        active_window
+                    let Some(user) = user else { return Client::Default };
+                    let output = if running_as_root {
+                        Command::new("runuser")
+                            .arg(user)
+                            .arg("-c")
+                            .arg("kdotool getactivewindow getwindowclassname")
+                            .output()
+                            .unwrap()
                     } else {
-                        Client::Default
-                    }
+                        Command::new("sh")
+                            .arg("-c")
+                            .arg(format!("systemd-run --user --scope -M {}@ kdotool getactivewindow getwindowclassname", user))
+                            .stderr(Stdio::null())
+                            .output()
+                            .unwrap()
+                    };
+                    let class = std::str::from_utf8(output.stdout.as_slice())
+                        .unwrap()
+                        .trim()
+                        .to_string();
+                    match_class(class, config)
                 }
                 "x11" => {
                     let Ok((connection, _)) = x11rb::connect(None) else {
@@ -159,26 +126,14 @@ pub async fn get_active_window(environment: &Environment, config: &Vec<Config>) 
                         },
                         Err(_) => return Client::Default,
                     };
-                    let class = class_reply.value;
-
-                    if let Some(middle) = class.iter().position(|&byte| byte == 0) {
-                        let class = class.split_at(middle).1;
-                        let mut class = &class[1..];
-                        if class.last() == Some(&0) {
-                            class = &class[..class.len() - 1];
-                        }
-                        let Ok(class_str) = std::str::from_utf8(class) else {
+                    let bytes = class_reply.value;
+                    if let Some(middle) = bytes.iter().position(|&b| b == 0) {
+                        let rest = &bytes[middle + 1..];
+                        let rest = rest.strip_suffix(&[0]).unwrap_or(rest);
+                        let Ok(class_str) = std::str::from_utf8(rest) else {
                             return Client::Default;
                         };
-                        let active_window = Client::Class(class_str.to_string());
-                        if let Some(_) = config
-                            .iter()
-                            .find(|&x| x.associations.client == active_window)
-                        {
-                            active_window
-                        } else {
-                            Client::Default
-                        }
+                        match_class(class_str.to_string(), config)
                     } else {
                         Client::Default
                     }

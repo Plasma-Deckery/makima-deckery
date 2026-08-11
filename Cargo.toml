@@ -17,6 +17,7 @@ fork = "0.1.23"
 zbus = { version = "3", features = ["tokio"] }
 notify = "6"
 libc = "0.2"
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [patch.crates-io]
 # evdev 0.12.1 is missing BTN_GRIPL/GRIPR/GRIPL2/GRIPL2 (Steam Deck back paddles, 0x224-0x227).

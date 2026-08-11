@@ -10,11 +10,12 @@ use crate::kwin_watcher;
 use tokio_stream::StreamExt;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
-#[derive(Debug, Default, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub enum Client {
     #[default]
     Default,
-    Class(String),
+    /// Window class + caption, both forwarded raw by the KWin script.
+    Class(String, String),
 }
 
 #[derive(Clone)]
@@ -31,7 +32,7 @@ pub struct Environment {
     pub server: Server,
 }
 
-pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: String, mut tasks: Vec<JoinHandle<()>>) {
+pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: String, mut tasks: Vec<JoinHandle<()>>, gaming_mode: Arc<Mutex<bool>>) {
     let environment = set_environment();
     let device_error_notify = Arc::new(Notify::new());
     // Separate signal from `device_error_notify`: a real evdev read error
@@ -76,7 +77,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
         }
     }
 
-    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None);
+    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -144,7 +145,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                             task.abort();
                         }
                         tasks.clear();
-                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None);
+                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
                     }
                 }
             }
@@ -156,7 +157,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None);
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
             }
             _ = resume_notify.notified() => {
                 println!("---------------------\n\nResume detected, reinitializing...\n");
@@ -165,7 +166,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                     task.abort();
                 }
                 tasks.clear();
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), prev_virt_dev.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), prev_virt_dev.clone(), gaming_mode.clone());
             }
             Some(_) = config_rx.recv() => {
                 // Debounce: drain any queued events, then wait briefly for the
@@ -179,7 +180,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                     task.abort();
                 }
                 tasks.clear();
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None);
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
             }
         }
     }
@@ -221,6 +222,7 @@ pub fn launch_tasks(
     active_client: Arc<Mutex<Client>>,
     window_changed: Arc<Notify>,
     reuse_virt_dev: Option<Arc<Mutex<VirtualDevices>>>,
+    gaming_mode: Arc<Mutex<bool>>,
 ) -> (Option<Arc<Mutex<VirtualDevices>>>, Arc<Mutex<Vec<Event>>>) {
     let modifiers: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Default::default()));
     let modifier_was_activated: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -279,14 +281,14 @@ pub fn launch_tasks(
                         if let Ok(layout) = split_config_name[1].parse::<u16>() {
                             (Client::Default, layout)
                         } else {
-                            (Client::Class(split_config_name[1].to_string()), 0)
+                            (Client::Class(split_config_name[1].to_string(), String::new()), 0)
                         }
                     }
                     3 => {
                         if let Ok(layout) = split_config_name[1].parse::<u16>() {
-                            (Client::Class(split_config_name[2].to_string()), layout)
+                            (Client::Class(split_config_name[2].to_string(), String::new()), layout)
                         } else if let Ok(layout) = split_config_name[2].parse::<u16>() {
-                            (Client::Class(split_config_name[1].to_string()), layout)
+                            (Client::Class(split_config_name[1].to_string(), String::new()), layout)
                         } else {
                             println!("Warning: unable to parse layout number in {}, treating it as default.", config.name);
                             (Client::Default, 0)
@@ -351,6 +353,7 @@ pub fn launch_tasks(
                 active_client.clone(),
                 window_changed.clone(),
                 std::path::PathBuf::from(&event_device),
+                gaming_mode.clone(),
             );
             tasks.push(tokio::spawn(start_reader(reader)));
             devices_found += 1
@@ -547,6 +550,7 @@ mod tests {
         let client = Arc::new(Mutex::new(Client::Default));
         let window_changed = Arc::new(Notify::new());
 
+        let gaming_mode = Arc::new(Mutex::new(false));
         let (virt_dev_opt, modifiers) = launch_tasks(
             &config_files,
             &mut tasks,
@@ -555,6 +559,7 @@ mod tests {
             client,
             window_changed,
             None,
+            gaming_mode,
         );
 
         if let Some(_) = virt_dev_opt {

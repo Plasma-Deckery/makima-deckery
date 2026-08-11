@@ -6,6 +6,7 @@ mod event_reader;
 mod gesture_pad;
 mod kde_input_defaults;
 mod kwin_watcher;
+mod steam_detector;
 mod lizard_mode;
 mod mt_trackpad;
 mod pad_hidraw;
@@ -22,9 +23,10 @@ mod virtual_devices;
 use crate::udev_monitor::*;
 use config::Config;
 use std::env;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// Process start time, set once at the top of `main()`. Used to log
@@ -101,5 +103,6 @@ async fn main() {
     let config_files = load_config_files(&config_dir);
     println!("makima: config loaded, +{}ms since startup", startup_ms());
     let tasks: Vec<JoinHandle<()>> = Vec::new();
-    start_monitoring_udev(config_files, config_dir, tasks).await;
+    let gaming_mode: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    start_monitoring_udev(config_files, config_dir, tasks, gaming_mode).await;
 }

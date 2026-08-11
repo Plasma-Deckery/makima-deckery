@@ -7,12 +7,15 @@
 //
 // Flow:
 //   1. We register "org.makima.watcher" on the session bus and expose
-//      the object /watcher with method WindowActivated(class_name).
+//      the object /watcher with method WindowActivated(class_name, caption).
 //   2. We write a tiny KWin script to /tmp and load it via
 //      org.kde.kwin.Scripting.loadScript / .start().
 //   3. Whenever KWin fires workspace.windowActivated, the script calls
-//      back into our method → we update the shared Arc<Mutex<Client>>
-//      and wake all EventReader tasks via Arc<Notify>.
+//      back into our method → we update the shared Arc<Mutex<Client>> with
+//      Client::Class(class, caption) and fire Arc<Notify>.
+//
+// This module only reports focus changes. All Gaming Mode policy lives in
+// EventReader::steam_detection_loop(), which reads the caption from active_client.
 
 use crate::udev_monitor::Client;
 use std::sync::Arc;
@@ -20,11 +23,15 @@ use tokio::sync::{Mutex, Notify};
 use zbus::{dbus_interface, dbus_proxy, ConnectionBuilder};
 
 // ── KWin script ──────────────────────────────────────────────────────────────
+//
+// Forwards raw class + caption — no classification logic here.
+// `steam_detector` decides what they mean in Rust.
 
 const KWIN_SCRIPT: &str = r#"
 workspace.windowActivated.connect(function(w) {
     var cls = (w && w.resourceClass) ? w.resourceClass : "";
-    callDBus("org.makima.watcher", "/watcher", "org.makima.watcher", "WindowActivated", cls);
+    var cap = (w && w.caption)       ? w.caption       : "";
+    callDBus("org.makima.watcher", "/watcher", "org.makima.watcher", "WindowActivated", cls, cap);
 });
 "#;
 
@@ -34,20 +41,25 @@ const SCRIPT_PATH: &str = "/tmp/makima-kwin-watcher.js";
 // ── D-Bus interface exposed by makima ─────────────────────────────────────────
 
 struct WatcherIface {
+    /// Shared client state — holds class + caption after every focus change.
+    /// EventReader uses class for config selection; steam_detection_loop
+    /// uses caption for Big Picture Mode detection.
     active_client: Arc<Mutex<Client>>,
+    /// Wakes all EventReader tasks on every focus change.
     notify: Arc<Notify>,
 }
 
 #[dbus_interface(name = "org.makima.watcher")]
 impl WatcherIface {
-    // Called by the KWin script on every window-activation change.
-    async fn window_activated(&self, class_name: String) {
-        let client = if class_name.is_empty() {
+    /// Called by the KWin script on every window-activation change.
+    /// Stores raw class + caption in active_client and fires notify.
+    /// No detection logic here — that lives in EventReader::steam_detection_loop().
+    async fn window_activated(&self, class_name: String, caption: String) {
+        *self.active_client.lock().await = if class_name.is_empty() {
             Client::Default
         } else {
-            Client::Class(class_name)
+            Client::Class(class_name, caption)
         };
-        *self.active_client.lock().await = client;
         self.notify.notify_waiters();
     }
 }
@@ -72,7 +84,10 @@ trait KwinScripting {
 
 /// Starts the KWin window-activation watcher.
 /// Meant to be spawned once as a tokio task; runs indefinitely.
-/// `active_client` and `notify` are shared with all EventReader instances.
+///
+/// On every focus change the watcher stores `Client::Class(class, caption)`
+/// in `active_client` and fires `notify`, waking all EventReader tasks
+/// (config re-evaluation and steam_detection_loop).
 pub async fn start_kwin_watcher(
     active_client: Arc<Mutex<Client>>,
     notify: Arc<Notify>,
@@ -82,7 +97,6 @@ pub async fn start_kwin_watcher(
         return;
     }
 
-    // Register our D-Bus service so KWin can call back into us.
     let conn = match ConnectionBuilder::session()
         .and_then(|b| b.name("org.makima.watcher"))
         .and_then(|b| {
@@ -107,8 +121,6 @@ pub async fn start_kwin_watcher(
         }
     };
 
-    // Wait for KWin to appear on D-Bus (it may not be ready at boot time).
-    // Retry every 2 seconds until the script is loaded successfully.
     loop {
         let scripting = match KwinScriptingProxy::new(&conn).await {
             Ok(p) => p,
@@ -118,7 +130,6 @@ pub async fn start_kwin_watcher(
             }
         };
 
-        // Clean up any leftover instance from a previous run.
         let _ = scripting.unload_script(PLUGIN_NAME).await;
 
         match scripting.load_script(SCRIPT_PATH, PLUGIN_NAME).await {
@@ -131,13 +142,11 @@ pub async fn start_kwin_watcher(
                 break;
             }
             Err(_) => {
-                // KWin not ready yet — wait and retry.
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
     }
 
-    // Keep the connection alive — callbacks arrive asynchronously.
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }
@@ -151,51 +160,62 @@ mod tests {
     use crate::udev_monitor::Client;
     use tokio::time::{timeout, Duration};
 
+    fn make_iface() -> WatcherIface {
+        WatcherIface {
+            active_client: Arc::new(Mutex::new(Client::Default)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
     #[tokio::test]
-    async fn window_activated_updates_client_and_notifies() {
+    async fn window_activated_stores_class_and_caption_in_client() {
         let active_client = Arc::new(Mutex::new(Client::Default));
         let notify = Arc::new(Notify::new());
-
         let iface = WatcherIface {
             active_client: active_client.clone(),
             notify: notify.clone(),
         };
 
-        // First, start waiting for the notification
         let notify_clone = notify.clone();
-        let wait_task = tokio::spawn(async move {
-            notify_clone.notified().await;
-        });
-
-        // Yield to ensure the spawned task actually reaches the `.await`
-        // before we trigger the notification.
+        let wait_task = tokio::spawn(async move { notify_clone.notified().await; });
         tokio::task::yield_now().await;
 
-        // Simulate KWin script calling the D-Bus method
-        iface.window_activated("org.mozilla.firefox".to_string()).await;
+        iface.window_activated("org.mozilla.firefox".to_string(), "Firefox".to_string()).await;
 
-        // Verify the state was correctly updated
-        let client = active_client.lock().await;
-        assert_eq!(*client, Client::Class("org.mozilla.firefox".to_string()));
-
-        // Verify the notification was actually fired (should resolve immediately)
+        assert_eq!(
+            *active_client.lock().await,
+            Client::Class("org.mozilla.firefox".to_string(), "Firefox".to_string()),
+        );
         assert!(timeout(Duration::from_millis(100), wait_task).await.is_ok());
     }
 
     #[tokio::test]
     async fn window_activated_empty_string_resets_to_default() {
-        let active_client = Arc::new(Mutex::new(Client::Class("some.other.app".to_string())));
-        let notify = Arc::new(Notify::new());
+        let iface = make_iface();
+        *iface.active_client.lock().await =
+            Client::Class("some.other.app".to_string(), String::new());
+        iface.window_activated("".to_string(), "".to_string()).await;
+        assert_eq!(*iface.active_client.lock().await, Client::Default);
+    }
 
-        let iface = WatcherIface {
-            active_client: active_client.clone(),
-            notify: notify.clone(),
-        };
+    #[tokio::test]
+    async fn window_activated_stores_bpm_caption() {
+        let iface = make_iface();
+        iface.window_activated("steam".to_string(), "Steam Big Picture".to_string()).await;
+        assert_eq!(
+            *iface.active_client.lock().await,
+            Client::Class("steam".to_string(), "Steam Big Picture".to_string()),
+        );
+    }
 
-        // Simulate empty class name (e.g., desktop focus lost)
-        iface.window_activated("".to_string()).await;
-
-        let client = active_client.lock().await;
-        assert_eq!(*client, Client::Default);
+    #[tokio::test]
+    async fn window_activated_fires_notify_for_every_focus_change() {
+        let iface = make_iface();
+        iface.window_activated("org.mozilla.firefox".to_string(), "Firefox".to_string()).await;
+        let notify_clone = iface.notify.clone();
+        let wait_task = tokio::spawn(async move { notify_clone.notified().await; });
+        tokio::task::yield_now().await;
+        iface.window_activated("org.kde.dolphin".to_string(), "Dolphin".to_string()).await;
+        assert!(timeout(Duration::from_millis(100), wait_task).await.is_ok());
     }
 }

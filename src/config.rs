@@ -1,4 +1,4 @@
-use crate::mt_trackpad::HapticPulse;
+use crate::mt_trackpad::{HapticChain, HapticPulse};
 use crate::udev_monitor::Client;
 use evdev::Key;
 use serde;
@@ -265,41 +265,73 @@ pub struct MappedModifiers {
 
 // ── Gaming Mode configuration ─────────────────────────────────────────────────
 
+/// Raw TOML form of the double-click trigger: the key name plus an optional
+/// inter-click window. Parsed from a `trigger = { key = "...", ms = N }` table.
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct RawDoubleclickTrigger {
+    /// Key name (e.g. `"BTN_BASE"`).
+    /// `"disabled"` → trigger disabled (explicit opt-out).
+    /// Any other unrecognised string → warning + disabled.
+    pub key: String,
+    /// Maximum milliseconds between two presses to count as a double-click.
+    /// Absent → 400.
+    pub ms: Option<u64>,
+}
+
+/// Parsed double-click trigger, ready for use at runtime.
+#[derive(Debug, Clone)]
+pub struct DoubleclickTrigger {
+    pub key: Key,
+    pub ms: u64,
+}
+
 /// Raw TOML deserialization type for the `[gaming_mode]` section.
 #[derive(serde::Deserialize, Debug, Clone, Default)]
 pub struct RawGamingModeConfig {
-    /// Which button triggers the double-click toggle (default: `"BTN_BASE"`,
-    /// the `...` / QAM button on Steam Deck). Empty string = disabled.
-    pub double_click_trigger: Option<String>,
-    /// Maximum milliseconds between two presses to register as a double-click
-    /// (default: 400).
-    pub double_click_ms: Option<u64>,
-    /// Optional haptic pulse fired on each Gaming Mode toggle.
-    pub haptic: Option<HapticPulse>,
+    /// Double-click trigger configuration.
+    /// Absent → default (BTN_BASE, 400 ms).
+    /// `trigger = { key = "disabled" }` → trigger disabled.
+    pub trigger: Option<RawDoubleclickTrigger>,
+    /// Haptic chain fired when Gaming Mode is *enabled*.
+    /// Falls back to `haptic` if absent, then to the built-in default.
+    pub haptic_on: Option<HapticChain>,
+    /// Haptic chain fired when Gaming Mode is *disabled*.
+    /// Falls back to `haptic` if absent, then to the built-in default.
+    pub haptic_off: Option<HapticChain>,
+    /// Legacy single-chain field — used as fallback when `haptic_on`/
+    /// `haptic_off` are not set, so existing configs keep working unchanged.
+    pub haptic: Option<HapticChain>,
 }
 
 /// Parsed Gaming Mode configuration, ready for use at runtime.
 #[derive(Debug, Clone)]
 pub struct GamingModeConfig {
-    /// Physical key that must be double-clicked to toggle Gaming Mode.
-    /// `None` means the double-click trigger is disabled.
-    /// Absent → BTN_BASE, empty string → disabled, unrecognised → disabled + warning.
-    pub double_click_trigger: Option<Key>,
-    /// Maximum interval between two presses to count as a double-click.
-    pub double_click_ms: u64,
-    /// Haptic pulse fired on each toggle.
-    /// Defaults to `HapticPulse::default()` (3-pulse burst) when not configured.
-    pub haptic: HapticPulse,
+    /// Double-click trigger. `None` means the trigger is disabled.
+    pub trigger: Option<DoubleclickTrigger>,
+    /// Haptic chain fired when Gaming Mode is *enabled*.
+    pub haptic_on: HapticChain,
+    /// Haptic chain fired when Gaming Mode is *disabled*.
+    pub haptic_off: HapticChain,
 }
 
 impl Default for GamingModeConfig {
     fn default() -> Self {
+        // Two staccato pings (8 ms burst, 150 ms apart) for both on and off.
+        // On/off use the same feel by default; users can differentiate via TOML.
+        let default_chain = HapticChain::Chain(vec![
+            crate::mt_trackpad::HapticChainStep {
+                pulse: HapticPulse { duration_us: 8000, interval_us: 8000, count: 1, gain_db: 0 },
+                pause_ms: Some(150),
+            },
+            crate::mt_trackpad::HapticChainStep {
+                pulse: HapticPulse { duration_us: 8000, interval_us: 8000, count: 1, gain_db: 0 },
+                pause_ms: None,
+            },
+        ]);
         GamingModeConfig {
-            double_click_trigger: Some(Key::BTN_BASE),
-            double_click_ms: 400,
-            // Deliberately more prominent than the trackpad click default:
-            // two pulses with a wide gap so the double-beat is clearly felt.
-            haptic: HapticPulse { duration_us: 12000, interval_us: 16000, count: 2, gain_db: 0 },
+            trigger: Some(DoubleclickTrigger { key: Key::BTN_BASE, ms: 400 }),
+            haptic_on:  default_chain.clone(),
+            haptic_off: default_chain,
         }
     }
 }
@@ -307,26 +339,30 @@ impl Default for GamingModeConfig {
 impl GamingModeConfig {
     fn from_raw(raw: Option<RawGamingModeConfig>) -> Self {
         let Some(raw) = raw else { return Self::default(); };
-        let double_click_trigger: Option<Key> = match raw.double_click_trigger.as_deref() {
-            // Not set → default (BTN_BASE).
-            None => Some(Key::BTN_BASE),
-            // Explicitly empty → disabled.
-            Some("") => None,
-            // Named key — must be valid, otherwise disabled with a warning.
-            Some(s) => match Key::from_str(s) {
-                Ok(key) => Some(key),
+
+        // Parse trigger: absent → default, key="disabled" → None, invalid → None + warning.
+        let trigger: Option<DoubleclickTrigger> = match raw.trigger {
+            None => Self::default().trigger,
+            Some(ref t) if t.key == "disabled" => None,
+            Some(ref t) => match Key::from_str(&t.key) {
+                Ok(key) => Some(DoubleclickTrigger { key, ms: t.ms.unwrap_or(400) }),
                 Err(_) => {
                     eprintln!(
-                        "[makima] WARNING: unknown gaming_mode double_click_trigger {:?} — trigger disabled",
-                        s
+                        "[makima] WARNING: unknown gaming_mode trigger key {:?} — trigger disabled",
+                        t.key
                     );
                     None
                 }
             },
         };
-        let double_click_ms = raw.double_click_ms.unwrap_or(400);
-        let haptic = raw.haptic.unwrap_or_default();
-        GamingModeConfig { double_click_trigger, double_click_ms, haptic }
+
+        // haptic_on / haptic_off fall back to `haptic`, then to the built-in default chain.
+        let default_chain = Self::default();
+        let fallback = raw.haptic.unwrap_or_else(|| default_chain.haptic_on.clone());
+        let haptic_on  = raw.haptic_on .unwrap_or_else(|| fallback.clone());
+        let haptic_off = raw.haptic_off.unwrap_or(fallback);
+
+        GamingModeConfig { trigger, haptic_on, haptic_off }
     }
 }
 

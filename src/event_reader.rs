@@ -113,27 +113,27 @@ pub struct EventReader {
     haptic_tx: Arc<Mutex<Option<mpsc::Sender<HapticCommand>>>>,
 }
 
-/// Sets Gaming Mode to `new_state`, logs the transition, and fires haptic
-/// feedback on both trackpads.
+/// Sets Gaming Mode to `new_state`, logs the transition, and fires the
+/// appropriate haptic chain on both trackpads.
 ///
-/// Called from two independent paths:
+/// Called from three independent paths:
 ///   1. The double-click trigger in `convert_event` (toggles: `!current`).
 ///   2. The IPC handler (`gaming_mode enable` / `gaming_mode disable`).
+///   3. `steam_detection_loop` (auto-detection via process tree + BPM window).
 ///
-/// Neither caller duplicates the haptic logic — they only supply the new state
-/// and the shared Arcs. Writing state.json is intentionally left to the
-/// caller: the IPC path has its own inline write, while the double-click path
-/// calls `self.write_state()`.
+/// Writing state.json is left to the caller — each path has its own context
+/// for when and how to persist (double-click and steam_detection_loop call
+/// `self.write_state()`; the IPC path does an inline write).
 async fn apply_gaming_mode(
     gaming_mode: &Arc<Mutex<bool>>,
     new_state: bool,
     haptic_tx: &Arc<Mutex<Option<mpsc::Sender<HapticCommand>>>>,
-    haptic: crate::mt_trackpad::HapticPulse,
+    chain: &crate::mt_trackpad::HapticChain,
 ) {
     *gaming_mode.lock().await = new_state;
     println!("makima: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
     let tx = haptic_tx.lock().await.clone();
-    mt_trackpad::pulse(&tx, HapticPad::Both, haptic).await;
+    mt_trackpad::fire_chain(&tx, HapticPad::Both, chain).await;
 }
 
 impl EventReader {
@@ -148,6 +148,7 @@ impl EventReader {
         active_client: Arc<Mutex<Client>>,
         window_changed: Arc<Notify>,
         device_path: std::path::PathBuf,
+        gaming_mode: Arc<Mutex<bool>>,
     ) -> Self {
         let mut position_vector: Vec<i32> = Vec::new();
         for i in [0, 0] {
@@ -165,7 +166,6 @@ impl EventReader {
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
         let active_layout: Arc<Mutex<u16>> = Arc::new(Mutex::new(0));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let gaming_mode: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -485,6 +485,7 @@ impl EventReader {
             self.key_cursor_loop(),
             self.key_scroll_loop(),
             self.window_changed_loop(),
+            self.steam_detection_loop(),
             self.state_write_loop(state_rx),
             session.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()),
         );
@@ -499,6 +500,34 @@ impl EventReader {
                     self.window_changed.notified().await;
                     self.update_config().await;
                 }
+            }
+        }
+    }
+
+    /// Auto-detects whether a Steam game is running on every window-activation
+    /// event (KDE only) and toggles Gaming Mode accordingly.
+    ///
+    /// Reads class + caption from `active_client` (set by kwin_watcher), then
+    /// calls `steam_detector::should_be_gaming()`.  When the detected state
+    /// changes, `apply_gaming_mode()` is called and `write_state()` persists
+    /// the result — exactly as the manual double-click path does.
+    async fn steam_detection_loop(&self) {
+        if !matches!(&self.environment.server, Server::Connected(s) if s == "KDE") {
+            return;
+        }
+        let mut detector = crate::steam_detector::SteamDetector::new();
+        loop {
+            self.window_changed.notified().await;
+            let (class, caption) = match &*self.active_client.lock().await {
+                Client::Class(c, cap) => (c.clone(), cap.clone()),
+                Client::Default => (String::new(), String::new()),
+            };
+            let new_state = detector.update(&class, &caption);
+            if new_state != *self.gaming_mode.lock().await {
+                let chain = if new_state { &self.gaming_mode_config.haptic_on }
+                            else        { &self.gaming_mode_config.haptic_off };
+                apply_gaming_mode(&self.gaming_mode, new_state, &self.haptic_tx, chain).await;
+                self.write_state().await;
             }
         }
     }
@@ -1321,24 +1350,24 @@ impl EventReader {
         // Skipped entirely when `trigger` is None (not configured or invalid).
         // Runs before the Gaming Mode guard so the second press is never
         // suppressed — even while Gaming Mode is already active (to turn it off).
-        if let Some(trigger_key) = self.gaming_mode_config.double_click_trigger {
-            if event == Event::Key(trigger_key) && value == 1 {
+        if let Some(ref trigger) = self.gaming_mode_config.trigger {
+            if event == Event::Key(trigger.key) && value == 1 {
                 let now = std::time::Instant::now();
                 let mut ts = self.gaming_mode_trigger_ts.lock().await;
                 let within_window = ts
-                    .map(|prev| now.duration_since(prev).as_millis() <= self.gaming_mode_config.double_click_ms as u128)
+                    .map(|prev| now.duration_since(prev).as_millis() <= trigger.ms as u128)
                     .unwrap_or(false);
                 if within_window {
                     *ts = None;
                     drop(ts);
-                    // Flip Gaming Mode, log, and fire haptic feedback.
+                    // Flip Gaming Mode, log, and fire the appropriate haptic chain.
                     let new_state = !*self.gaming_mode.lock().await;
-                    apply_gaming_mode(
-                        &self.gaming_mode,
-                        new_state,
-                        &self.haptic_tx,
-                        self.gaming_mode_config.haptic,
-                    ).await;
+                    let chain = if new_state {
+                        &self.gaming_mode_config.haptic_on
+                    } else {
+                        &self.gaming_mode_config.haptic_off
+                    };
+                    apply_gaming_mode(&self.gaming_mode, new_state, &self.haptic_tx, chain).await;
                     self.write_state().await;
                     return;
                 } else {
@@ -1780,14 +1809,18 @@ impl EventReader {
     async fn change_active_layout(&self) {
         let mut active_layout = self.active_layout.lock().await;
         let active_window = get_active_window(&self.environment, &self.config).await;
+        let active_class = match &active_window { Client::Class(c, _) => c.as_str(), Client::Default => "" };
         loop {
             if *active_layout == 3 {
                 *active_layout = 0
             } else {
                 *active_layout += 1
             };
-            if let Some(_) = self.config.iter().find(|&x| {
-                x.associations.layout == *active_layout && x.associations.client == active_window
+            if self.config.iter().any(|x| {
+                x.associations.layout == *active_layout && match &x.associations.client {
+                    Client::Class(c, _) => c == active_class,
+                    Client::Default => active_class.is_empty(),
+                }
             }) {
                 break;
             };
@@ -1810,7 +1843,11 @@ impl EventReader {
             let active_window = match &self.environment.server {
                 Server::Connected(s) if s == "KDE" => {
                     let client = self.active_client.lock().await.clone();
-                    if self.config.iter().any(|x| x.associations.client == client) {
+                    let class = match &client { Client::Class(c, _) => c.as_str(), Client::Default => "" };
+                    if self.config.iter().any(|x| match &x.associations.client {
+                        Client::Class(c, _) => c == class,
+                        Client::Default => class.is_empty(),
+                    }) {
                         client
                     } else {
                         Client::Default
@@ -2097,11 +2134,17 @@ impl EventReader {
                                     *paused.lock().await = cmd == "pause";
                                 } else {
                                     // Set Gaming Mode, log, and fire haptic feedback.
+                                    let new_state = cmd == "gaming_mode enable";
+                                    let chain = if new_state {
+                                        &gaming_mode_cfg_ipc.haptic_on
+                                    } else {
+                                        &gaming_mode_cfg_ipc.haptic_off
+                                    };
                                     apply_gaming_mode(
                                         &gaming_mode_ipc,
-                                        cmd == "gaming_mode enable",
+                                        new_state,
                                         &haptic_tx_ipc,
-                                        gaming_mode_cfg_ipc.haptic,
+                                        chain,
                                     ).await;
                                 }
                                 // Write state immediately so the HUD sees the updated

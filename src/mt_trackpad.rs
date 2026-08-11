@@ -21,6 +21,7 @@ use crate::trackpad::PadState;
 use crate::trackpad_router::SinglePadFrame;
 use crate::virtual_devices::VirtualDevices;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
 /// Parameters of a single haptic "click tick" — how a physical trackpad
@@ -79,13 +80,16 @@ pub struct MovementHaptic {
 
 /// Haptic policy for this handler: which events fire a pulse, and with what
 /// parameters. A physical click is really two distinct edges — press and
-/// release — and they deserve independent pulses rather than being collapsed
+/// release — and they deserve independent chains rather than being collapsed
 /// into a single "on_click". `on_movement` gates on cumulative pixel distance
 /// (see `MovementHaptic`) rather than time, to avoid continuous buzzing.
+/// `on_movement` intentionally keeps a single `HapticPulse` (not a chain):
+/// it fires on every distance threshold crossing, so a multi-step chain would
+/// overlap itself under fast movement.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct HapticConfig {
-    pub on_press: Option<HapticPulse>,
-    pub on_release: Option<HapticPulse>,
+    pub on_press: Option<HapticChain>,
+    pub on_release: Option<HapticChain>,
     pub on_movement: Option<MovementHaptic>,
 }
 
@@ -110,27 +114,19 @@ impl MtTrackpadConfig {
         })
     }
 
-    /// The haptic pulse to fire on the press edge (finger comes down on an
-    /// already-touching pad) — user-configured `on_press`, or the
-    /// conservative built-in default. Defaults to firing (rather than
-    /// silence) to preserve the pre-press/release-split behavior of the old
-    /// single `on_click` pulse, which always fired on this same edge.
-    pub fn press_pulse(&self) -> HapticPulse {
-        self.haptic.on_press.unwrap_or_default()
+    /// The haptic chain to fire on the press edge (finger comes down on an
+    /// already-touching pad) — user-configured `on_press`, or the built-in
+    /// default single-pulse chain.
+    pub fn press_chain(&self) -> HapticChain {
+        self.haptic.on_press.clone().unwrap_or_default()
     }
 
-    /// The haptic pulse to fire on the release edge (finger lifts off the
-    /// click mechanism while still touching) — user-configured `on_release`,
-    /// or the same built-in default as `press_pulse`. Originally left silent
-    /// unless explicitly configured (release haptics were new opt-in
-    /// behavior with no established feel to fall back to), but on-hardware
-    /// A/B testing (2026-07-10) confirmed the tuned default burst feels
-    /// right on both edges, so it's now a real default like press rather
-    /// than opt-in-only. Still returns `Option` (not a bare `HapticPulse`)
-    /// so a future need to silence release-only without touching press
-    /// remains possible via explicit config.
-    pub fn release_pulse(&self) -> Option<HapticPulse> {
-        Some(self.haptic.on_release.unwrap_or_default())
+    /// The haptic chain to fire on the release edge — user-configured
+    /// `on_release`, or the same built-in default as `press_chain`.
+    /// Returns `Option` so a user can silence release-only by omitting it,
+    /// while press still fires.
+    pub fn release_chain(&self) -> Option<HapticChain> {
+        Some(self.haptic.on_release.clone().unwrap_or_default())
     }
 
     /// The movement pulse/distance-gate policy, if configured. `None` by
@@ -139,6 +135,51 @@ impl MtTrackpadConfig {
     pub fn movement_pulse(&self) -> Option<MovementHaptic> {
         self.haptic.on_movement
     }
+}
+
+/// One step in a `HapticChain`: a single burst followed by an optional pause
+/// before the next step. The last step in a chain typically has `pause_ms =
+/// None` (no pause needed after the final pulse).
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct HapticChainStep {
+    #[serde(flatten)]
+    pub pulse: HapticPulse,
+    /// Milliseconds to wait after this pulse before firing the next one.
+    /// `None` (or omitted in TOML) on the last step.
+    pub pause_ms: Option<u64>,
+}
+
+/// A sequence of haptic pulses, each with an optional inter-pulse pause.
+///
+/// Deserialises from two TOML forms — existing single-pulse configs need no
+/// migration:
+///
+/// ```toml
+/// # Single pulse (backward-compatible):
+/// haptic_on = { duration_us = 8000, count = 1 }
+///
+/// # Chain with pauses:
+/// haptic_on = [
+///     { duration_us = 8000, count = 1, pause_ms = 150 },
+///     { duration_us = 8000, count = 1 },
+/// ]
+/// ```
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum HapticChain {
+    /// Single burst — the common case and the backward-compatible form.
+    Single(HapticPulse),
+    /// Ordered sequence of pulses; each step may pause before the next.
+    Chain(Vec<HapticChainStep>),
+}
+
+impl Default for HapticChain {
+    fn default() -> Self { Self::Single(HapticPulse::default()) }
+}
+
+impl HapticChain {
+    /// Wraps a single pulse as a chain (convenience constructor).
+    pub fn single(pulse: HapticPulse) -> Self { Self::Single(pulse) }
 }
 
 /// Fires a haptic pulse on `pad` per `pulse`, best-effort: a missing/failed
@@ -164,6 +205,25 @@ pub(crate) async fn pulse(haptic_tx: &Option<mpsc::Sender<HapticCommand>>, pad: 
     }
 }
 
+/// Fires a `HapticChain` on `pad`: single pulse or ordered sequence with
+/// per-step pauses. This is the single execution point for all chain logic —
+/// callers never inspect the chain shape themselves.
+pub(crate) async fn fire_chain(haptic_tx: &Option<mpsc::Sender<HapticCommand>>, pad: HapticPad, chain: &HapticChain) {
+    match chain {
+        HapticChain::Single(p) => pulse(haptic_tx, pad, *p).await,
+        HapticChain::Chain(steps) => {
+            for step in steps {
+                pulse(haptic_tx, pad, step.pulse).await;
+                if let Some(ms) = step.pause_ms {
+                    if ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Runs one individual (non-gesture) MT trackpad handler until `rx` closes.
 /// Consumes `SinglePadFrame`s already routed to this pad by
 /// `trackpad_router::run` and emits them to `pad`'s virtual MT device,
@@ -177,8 +237,8 @@ pub async fn run_single(
     pad: &PadState,
     haptic_tx: Option<mpsc::Sender<HapticCommand>>,
     haptic_pad: HapticPad,
-    press_pulse: HapticPulse,
-    release_pulse: Option<HapticPulse>,
+    press_chain: HapticChain,
+    release_chain: Option<HapticChain>,
     movement_pulse: Option<MovementHaptic>,
 ) {
     let mut prev_click = false;
@@ -199,10 +259,10 @@ pub async fn run_single(
             );
         }
         if press_edge {
-            pulse(&haptic_tx, haptic_pad, press_pulse).await;
+            fire_chain(&haptic_tx, haptic_pad, &press_chain).await;
         } else if release_edge {
-            if let Some(p) = release_pulse {
-                pulse(&haptic_tx, haptic_pad, p).await;
+            if let Some(ref c) = release_chain {
+                fire_chain(&haptic_tx, haptic_pad, c).await;
             }
         }
 

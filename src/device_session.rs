@@ -16,7 +16,7 @@
 use crate::config::TrackpadConfig;
 use crate::gesture_pad::{self, GesturePadConfig};
 use crate::kde_input_defaults::{self, GestureKdeConfig, PadKdeConfig};
-use crate::mt_trackpad::{self, HapticPulse, MovementHaptic, MtTrackpadConfig};
+use crate::mt_trackpad::{self, HapticChain, MovementHaptic, MtTrackpadConfig};
 use crate::pad_hidraw::{self, HapticCommand, HapticPad, PadFrame};
 use crate::trackball::{self, TrackballConfig};
 use crate::trackpad::PadState;
@@ -35,12 +35,12 @@ pub struct TrackpadSession {
     combined_tx: Option<mpsc::Sender<GestureEvent>>,
     combined_rx: Option<mpsc::Receiver<GestureEvent>>,
 
-    left_press_pulse:    HapticPulse,
-    left_release_pulse:  Option<HapticPulse>,
+    left_press_chain:    HapticChain,
+    left_release_chain:  Option<HapticChain>,
     left_movement_pulse: Option<MovementHaptic>,
 
-    right_press_pulse:    HapticPulse,
-    right_release_pulse:  Option<HapticPulse>,
+    right_press_chain:    HapticChain,
+    right_release_chain:  Option<HapticChain>,
     right_movement_pulse: Option<MovementHaptic>,
 
     gesture_pad_config: GesturePadConfig,
@@ -162,11 +162,11 @@ impl TrackpadSession {
             right_rx,
             combined_tx,
             combined_rx,
-            left_press_pulse:    left_mt.press_pulse(),
-            left_release_pulse:  left_mt.release_pulse(),
+            left_press_chain:    left_mt.press_chain(),
+            left_release_chain:  left_mt.release_chain(),
             left_movement_pulse: left_mt.movement_pulse(),
-            right_press_pulse:    right_mt.press_pulse(),
-            right_release_pulse:  right_mt.release_pulse(),
+            right_press_chain:    right_mt.press_chain(),
+            right_release_chain:  right_mt.release_chain(),
             right_movement_pulse: right_mt.movement_pulse(),
             gesture_pad_config,
             lball_rx,
@@ -216,8 +216,8 @@ impl TrackpadSession {
                     mt_trackpad::run_single(
                         rx, virt_dev, lpad,
                         left_haptic, HapticPad::Left,
-                        self.left_press_pulse,
-                        self.left_release_pulse,
+                        self.left_press_chain,
+                        self.left_release_chain,
                         self.left_movement_pulse,
                     )
                     .await;
@@ -228,8 +228,8 @@ impl TrackpadSession {
                     mt_trackpad::run_single(
                         rx, virt_dev, rpad,
                         right_haptic, HapticPad::Right,
-                        self.right_press_pulse,
-                        self.right_release_pulse,
+                        self.right_press_chain,
+                        self.right_release_chain,
                         self.right_movement_pulse,
                     )
                     .await;
