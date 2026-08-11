@@ -1,3 +1,4 @@
+use crate::mt_trackpad::HapticPulse;
 use crate::udev_monitor::Client;
 use evdev::Key;
 use serde;
@@ -262,6 +263,73 @@ pub struct MappedModifiers {
     pub all: Vec<Event>,
 }
 
+// ── Gaming Mode configuration ─────────────────────────────────────────────────
+
+/// Raw TOML deserialization type for the `[gaming_mode]` section.
+#[derive(serde::Deserialize, Debug, Clone, Default)]
+pub struct RawGamingModeConfig {
+    /// Which button triggers the double-click toggle (default: `"BTN_BASE"`,
+    /// the `...` / QAM button on Steam Deck). Empty string = disabled.
+    pub double_click_trigger: Option<String>,
+    /// Maximum milliseconds between two presses to register as a double-click
+    /// (default: 400).
+    pub double_click_ms: Option<u64>,
+    /// Optional haptic pulse fired on each Gaming Mode toggle.
+    pub haptic: Option<HapticPulse>,
+}
+
+/// Parsed Gaming Mode configuration, ready for use at runtime.
+#[derive(Debug, Clone)]
+pub struct GamingModeConfig {
+    /// Physical key that must be double-clicked to toggle Gaming Mode.
+    /// `None` means the double-click trigger is disabled.
+    /// Absent → BTN_BASE, empty string → disabled, unrecognised → disabled + warning.
+    pub double_click_trigger: Option<Key>,
+    /// Maximum interval between two presses to count as a double-click.
+    pub double_click_ms: u64,
+    /// Haptic pulse fired on each toggle.
+    /// Defaults to `HapticPulse::default()` (3-pulse burst) when not configured.
+    pub haptic: HapticPulse,
+}
+
+impl Default for GamingModeConfig {
+    fn default() -> Self {
+        GamingModeConfig {
+            double_click_trigger: Some(Key::BTN_BASE),
+            double_click_ms: 400,
+            // Deliberately more prominent than the trackpad click default:
+            // two pulses with a wide gap so the double-beat is clearly felt.
+            haptic: HapticPulse { duration_us: 12000, interval_us: 16000, count: 2, gain_db: 0 },
+        }
+    }
+}
+
+impl GamingModeConfig {
+    fn from_raw(raw: Option<RawGamingModeConfig>) -> Self {
+        let Some(raw) = raw else { return Self::default(); };
+        let double_click_trigger: Option<Key> = match raw.double_click_trigger.as_deref() {
+            // Not set → default (BTN_BASE).
+            None => Some(Key::BTN_BASE),
+            // Explicitly empty → disabled.
+            Some("") => None,
+            // Named key — must be valid, otherwise disabled with a warning.
+            Some(s) => match Key::from_str(s) {
+                Ok(key) => Some(key),
+                Err(_) => {
+                    eprintln!(
+                        "[makima] WARNING: unknown gaming_mode double_click_trigger {:?} — trigger disabled",
+                        s
+                    );
+                    None
+                }
+            },
+        };
+        let double_click_ms = raw.double_click_ms.unwrap_or(400);
+        let haptic = raw.haptic.unwrap_or_default();
+        GamingModeConfig { double_click_trigger, double_click_ms, haptic }
+    }
+}
+
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct RawConfig {
     #[serde(default)]
@@ -274,6 +342,8 @@ pub struct RawConfig {
     pub settings: HashMap<String, String>,
     #[serde(default)]
     pub trackpad: RawTrackpadConfig,
+    #[serde(default)]
+    pub gaming_mode: Option<RawGamingModeConfig>,
 }
 
 impl RawConfig {
@@ -290,12 +360,14 @@ impl RawConfig {
         let movements = raw_config.movements;
         let settings = raw_config.settings;
         let trackpad = raw_config.trackpad;
+        let gaming_mode = raw_config.gaming_mode;
         Self {
             remap,
             commands,
             movements,
             settings,
             trackpad,
+            gaming_mode,
         }
     }
 }
@@ -316,12 +388,16 @@ pub struct Config {
     /// Falls back to legacy `LPAD`/`RPAD` settings when `[trackpad]` is absent.
     /// Only meaningful on the base config; app-specific configs inherit from base.
     pub trackpad: TrackpadConfig,
+    /// Gaming Mode trigger configuration parsed from `[gaming_mode]`.
+    /// Only meaningful on the base config; app-specific configs inherit from base.
+    pub gaming_mode_config: GamingModeConfig,
 }
 
 impl Config {
     pub fn new_from_file(file: &str, file_name: String) -> Self {
         let raw_config = RawConfig::new_from_file(file);
         let raw_trackpad = raw_config.trackpad.clone();
+        let raw_gaming_mode = raw_config.gaming_mode.clone();
         let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config);
         let associations = Default::default();
 
@@ -344,6 +420,9 @@ impl Config {
                 .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
         };
 
+        // Parse [gaming_mode] section; fall back to defaults when absent.
+        let gaming_mode_config = GamingModeConfig::from_raw(raw_gaming_mode);
+
         Self {
             name: file_name,
             associations,
@@ -352,6 +431,7 @@ impl Config {
             settings,
             mapped_modifiers,
             trackpad,
+            gaming_mode_config,
         }
     }
 
@@ -364,6 +444,7 @@ impl Config {
             settings: Default::default(),
             mapped_modifiers: Default::default(),
             trackpad: Default::default(),
+            gaming_mode_config: Default::default(),
         }
     }
 
@@ -448,6 +529,8 @@ impl Config {
         {
             self.trackpad = base.trackpad.clone();
         }
+        // Gaming Mode config is device-level; always inherit from base.
+        self.gaming_mode_config = base.gaming_mode_config.clone();
         self.mapped_modifiers.all.clear();
         self.mapped_modifiers.all.extend(self.mapped_modifiers.default.clone());
         self.mapped_modifiers.all.extend(self.mapped_modifiers.custom.clone());

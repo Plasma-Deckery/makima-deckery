@@ -41,6 +41,7 @@ fn make_config(
             all: all_mods,
         },
         trackpad: Default::default(),
+        gaming_mode_config: Default::default(),
     }
 }
 
@@ -470,7 +471,8 @@ fn override_remap_hides_base_command() {
                 custom: vec![btn_tl],
                 all: vec![btn_tl],
             },
-        trackpad: Default::default(),
+            trackpad: Default::default(),
+            gaming_mode_config: Default::default(),
         }
     };
 
@@ -489,7 +491,8 @@ fn override_remap_hides_base_command() {
             override_bindings: None,
             settings: HashMap::new(),
             mapped_modifiers: Default::default(),
-        trackpad: Default::default(),
+            trackpad: Default::default(),
+            gaming_mode_config: Default::default(),
         }
     };
 
@@ -539,7 +542,8 @@ fn override_clears_base_label() {
         mapped_modifiers: crate::config::MappedModifiers {
             custom: vec![btn_tl], all: vec![btn_tl], default: vec![],
         },
-    trackpad: Default::default(),
+        trackpad: Default::default(),
+        gaming_mode_config: Default::default(),
     };
 
     // Override replaces with a remap, no label defined.
@@ -553,7 +557,8 @@ fn override_clears_base_label() {
         override_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: Default::default(),
-    trackpad: Default::default(),
+        trackpad: Default::default(),
+        gaming_mode_config: Default::default(),
     };
 
     app.merge_base(&base);
@@ -594,7 +599,8 @@ fn override_label_replaces_base_label() {
         mapped_modifiers: crate::config::MappedModifiers {
             custom: vec![btn_tl], all: vec![btn_tl], default: vec![],
         },
-    trackpad: Default::default(),
+        trackpad: Default::default(),
+        gaming_mode_config: Default::default(),
     };
 
     // Override replaces with a remap AND defines its own label.
@@ -610,7 +616,8 @@ fn override_label_replaces_base_label() {
         override_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: Default::default(),
-    trackpad: Default::default(),
+        trackpad: Default::default(),
+        gaming_mode_config: Default::default(),
     };
 
     app.merge_base(&base);
@@ -680,7 +687,8 @@ fn origin_override_vs_base() {
             custom: vec![btn_tl],
             all: vec![btn_tl],
         },
-    trackpad: Default::default(),
+        trackpad: Default::default(),
+        gaming_mode_config: Default::default(),
     };
 
     let state = build_state(

@@ -1,6 +1,8 @@
 use crate::active_client::*;
-use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, Relative, Scroll, TrackpadConfig};
+use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::device_session::TrackpadSession;
+use crate::mt_trackpad;
+use crate::pad_hidraw::{HapticCommand, HapticPad};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::trackpad::PadState;
@@ -100,6 +102,38 @@ pub struct EventReader {
     /// Path of the evdev device this reader is attached to — used to locate the
     /// corresponding hidraw sibling via sysfs at startup.
     device_path: std::path::PathBuf,
+    /// Gaming Mode trigger configuration (from `[gaming_mode]` in the base config).
+    /// Stored here so `convert_event` can check it without locking anything.
+    gaming_mode_config: GamingModeConfig,
+    /// Timestamp of the last Gaming Mode trigger button press.
+    /// Used to detect a double-click within `gaming_mode_config.double_click_ms`.
+    gaming_mode_trigger_ts: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Haptic command channel, wired from `TrackpadSession` after setup.
+    /// `None` when the hidraw sibling was not found (trackpad position unavailable).
+    haptic_tx: Arc<Mutex<Option<mpsc::Sender<HapticCommand>>>>,
+}
+
+/// Sets Gaming Mode to `new_state`, logs the transition, and fires haptic
+/// feedback on both trackpads.
+///
+/// Called from two independent paths:
+///   1. The double-click trigger in `convert_event` (toggles: `!current`).
+///   2. The IPC handler (`gaming_mode enable` / `gaming_mode disable`).
+///
+/// Neither caller duplicates the haptic logic — they only supply the new state
+/// and the shared Arcs. Writing state.json is intentionally left to the
+/// caller: the IPC path has its own inline write, while the double-click path
+/// calls `self.write_state()`.
+async fn apply_gaming_mode(
+    gaming_mode: &Arc<Mutex<bool>>,
+    new_state: bool,
+    haptic_tx: &Arc<Mutex<Option<mpsc::Sender<HapticCommand>>>>,
+    haptic: crate::mt_trackpad::HapticPulse,
+) {
+    *gaming_mode.lock().await = new_state;
+    println!("makima: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
+    let tx = haptic_tx.lock().await.clone();
+    mt_trackpad::pulse(&tx, HapticPad::Both, haptic).await;
 }
 
 impl EventReader {
@@ -390,6 +424,12 @@ impl EventReader {
             notify_layout_switch,
             cursor_when_paused,
         };
+        let gaming_mode_config = config
+            .iter()
+            .find(|c| c.associations == Associations::default())
+            .map(|c| c.gaming_mode_config.clone())
+            .unwrap_or_default();
+
         Self {
             config,
             stream,
@@ -423,6 +463,9 @@ impl EventReader {
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
             device_path,
+            gaming_mode_config,
+            gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
+            haptic_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -431,6 +474,8 @@ impl EventReader {
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
         let session = TrackpadSession::setup(&self.trackpad, &self.virt_dev, &self.device_path).await;
+        // Wire the haptic channel so Gaming Mode toggle can fire haptic feedback.
+        *self.haptic_tx.lock().await = session.haptic_tx();
         self.write_state().await;
         self.start_control_socket().await;
         tokio::join!(
@@ -1217,12 +1262,26 @@ impl EventReader {
         send_zero: bool,
     ) {
 
+        // TODO: structural debt — gaming_mode is read here early because the
+        // Custom Modifier Intercept and held_keys update both sit before the
+        // Gaming Mode guard. Ideally the guard would be the first thing after
+        // emitted_outputs cleanup, and the intercept would be folded into the
+        // post-guard path. Refactor when touching this area next.
+        let gaming_mode = *self.gaming_mode.lock().await;
+
         // Track all currently held buttons so the HUD can highlight them.
         // Only KEY events are tracked (not axis/stick movements).
+        // Presses (value=1) are suppressed while Gaming Mode is active so the
+        // HUD never shows buttons as held when input is passed through raw.
+        // Releases (value=0) always run so held_keys is cleaned up correctly
+        // when Gaming Mode is turned off mid-hold.
+        // TODO: once the guard is moved earlier (see TODO above), this
+        // guard can be removed — the early return will prevent presses from
+        // reaching here.
         if matches!(event, Event::Key(_)) {
             let mut held = self.held_keys.lock().await;
             match value {
-                1 => { held.push(event); held.sort(); held.dedup(); }
+                1 if !gaming_mode => { held.push(event); held.sort(); held.dedup(); }
                 0 => held.retain(|&x| x != event),
                 _ => {}
             }
@@ -1250,12 +1309,45 @@ impl EventReader {
         };
         let config = self.current_config.lock().await.clone();
         let paused = *self.paused.lock().await;
-        let gaming_mode = *self.gaming_mode.lock().await;
+        // gaming_mode already read above.
         let mut modifiers = self.modifiers.lock().await.clone();
         modifiers.sort();
         modifiers.dedup();
 
 
+        // ── Gaming Mode double-click trigger ──────────────────────────────────
+        // The configured trigger key double-pressed within `double_click_ms`
+        // toggles Gaming Mode on/off and fires haptic feedback.
+        // Skipped entirely when `trigger` is None (not configured or invalid).
+        // Runs before the Gaming Mode guard so the second press is never
+        // suppressed — even while Gaming Mode is already active (to turn it off).
+        if let Some(trigger_key) = self.gaming_mode_config.double_click_trigger {
+            if event == Event::Key(trigger_key) && value == 1 {
+                let now = std::time::Instant::now();
+                let mut ts = self.gaming_mode_trigger_ts.lock().await;
+                let within_window = ts
+                    .map(|prev| now.duration_since(prev).as_millis() <= self.gaming_mode_config.double_click_ms as u128)
+                    .unwrap_or(false);
+                if within_window {
+                    *ts = None;
+                    drop(ts);
+                    // Flip Gaming Mode, log, and fire haptic feedback.
+                    let new_state = !*self.gaming_mode.lock().await;
+                    apply_gaming_mode(
+                        &self.gaming_mode,
+                        new_state,
+                        &self.haptic_tx,
+                        self.gaming_mode_config.haptic,
+                    ).await;
+                    self.write_state().await;
+                    return;
+                } else {
+                    // First click of a potential double-click — record timestamp and
+                    // let the event fall through so normal bindings still fire.
+                    *ts = Some(now);
+                }
+            }
+        }
         // ── Custom modifier + remap intercept ──────────────────────────────────
         // A button that is BOTH in CUSTOM_MODIFIERS and has a base remap entry
         // acts as two things simultaneously:
@@ -1271,8 +1363,13 @@ impl EventReader {
                 .and_then(|m| m.get(&vec![]))
                 .cloned()
             {
-                {
-                    if !paused && !gaming_mode {
+                // Press / repeat: emit the output key only when active.
+                // Release (value=0): intentionally NOT emitted here — always handled
+                // by the emitted_outputs cleanup at the top of convert_event. That
+                // guarantees the key-up fires even when paused or gaming_mode was
+                // activated while the key was held (preventing stuck modifier keys).
+                if value != 0 && !paused && !gaming_mode {
+                    {
                         let mut virt_dev = self.virt_dev.lock().await;
                         for key in &out_keys {
                             virt_dev.keys.emit(&[
@@ -1280,8 +1377,19 @@ impl EventReader {
                             ]).unwrap();
                         }
                     }
+                    // Store on press so the emitted_outputs cleanup can release on key-up.
+                    if value == 1 {
+                        self.store_emitted_outputs(&event, &out_keys).await;
+                    }
                 }
-                self.set_last_emitted(&event, &out_keys, value, false, config.bindings.labels.get(&(event, vec![])).cloned(), false).await;
+                // Don't write state for suppressed modifier events in Gaming Mode —
+                // the HUD must not show modifiers as active when input is raw.
+                // TODO: once the guard is moved earlier (see TODO above), this
+                // guard becomes unnecessary — suppressed events will never reach
+                // the intercept in the first place.
+                if !gaming_mode {
+                    self.set_last_emitted(&event, &out_keys, value, false, config.bindings.labels.get(&(event, vec![])).cloned(), false).await;
+                }
                 self.toggle_modifiers(event, value, &config).await;
                 return;
             }
@@ -1291,14 +1399,17 @@ impl EventReader {
         // (Keys, Command, Movement, Hold) are suppressed, not just Unbound
         // passthrough events. Key-up events (value=0) always pass through so
         // held_keys / emitted_outputs are flushed and no key stays stuck.
+        //
+        // No write_state() here: the gaming_mode flag was already written to
+        // state.json when the mode was toggled. Suppressed events must not
+        // update the HUD — Gaming Mode means makima is transparent.
+        // Modifier tracking still runs so combo state stays consistent.
         if gaming_mode {
             let is_while_gaming = config.bindings.while_gaming.contains(&(event, modifiers.clone()))
                 || config.bindings.while_gaming.contains(&(event, vec![]));
             if gaming_mode_suppresses(value, is_while_gaming) {
                 if gaming_mode_tracks_modifier(&event, &config.mapped_modifiers.all) {
                     self.toggle_modifiers(event, value, &config).await;
-                } else {
-                    self.write_state().await;
                 }
                 return;
             }
@@ -1944,13 +2055,15 @@ impl EventReader {
 
     async fn start_control_socket(&self) {
         let paused          = self.paused.clone();
-        let gaming_mode_ipc = self.gaming_mode.clone();
-        let last_action     = self.last_action.clone();
-        let current_config  = self.current_config.clone();
-        let modifiers       = self.modifiers.clone();
-        let active_layout   = self.active_layout.clone();
-        let held_keys       = self.held_keys.clone();
-        let all_configs     = self.config.clone();
+        let gaming_mode_ipc      = self.gaming_mode.clone();
+        let haptic_tx_ipc        = self.haptic_tx.clone();
+        let gaming_mode_cfg_ipc  = self.gaming_mode_config.clone();
+        let last_action          = self.last_action.clone();
+        let current_config       = self.current_config.clone();
+        let modifiers            = self.modifiers.clone();
+        let active_layout        = self.active_layout.clone();
+        let held_keys            = self.held_keys.clone();
+        let all_configs          = self.config.clone();
         let analog_state_export  = self.analog_state_export.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file("/tmp/makima-control.sock");
@@ -1962,14 +2075,16 @@ impl EventReader {
                 }
             };
             while let Ok((stream, _addr)) = listener.accept().await {
-                let paused          = paused.clone();
-                let gaming_mode_ipc = gaming_mode_ipc.clone();
-                let last_action     = last_action.clone();
-                let current_config  = current_config.clone();
-                let modifiers       = modifiers.clone();
-                let active_layout   = active_layout.clone();
-                let held_keys       = held_keys.clone();
-                let all_configs     = all_configs.clone();
+                let paused               = paused.clone();
+                let gaming_mode_ipc      = gaming_mode_ipc.clone();
+                let haptic_tx_ipc        = haptic_tx_ipc.clone();
+                let gaming_mode_cfg_ipc  = gaming_mode_cfg_ipc.clone();
+                let last_action          = last_action.clone();
+                let current_config       = current_config.clone();
+                let modifiers            = modifiers.clone();
+                let active_layout        = active_layout.clone();
+                let held_keys            = held_keys.clone();
+                let all_configs          = all_configs.clone();
                 let analog_state_export  = analog_state_export.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream.into_std().unwrap());
@@ -1981,7 +2096,13 @@ impl EventReader {
                                 if cmd == "pause" || cmd == "resume" {
                                     *paused.lock().await = cmd == "pause";
                                 } else {
-                                    *gaming_mode_ipc.lock().await = cmd == "gaming_mode enable";
+                                    // Set Gaming Mode, log, and fire haptic feedback.
+                                    apply_gaming_mode(
+                                        &gaming_mode_ipc,
+                                        cmd == "gaming_mode enable",
+                                        &haptic_tx_ipc,
+                                        gaming_mode_cfg_ipc.haptic,
+                                    ).await;
                                 }
                                 // Write state immediately so the HUD sees the updated
                                 // flag without waiting for the next button event.

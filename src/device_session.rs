@@ -176,6 +176,13 @@ impl TrackpadSession {
         }
     }
 
+    /// Returns a clone of the haptic command sender, if one was established.
+    /// `None` when no hidraw sibling was found (trackpad position not available).
+    /// Used by `EventReader` to fire haptics on Gaming Mode toggle.
+    pub fn haptic_tx(&self) -> Option<mpsc::Sender<HapticCommand>> {
+        self.haptic_tx.clone()
+    }
+
     /// Runs the trackpad router and all per-handler tasks until the session
     /// ends (hidraw channel closes). Consumes `self`.
     pub async fn run(

@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, Mutex};
 pub struct HapticPulse {
     #[serde(default = "default_duration_us")]
     pub duration_us: u16,
-    #[serde(default)]
+    #[serde(default = "default_interval_us")]
     pub interval_us: u16,
     #[serde(default = "default_count")]
     pub count: u16,

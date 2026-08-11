@@ -28,6 +28,7 @@ fn config_with(name: &str, bindings: Bindings) -> Config {
         settings: HashMap::new(),
         mapped_modifiers: Default::default(),
         trackpad: Default::default(),
+        gaming_mode_config: Default::default(),
     }
 }
 
@@ -221,6 +222,7 @@ fn parse_raw_config_populates_while_gaming_for_remap() {
         movements: HashMap::new(),
         settings: HashMap::new(),
         trackpad: RawTrackpadConfig::default(),
+        gaming_mode: None,
     };
     let (bindings, _, _) = parse_raw_config(raw);
     let btn_south = Event::Key(Key::BTN_SOUTH);
@@ -256,6 +258,7 @@ fn parse_raw_config_populates_while_gaming_for_command() {
         movements: HashMap::new(),
         settings: HashMap::new(),
         trackpad: RawTrackpadConfig::default(),
+        gaming_mode: None,
     };
     let (bindings, _, _) = parse_raw_config(raw);
     let btn_mode = Event::Key(Key::BTN_MODE);
