@@ -117,28 +117,6 @@ pub struct EventReader {
     gaming_mode_tx: mpsc::Sender<bool>,
 }
 
-/// Sets Gaming Mode to `new_state`, logs the transition, and fires the
-/// appropriate haptic chain on both trackpads.
-///
-/// Called from three independent paths:
-///   1. The double-click trigger in `convert_event` (toggles: `!current`).
-///   2. The IPC handler (`gaming_mode enable` / `gaming_mode disable`).
-///   3. `steam_detection_loop` (auto-detection via process tree + BPM window).
-///
-/// Writing state.json is left to the caller — each path has its own context
-/// for when and how to persist (double-click and steam_detection_loop call
-/// `self.write_state()`; the IPC path does an inline write).
-async fn apply_gaming_mode(
-    gaming_mode: &Arc<Mutex<bool>>,
-    new_state: bool,
-    haptic_tx: &Arc<Mutex<Option<mpsc::Sender<HapticCommand>>>>,
-    chain: &crate::mt_trackpad::HapticChain,
-) {
-    *gaming_mode.lock().await = new_state;
-    println!("makima: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
-    let tx = haptic_tx.lock().await.clone();
-    mt_trackpad::fire_chain(&tx, HapticPad::Both, chain).await;
-}
 
 impl EventReader {
     pub fn new(
@@ -187,7 +165,7 @@ impl EventReader {
             .unwrap()
             .settings
             .get("LSTICK")
-            .unwrap_or(&"cursor".to_string())
+            .unwrap_or(&"disabled".to_string())
             .to_string();
         let lstick_sensitivity: u64 = config
             .iter()
@@ -511,21 +489,44 @@ impl EventReader {
         }
     }
 
+    /// Single handler for all Gaming Mode state changes.
+    ///
+    /// When `paused` is false (normal mode): sets the flag, fires the
+    /// appropriate haptic chain, writes last_action and state.
+    /// When `paused` is true (preview mode): skips the actual toggle and
+    /// haptics, but still writes last_action so the HUD preview shows
+    /// what the action would do.
+    async fn set_gaming_mode(&self, new_state: bool, paused: bool) {
+        if !paused {
+            *self.gaming_mode.lock().await = new_state;
+            println!("makima: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
+            let chain = if new_state { &self.gaming_mode_config.haptic_on }
+                        else        { &self.gaming_mode_config.haptic_off };
+            let tx = self.haptic_tx.lock().await.clone();
+            mt_trackpad::fire_chain(&tx, HapticPad::Both, chain).await;
+        }
+        let label = if new_state { "Gaming Mode On" } else { "Gaming Mode Off" };
+        *self.last_action.lock().await = Some(crate::state_export::LastAction {
+            r#type: "command".to_string(),
+            value: serde_json::json!(label),
+            label: Some(label.to_string()),
+            ts: crate::state_export::now_ts(),
+            silent: false,
+        });
+        self.write_state().await;
+    }
+
     /// Unified Gaming Mode setter — the single consumer of the `gaming_mode_tx`
     /// channel.  Both steam auto-detection and IPC commands send `bool` here;
-    /// this loop applies the change (flag + haptic + state write) when the
-    /// desired state differs from the current one.
+    /// this loop applies the change when the desired state differs from the current one.
     ///
-    /// Has full `self` access, so `write_state()` works without any workarounds.
+    /// Has full `self` access, so `set_gaming_mode()` works without any workarounds.
     /// Returns when all senders are dropped (device disconnected / non-KDE).
     async fn gaming_mode_set_loop(&self, mut rx: mpsc::Receiver<bool>) {
         while let Some(new_state) = rx.recv().await {
             if new_state != *self.gaming_mode.lock().await {
-                let chain = if new_state { &self.gaming_mode_config.haptic_on }
-                            else        { &self.gaming_mode_config.haptic_off };
                 println!("makima: Gaming Mode trigger — channel, new_state={}", new_state);
-                apply_gaming_mode(&self.gaming_mode, new_state, &self.haptic_tx, chain).await;
-                self.write_state().await;
+                self.set_gaming_mode(new_state, false).await;
             }
         }
     }
@@ -1348,6 +1349,8 @@ impl EventReader {
         // Skipped entirely when `trigger` is None (not configured or invalid).
         // Runs before the Gaming Mode guard so the second press is never
         // suppressed — even while Gaming Mode is already active (to turn it off).
+        // Intentionally runs even when paused: Gaming Mode and Pause are
+        // orthogonal meta-states and the toggle should always be reachable.
         if let Some(ref trigger) = self.gaming_mode_config.trigger {
             if event == Event::Key(trigger.key) && value == 1 {
                 let now = std::time::Instant::now();
@@ -1359,14 +1362,8 @@ impl EventReader {
                     *ts = None;
                     drop(ts);
                     let new_state = !*self.gaming_mode.lock().await;
-                    let chain = if new_state {
-                        &self.gaming_mode_config.haptic_on
-                    } else {
-                        &self.gaming_mode_config.haptic_off
-                    };
-                    println!("makima: Gaming Mode trigger — double-click");
-                    apply_gaming_mode(&self.gaming_mode, new_state, &self.haptic_tx, chain).await;
-                    self.write_state().await;
+                    println!("makima: Gaming Mode trigger — double-click (paused={})", paused);
+                    self.set_gaming_mode(new_state, paused).await;
                     return;
                 } else {
                     // First click of a potential double-click — record timestamp and
@@ -2072,7 +2069,7 @@ impl EventReader {
             "x": crate::analog::normalize(imu_raw.0),
             "y": crate::analog::normalize(imu_raw.1),
         });
-        crate::state_export::write_state(&config, &modifiers, layout, paused, gaming_mode, &held_keys, &last_action, &config_stack, trackpads, sticks, imu, analog_state_export).await;
+        crate::state_export::write_state(&config, &modifiers, layout, paused, gaming_mode, &held_keys, &last_action, &config_stack, &self.gaming_mode_config, trackpads, sticks, imu, analog_state_export).await;
     }
 
     /// Record the actual emitted key output for the HUD last-event display.
@@ -2127,6 +2124,7 @@ impl EventReader {
         let held_keys            = self.held_keys.clone();
         let all_configs          = self.config.clone();
         let analog_state_export  = self.analog_state_export.clone();
+        let gaming_mode_config   = self.gaming_mode_config.clone();
         // paused state still needs an immediate write (no channel for it yet).
         let gaming_mode_for_write = self.gaming_mode.clone();
         tokio::spawn(async move {
@@ -2148,6 +2146,7 @@ impl EventReader {
                 let held_keys            = held_keys.clone();
                 let all_configs          = all_configs.clone();
                 let analog_state_export  = analog_state_export.clone();
+                let gaming_mode_config   = gaming_mode_config.clone();
                 let gaming_mode_for_write = gaming_mode_for_write.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream.into_std().unwrap());
@@ -2208,6 +2207,7 @@ impl EventReader {
                                 };
                                 crate::state_export::write_state(
                                     &config, &mods, layout, is_paused, is_gaming, &hk, &la, &stack,
+                                    &gaming_mode_config,
                                     serde_json::Value::Null,
                                     serde_json::Value::Null,
                                     serde_json::Value::Null,
