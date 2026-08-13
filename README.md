@@ -8,7 +8,7 @@ The heart of Deckery — the input remapper. Reads raw evdev events directly fro
 
 ## Setup
 
-Makima Deckery is installed and managed as part of the Deckery suite — no separate setup needed.
+Makima Deckery is installed and managed as part of the Deckery suite.
 
 → [Deckery Setup Guide](https://plasma-deckery.github.io/deckery/setup-guide/)
 
@@ -55,7 +55,9 @@ distrobox enter deckery -- cargo test
 
 ---
 
-Window focus changes are detected event-driven via a KWin D-Bus script (`kwin_watcher`), which registers `org.makima.watcher` on the session bus and receives a callback from `workspace.windowActivated` on every focus change. This replaces the previous approach of spawning a `kdotool` subprocess on every button press to query the active window — eliminating a significant source of CPU load and latency. No polling, no subprocess spawning, no external tool dependency.
+### Application-aware configuration
+
+Window focus changes are detected event-driven via a KWin D-Bus script (`kwin_watcher`), which registers `org.makima.watcher` on the session bus and receives a callback from `workspace.windowActivated` on every focus change. This replaces the previous approach of spawning a `kdotool` subprocess on every button press to query the active window — eliminating a significant source of CPU load and latency.
 
 Config files only need to contain their overrides:
 
@@ -68,14 +70,13 @@ BTN_TL-BTN_DPAD_UP    = ["KEY_LEFTCTRL", "KEY_R"]     # L1+↑ → Reload
 
 [settings]
 CUSTOM_MODIFIERS = "BTN_TL-BTN_MODE"
-GRAB_DEVICE = "false"
 ```
 
 ---
 
 ### Trackpad emulation as system touchpads
 
-The Steam Deck trackpads are capable input surfaces, but Steam Input's default handling is invisible to gesture tools — they expect standard Linux multi-touch devices. By reading the trackpads' raw hidraw reports and translating them into proper MT events on virtual uinput devices, makima makes both pads (and, optionally, a combined two-finger gesture surface) visible to tools like `libinput-gestures` or `fusuma`. This is the prerequisite for defining custom gestures per pad (swipe zones, tap areas, circular scroll, pinch-zoom) without having to implement gesture recognition inside makima itself.
+Similar to laptop trackpads — including haptic feedback and gestures — the Steam Deck's pads are invisible to the standard Linux input stack. Normally Steam Input is required to read from them. Deckery emulates them as standard Linux multi-touch devices, making both pads available to the desktop environment without Steam running.
 
 Trackpad handling is split across three layers, each independently testable and swappable:
 
@@ -95,7 +96,7 @@ mt_trackpad.rs        — handler(s): turn one channel's frame stream into an
                         two layers above.
 ```
 
-With `mode = "mt-trackpad"` under `[trackpad.left]`/`[trackpad.right]` in the config, makima exposes each pad as its own standard uinput touchpad device — `Deckery Left Trackpad` / `Deckery Right Trackpad`. Setting `combined_gesture_device = true` additionally exposes a third two-slot MT device, `Deckery Combined Trackpad`, active only while both pads are touching at once (e.g. for pinch-zoom) — individual pads seamlessly resume their own device the instant one finger lifts.
+With `mode = "mt-trackpad"` under `[trackpad.left]`/`[trackpad.right]` in the config, makima exposes each pad as its own standard uinput touchpad device — `Deckery Left Trackpad` / `Deckery Right Trackpad`. Setting `combined_gesture_device = true` additionally exposes a third device, `Deckery Combined Trackpad`, enabling both trackpads simultaneously for pinch-zoom and scroll — individual pads seamlessly resume their own device the instant one finger lifts.
 
 ```toml
 [trackpad.left]
