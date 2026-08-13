@@ -95,7 +95,7 @@ pub struct RawTrackpadConfig {
     pub gestures: Option<toml::Value>,
 }
 
-fn parse_trackpad_side(raw: Option<&toml::Value>, legacy_setting: Option<&String>) -> TrackpadSideConfig {
+fn parse_trackpad_side(raw: Option<&toml::Value>) -> TrackpadSideConfig {
     if let Some(toml::Value::Table(t)) = raw {
         let mode = t.get("mode")
             .and_then(|v| v.as_str())
@@ -113,9 +113,6 @@ fn parse_trackpad_side(raw: Option<&toml::Value>, legacy_setting: Option<&String
             handler_config: toml::Value::Table(t.clone()),
             kde_config,
         }
-    } else if let Some(s) = legacy_setting {
-        // Backward-compat: LPAD/RPAD = "mt-trackpad" / "disabled"
-        TrackpadSideConfig { mode: s.trim().to_lowercase(), ..Default::default() }
     } else {
         TrackpadSideConfig::default()
     }
@@ -423,7 +420,6 @@ pub struct Config {
     pub settings: HashMap<String, String>,
     pub mapped_modifiers: MappedModifiers,
     /// Trackpad configuration parsed from `[trackpad.left]` / `[trackpad.right]`.
-    /// Falls back to legacy `LPAD`/`RPAD` settings when `[trackpad]` is absent.
     /// Only meaningful on the base config; app-specific configs inherit from base.
     pub trackpad: TrackpadConfig,
     /// Gaming Mode trigger configuration parsed from `[gaming_mode]`.
@@ -439,16 +435,9 @@ impl Config {
         let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config);
         let associations = Default::default();
 
-        // Parse [trackpad] section; fall back to legacy LPAD/RPAD settings.
         let trackpad = TrackpadConfig {
-            left: parse_trackpad_side(
-                raw_trackpad.left.as_ref(),
-                settings.get("LPAD"),
-            ),
-            right: parse_trackpad_side(
-                raw_trackpad.right.as_ref(),
-                settings.get("RPAD"),
-            ),
+            left: parse_trackpad_side(raw_trackpad.left.as_ref()),
+            right: parse_trackpad_side(raw_trackpad.right.as_ref()),
             combined_gesture_device: raw_trackpad.combined_gesture_device.unwrap_or(false),
             gesture_kde_config: raw_trackpad.gestures.as_ref()
                 .and_then(|v| v.get("kde"))

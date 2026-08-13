@@ -44,6 +44,8 @@ distrobox enter deckery -- cargo test
 - **Event-driven window focus** — KWin D-Bus script replaces `kdotool` subprocess spawning; no polling, no latency
 - **Per-app configs with inheritance** — app overrides only declare what differs; base config is merged at runtime
 - **Binding attributes** — `label` and `no_pause` per binding
+- **Gaming Mode** — Steam games are auto-detected on window focus and activate Gaming Mode, disabling all remapping so Deckery and in-game input don't collide
+- **Haptic feedback** — configurable haptic pulses on the Steam Deck's trackpad actuators, triggered on button events, trackpad touch/click, and Gaming Mode transitions
 - **State export** → `/tmp/makima-state.json` — all state needed for a real-time button preview HUD: active bindings, modifier context, currently held buttons, last executed action, and analog sensor values (sticks, trackpads, IMU)
 - **Trackpad MT translation** — both trackpads emulated as standard system touchpad devices, activating existing trackpad gesture recognition tools
 - **Lizard Mode suppression** — periodic hidraw heartbeat keeps the `hid-steam` kernel driver's built-in mouse/scroll fallback disabled without Steam running; configurable via `SUPPRESS_LIZARD_MODE`
@@ -55,11 +57,25 @@ distrobox enter deckery -- cargo test
 
 ---
 
+### Binding attributes
+
+Bindings support an extended inline-table syntax alongside the simple array form:
+
+```toml
+[remap]
+BTN_TL-BTN_NORTH = { keys = ["KEY_LEFTCTRL", "KEY_C"], label = "Copy (Ctrl+C)" }
+
+[commands]
+BTN_THUMBL = { run = ["deckery-hud-toggle"], no_pause = true, label = "Toggle HUD" }
+```
+
+→ [Full bindings reference](https://plasma-deckery.github.io/deckery/projects/makima-deckery/bindings/)
+
+---
+
 ### Application-aware configuration
 
-Window focus changes are detected event-driven via a KWin D-Bus script (`kwin_watcher`), which registers `org.makima.watcher` on the session bus and receives a callback from `workspace.windowActivated` on every focus change. This replaces the previous approach of spawning a `kdotool` subprocess on every button press to query the active window — eliminating a significant source of CPU load and latency.
-
-Config files only need to contain their overrides:
+On window focus change, makima automatically loads the matching per-app config. App overrides only declare what differs from the base config — everything else is inherited.
 
 ```toml
 # Steam Deck::org.mozilla.firefox.toml
@@ -76,27 +92,9 @@ CUSTOM_MODIFIERS = "BTN_TL-BTN_MODE"
 
 ### Trackpad emulation as system touchpads
 
-Similar to laptop trackpads — including haptic feedback and gestures — the Steam Deck's pads are invisible to the standard Linux input stack. Normally Steam Input is required to read from them. Deckery emulates them as standard Linux multi-touch devices, making both pads available to the desktop environment without Steam running.
+Steam Deck trackpads are similar to laptop trackpads — even including haptic feedback coils. As part of the Steam Deck controller, they are invisible to the standard Linux input stack. Normally Steam Input is required to read from them and emulate mouse movements. Deckery reads the raw data streams and emulates both pads as standard Linux multitouch devices.
 
-Trackpad handling is split across three layers, each independently testable and swappable:
-
-```
-pad_hidraw.rs        — raw producer: parses 64-byte hidraw reports from the
-                        Steam Deck controller into PadFrame{x, y, touching, click}
-                        per pad. No knowledge of modes or gestures.
-trackpad_router.rs   — Core routing: always mirrors raw position/touch/click into
-                        state.json regardless of mode, and decides which channel
-                        is active — left individual, right individual, or (if
-                        enabled) the combined two-finger gesture channel once both
-                        pads are touching simultaneously.
-mt_trackpad.rs        — handler(s): turn one channel's frame stream into an
-                        emulated MT device, including click-edge detection and
-                        haptic policy. A future trackball or multi-zone handler
-                        would be a sibling module here, without touching the
-                        two layers above.
-```
-
-With `mode = "mt-trackpad"` under `[trackpad.left]`/`[trackpad.right]` in the config, makima exposes each pad as its own standard uinput touchpad device — `Deckery Left Trackpad` / `Deckery Right Trackpad`. Setting `combined_gesture_device = true` additionally exposes a third device, `Deckery Combined Trackpad`, enabling both trackpads simultaneously for pinch-zoom and scroll — individual pads seamlessly resume their own device the instant one finger lifts.
+→ [Trackpad architecture reference](https://plasma-deckery.github.io/deckery/reference/trackpad-architecture/)
 
 ```toml
 [trackpad.left]
@@ -110,9 +108,7 @@ combined_gesture_device = true   # also creates "Deckery Combined Trackpad" for 
 # mode = "disabled" # default per pad — no virtual device, but position is still tracked in state.json
 ```
 
-The legacy `[settings] LPAD = "trackpad"` / `RPAD = "trackpad"` syntax is still accepted as a fallback for `mode = "mt-trackpad"`.
-
-Position is Y-corrected to libinput convention (hardware reports up as negative; the virtual device flips this) and split into left/right halves of a shared X axis on the combined device so a pinch gesture tracks correctly across both slots. Trackpad position, touch state, and press state are always tracked and exported to `state.json` regardless of the mode setting — the HUD can visualize trackpad input even when `"disabled"`.
+Setting `combined_gesture_device = true` enables both trackpads simultaneously for pinch-zoom and scroll — individual pads seamlessly resume their own device the instant one finger lifts.
 
 Haptic feedback is configurable per pad: press and release edges are independent events with separate pulse shapes, and distance-gated movement haptics are also supported. See the [trackpad configuration docs](https://plasma-deckery.github.io/deckery/projects/makima-deckery/trackpad/) for the full config reference.
 
@@ -122,70 +118,16 @@ Haptic feedback is configurable per pad: press and release edges are independent
 
 ### Lizard Mode suppression
 
-The `hid-steam` kernel driver keeps a built-in mouse/scroll fallback ("Lizard Mode") active unless a userspace client suppresses it by sending HID feature reports periodically. Steam handles this while it is running — without it, the trackpads emit mouse events directly via the kernel driver, bypassing makima entirely.
+The `hid-steam` kernel driver keeps a built-in mouse/scroll fallback ("Lizard Mode") active unless suppressed. Without it, trackpads emit mouse events directly via the kernel driver, bypassing makima entirely.
 
-Makima-deckery takes over this role via a configurable hidraw heartbeat. On startup, it opens the raw controller hidraw device (the `.0005` interface, not the emulated keyboard/mouse nodes) and sends suppression reports every 4 s. The heartbeat is a built-in safety mechanism: if makima crashes or exits, the file descriptor is closed, and Lizard Mode re-activates automatically within ~8 s.
+Makima-deckery suppresses it via a periodic hidraw heartbeat. If makima exits, the file descriptor closes and Lizard Mode re-activates within ~8 s.
 
-Control which aspects are suppressed via `SUPPRESS_LIZARD_MODE` in the `[settings]` section of your base config:
-
-```toml
-[settings]
-SUPPRESS_LIZARD_MODE = "buttons,mouse"   # suppress both (recommended)
-SUPPRESS_LIZARD_MODE = "buttons"          # only clear keyboard/button mappings
-SUPPRESS_LIZARD_MODE = "mouse"            # only disable trackpad mouse/scroll emulation
-SUPPRESS_LIZARD_MODE = "false"            # disabled (default when setting is absent)
-```
-
-| Value | Effect |
-|---|---|
-| `"buttons"` | Sends `ID_CLEAR_DIGITAL_MAPPINGS` (0x81) — prevents the kernel driver from emitting arrow keys, Enter, Esc via d-pad and face buttons |
-| `"mouse"` | Sends `ID_SET_SETTINGS_VALUES` (0x87) with `TRACKPAD_NONE` — prevents the kernel driver from emitting mouse and scroll events from the trackpads |
-| `"buttons,mouse"` | Both of the above (recommended for full Steam independence) |
-| `"false"` / absent | Disabled — Lizard Mode is not suppressed |
-
-When the setting is absent, Lizard Mode is **not** suppressed. Makima gracefully skips the heartbeat task on non-Steam-Deck hardware (no Valve hidraw device found).
+→ [Full Lizard Mode reference](https://plasma-deckery.github.io/deckery/reference/lizard-mode/)
 
 ---
 
 ### State export → `/tmp/makima-state.json`
 
-On every config or modifier change, makima writes a fully-resolved state snapshot to `/tmp/makima-state.json`. This allows the Deckery HUD overlay to display live button mappings without re-implementing any of makima's lookup logic.
+On every input event, makima writes a fully-resolved state snapshot to `/tmp/makima-state.json`. This allows the Deckery HUD overlay to display live button mappings without re-implementing any of makima's lookup logic. In paused mode, it enables a live preview of button combinations without any actions firing.
 
 → [Full state.json reference](https://plasma-deckery.github.io/deckery/reference/state-json/)
-
----
-
-### Binding attributes
-
-Bindings support an extended inline-table syntax alongside the simple array form:
-
-```toml
-[remap]
-BTN_TL-BTN_NORTH = { keys = ["KEY_LEFTCTRL", "KEY_C"], label = "Copy (Ctrl+C)" }
-
-[commands]
-BTN_THUMBL = { run = ["deckery-hud-toggle"], no_pause = true, label = "Toggle HUD" }
-```
-
-| Attribute | Type | Applies to | Description |
-|---|---|---|---|
-| `keys` / `run` | array | remap / command | The action (replaces the bare array) |
-| `label` | string | both | Human-readable name exported to the HUD |
-| `no_pause` | bool | command | Execute even when makima is paused |
-
-→ [Full bindings reference](https://plasma-deckery.github.io/deckery/projects/makima-deckery/bindings/)
-
----
-
-### Pause / Resume IPC
-
-makima-deckery exposes a Unix socket at `/tmp/makima-control.sock` for runtime control:
-
-```bash
-echo "pause"               | socat - UNIX-CONNECT:/tmp/makima-control.sock
-echo "resume"              | socat - UNIX-CONNECT:/tmp/makima-control.sock
-echo "analog-state-export on"  | socat - UNIX-CONNECT:/tmp/makima-control.sock
-echo "analog-state-export off" | socat - UNIX-CONNECT:/tmp/makima-control.sock
-```
-
-When paused, all input passes through unmodified. The `paused` flag is reflected in `/tmp/makima-state.json`. The primary use case is **HUD dry-run mode**: the overlay can show the full binding map without any remapping actually taking effect — useful for exploring layouts without triggering actions.
