@@ -7,7 +7,7 @@
 // Called from EventReader::write_state() in event_reader.rs, which handles
 // all Arc/Mutex locking and passes plain values here.
 
-use crate::config::Event;
+use crate::config::{Event, GamingModeConfig};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::Config;
 use evdev::Key;
@@ -80,6 +80,7 @@ pub fn build_state(
     held_keys: &[Event],
     last_action: &Option<LastAction>,
     config_stack: &[String],
+    gaming_mode_config: &GamingModeConfig,
 ) -> serde_json::Value {
     // Determine the origin name for a given trigger+combo.
     // If this config has override_bindings (i.e. it's an app-specific config
@@ -364,6 +365,13 @@ pub fn build_state(
         "default".to_string()
     };
 
+    let gaming_mode_trigger = gaming_mode_config.trigger.as_ref().map(|t| {
+        serde_json::json!({
+            "key":   event_to_str(&Event::Key(t.key)),
+            "label": "Gaming Mode",
+        })
+    });
+
     serde_json::json!({
         "context": {
             "active_app": active_app,
@@ -379,6 +387,7 @@ pub fn build_state(
         "last_action": last_action,
         "bindings": bindings,
         "modifier_active": modifier_active,
+        "gaming_mode_trigger": gaming_mode_trigger,
     })
 }
 
@@ -393,12 +402,13 @@ pub async fn write_state(
     held_keys: &[Event],
     last_action: &Option<LastAction>,
     config_stack: &[String],
+    gaming_mode_config: &GamingModeConfig,
     trackpads: serde_json::Value,
     sticks: serde_json::Value,
     imu: serde_json::Value,
     analog_state_export: bool,
 ) {
-    let mut state = build_state(config, modifiers, layout, paused, gaming_mode, held_keys, last_action, config_stack);
+    let mut state = build_state(config, modifiers, layout, paused, gaming_mode, held_keys, last_action, config_stack, gaming_mode_config);
     state["trackpads"] = trackpads;
     state["sticks"] = sticks;
     state["imu"] = imu;

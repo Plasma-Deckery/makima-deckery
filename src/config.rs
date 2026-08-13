@@ -292,15 +292,14 @@ pub struct RawGamingModeConfig {
     /// Absent → default (BTN_BASE, 400 ms).
     /// `trigger = { key = "disabled" }` → trigger disabled.
     pub trigger: Option<RawDoubleclickTrigger>,
-    /// Haptic chain fired when Gaming Mode is *enabled*.
-    /// Falls back to `haptic` if absent, then to the built-in default.
+    /// Haptic chain fired when Gaming Mode is *enabled*. Falls back to the built-in default.
     pub haptic_on: Option<HapticChain>,
-    /// Haptic chain fired when Gaming Mode is *disabled*.
-    /// Falls back to `haptic` if absent, then to the built-in default.
+    /// Haptic chain fired when Gaming Mode is *disabled*. Falls back to the built-in default.
     pub haptic_off: Option<HapticChain>,
-    /// Legacy single-chain field — used as fallback when `haptic_on`/
-    /// `haptic_off` are not set, so existing configs keep working unchanged.
-    pub haptic: Option<HapticChain>,
+    /// Automatically enable Gaming Mode when a Steam game is detected running
+    /// (process tree walk: focused PID → reaper → steam) or Steam Big Picture
+    /// Mode is focused. Default: true. Set to false to disable auto-detection.
+    pub auto_detect_steam_games: Option<bool>,
 }
 
 /// Parsed Gaming Mode configuration, ready for use at runtime.
@@ -312,6 +311,8 @@ pub struct GamingModeConfig {
     pub haptic_on: HapticChain,
     /// Haptic chain fired when Gaming Mode is *disabled*.
     pub haptic_off: HapticChain,
+    /// Whether Steam game auto-detection is active. Default: true.
+    pub auto_detect_steam_games: bool,
 }
 
 impl Default for GamingModeConfig {
@@ -332,6 +333,7 @@ impl Default for GamingModeConfig {
             trigger: Some(DoubleclickTrigger { key: Key::BTN_BASE, ms: 400 }),
             haptic_on:  default_chain.clone(),
             haptic_off: default_chain,
+            auto_detect_steam_games: true,
         }
     }
 }
@@ -356,13 +358,13 @@ impl GamingModeConfig {
             },
         };
 
-        // haptic_on / haptic_off fall back to `haptic`, then to the built-in default chain.
         let default_chain = Self::default();
-        let fallback = raw.haptic.unwrap_or_else(|| default_chain.haptic_on.clone());
-        let haptic_on  = raw.haptic_on .unwrap_or_else(|| fallback.clone());
-        let haptic_off = raw.haptic_off.unwrap_or(fallback);
+        let haptic_on  = raw.haptic_on .unwrap_or_else(|| default_chain.haptic_on.clone());
+        let haptic_off = raw.haptic_off.unwrap_or(default_chain.haptic_off);
 
-        GamingModeConfig { trigger, haptic_on, haptic_off }
+        let auto_detect_steam_games = raw.auto_detect_steam_games.unwrap_or(true);
+
+        GamingModeConfig { trigger, haptic_on, haptic_off, auto_detect_steam_games }
     }
 }
 

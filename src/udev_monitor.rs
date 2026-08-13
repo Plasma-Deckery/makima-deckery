@@ -64,16 +64,17 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
     ));
 
     // Suppress Steam Deck Lizard Mode — persists across device reinitializations.
-    // Reads SUPPRESS_LIZARD_MODE from any base config (default associations).
-    // Gracefully skips if the setting is absent or on non-Steam-Deck hardware.
+    // Reads SUPPRESS_LIZARD_MODE from any base config; defaults to "buttons,mouse".
+    // Set SUPPRESS_LIZARD_MODE = "false" to opt out. Gracefully skips on non-Steam-Deck hardware.
     {
         use crate::lizard_mode::LizardModeSuppression;
-        let lizard_cfg = config_files
+        let setting = config_files
             .iter()
             .filter(|c| c.associations == Associations::default())
             .find_map(|c| c.settings.get("SUPPRESS_LIZARD_MODE"))
-            .and_then(|v| LizardModeSuppression::from_setting(v));
-        if let Some(cfg) = lizard_cfg {
+            .map(|s| s.as_str())
+            .unwrap_or("buttons,mouse");
+        if let Some(cfg) = LizardModeSuppression::from_setting(setting) {
             tokio::spawn(crate::lizard_mode::run_lizard_mode_suppression(cfg));
         }
     }
@@ -233,10 +234,16 @@ pub fn launch_tasks(
     // Sends detected gaming state changes via gaming_mode_tx.
     // No compositor check needed: if window_changed is never fired (non-KDE),
     // the task simply blocks on notified().await forever — zero overhead.
+    let auto_detect = config_files
+        .iter()
+        .find(|c| c.associations == Associations::default())
+        .map(|c| c.gaming_mode_config.auto_detect_steam_games)
+        .unwrap_or(true);
     tokio::spawn(crate::steam_detector::steam_detection_task(
         window_changed.clone(),
         active_client.clone(),
         gaming_mode_tx.clone(),
+        auto_detect,
     ));
 
     // The rx goes to the first matched reader (wrapped in Option so only one
@@ -562,8 +569,8 @@ pub fn is_mapped(udev_device: &tokio_udev::Device, config_files: &Vec<Config>) -
 mod tests {
     use super::*;
 
-    #[test]
-    fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
+    #[tokio::test]
+    async fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
         let config_files = Vec::new();
         let mut tasks = Vec::new();
         let env = Environment {

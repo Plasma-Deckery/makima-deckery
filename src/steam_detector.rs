@@ -96,21 +96,29 @@ fn parse_field(content: &str, field: &str) -> Option<String> {
 /// Compositor-agnostic: on non-KDE systems `window_changed` is never fired
 /// and the task simply blocks on `notified()` forever — zero overhead.
 /// Only sends when the state actually changes to avoid flooding the channel.
+///
+/// When `auto_detect` is false the task still runs but never sends `true` —
+/// Gaming Mode can only be set via the manual double-click trigger or IPC.
 pub async fn steam_detection_task(
     window_changed: Arc<Notify>,
     active_client: Arc<Mutex<Client>>,
     tx: mpsc::Sender<bool>,
+    auto_detect: bool,
 ) {
     let mut last_sent: Option<bool> = None;
     loop {
         window_changed.notified().await;
-        let (class, caption, pid) = match &*active_client.lock().await {
-            Client::Class(c, cap, p) => (c.clone(), cap.clone(), *p),
-            Client::Default => (String::new(), String::new(), None),
+        let new_state = if auto_detect {
+            let (class, caption, pid) = match &*active_client.lock().await {
+                Client::Class(c, cap, p) => (c.clone(), cap.clone(), *p),
+                Client::Default => (String::new(), String::new(), None),
+            };
+            let bpm  = is_steam_bpm(&class, &caption);
+            let game = pid.map(is_game_running).unwrap_or(false);
+            bpm || game
+        } else {
+            false
         };
-        let bpm       = is_steam_bpm(&class, &caption);
-        let game      = pid.map(is_game_running).unwrap_or(false);
-        let new_state = bpm || game;
         if Some(new_state) != last_sent {
             if tx.send(new_state).await.is_err() {
                 break; // all receivers gone, stop
@@ -165,6 +173,58 @@ mod tests {
         assert_eq!(parse_field(status, "Name").as_deref(), Some("foo"));
         assert_eq!(parse_field(status, "PPid").as_deref(), Some("42"));
         assert_eq!(parse_field(status, "Missing"), None);
+    }
+
+    /// When `auto_detect_steam_games = false` the task must never send `true`,
+    /// even when the focused window looks exactly like Steam Big Picture Mode.
+    #[tokio::test]
+    async fn auto_detect_false_never_sends_true() {
+        use crate::udev_monitor::Client;
+        let notify = Arc::new(Notify::new());
+        // Focused window is Steam BPM — would normally trigger gaming mode.
+        let client = Arc::new(Mutex::new(Client::Class(
+            "steam".to_string(),
+            "Steam Big Picture".to_string(),
+            None,
+        )));
+        let (tx, mut rx) = mpsc::channel::<bool>(8);
+        // notify_one() stores a permit so the task fires immediately on first
+        // notified().await even if we race ahead of the spawn.
+        notify.notify_one();
+        tokio::spawn(steam_detection_task(
+            notify.clone(),
+            client,
+            tx,
+            false, // auto_detect_steam_games = false
+        ));
+        // Allow the task one iteration.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let state = rx.try_recv().expect("task should have sent a value");
+        assert!(!state, "auto_detect_steam_games=false must never send true");
+    }
+
+    /// When `auto_detect_steam_games = true` the task must send `true` when the
+    /// focused window is Steam Big Picture Mode.
+    #[tokio::test]
+    async fn auto_detect_true_sends_true_for_bpm() {
+        use crate::udev_monitor::Client;
+        let notify = Arc::new(Notify::new());
+        let client = Arc::new(Mutex::new(Client::Class(
+            "steam".to_string(),
+            "Steam Big Picture".to_string(),
+            None,
+        )));
+        let (tx, mut rx) = mpsc::channel::<bool>(8);
+        notify.notify_one();
+        tokio::spawn(steam_detection_task(
+            notify.clone(),
+            client,
+            tx,
+            true, // auto_detect_steam_games = true
+        ));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let state = rx.try_recv().expect("task should have sent a value");
+        assert!(state, "auto_detect_steam_games=true should send true for BPM window");
     }
 
     // Live process-tree test: only verifies no panic; whether a game is

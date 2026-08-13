@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{Bindings, Event, MappedModifiers};
+use crate::config::{Bindings, Event, GamingModeConfig, MappedModifiers};
 use crate::Config;
 use evdev::Key;
 use std::collections::{HashMap, HashSet};
@@ -99,7 +99,7 @@ fn active_outputs_base_remap() {
         vec![(key(Key::BTN_SOUTH), vec![], vec![Key::KEY_ENTER])],
         vec![], vec![],
     );
-    let state = build_state(&config, &[], 0, false, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, false, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(active_outputs(&state), vec!["KEY_ENTER"]);
 }
 
@@ -113,7 +113,7 @@ fn active_outputs_combo_remap() {
         vec![], vec![btn_tl],
     );
     // modifiers = [BTN_TL], held_keys = [BTN_NORTH]
-    let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_north], &None, &["test".to_string()]);
+    let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_north], &None, &["test".to_string()], &GamingModeConfig::default());
     // KEY_LEFTCTRL sorts before KEY_C
     assert_eq!(active_outputs(&state), vec!["KEY_LEFTCTRL", "KEY_C"]);
 }
@@ -128,7 +128,7 @@ fn active_outputs_fallback_remap() {
         vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
         vec![], vec![btn_tl],
     );
-    let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_south], &None, &["test".to_string()]);
+    let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_south], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(active_outputs(&state), vec!["KEY_ENTER"]);
 }
 
@@ -143,14 +143,14 @@ fn active_outputs_command_suppresses_remap() {
         vec![(btn_dpad_up, vec![btn_tl], vec!["previous-desktop".to_string()])],
         vec![btn_tl],
     );
-    let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_dpad_up], &None, &["test".to_string()]);
+    let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_dpad_up], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(active_outputs(&state), Vec::<String>::new());
 }
 
 #[test]
 fn active_outputs_unbound_is_empty() {
     let config = make_config(vec![], vec![], vec![]);
-    let state = build_state(&config, &[], 0, false, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, false, false, &[key(Key::BTN_SOUTH)], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(active_outputs(&state), Vec::<String>::new());
 }
 
@@ -169,7 +169,7 @@ fn available_modifiers_shows_both_when_none_held() {
         ],
         vec![], vec![btn_tl, btn_tr],
     );
-    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     let mut avail = available_modifiers(&state);
     avail.sort();
     assert!(avail.contains(&"BTN_TL".to_string()));
@@ -193,7 +193,7 @@ fn available_modifiers_filters_satisfied() {
     );
     // BTN_TL is active_input_mod → filtered out of available_modifiers.
     // BTN_TR qualifies because BTN_TL-BTN_TR-BTN_SOUTH exists and BTN_TL ⊆ that combo.
-    let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     let avail = available_modifiers(&state);
     assert!(!avail.contains(&"BTN_TL".to_string()), "BTN_TL is already active");
     assert!(avail.contains(&"BTN_TR".to_string()), "BTN_TR unlocks a BTN_TL+BTN_TR combo");
@@ -215,7 +215,7 @@ fn modifier_active_exact_match_only() {
         ],
         vec![], vec![btn_tl, btn_tr],
     );
-    let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     let keys = modifier_active_keys(&state);
     assert!(keys.contains(&"BTN_NORTH".to_string()), "BTN_TL-BTN_NORTH should appear");
     assert!(!keys.contains(&"BTN_SOUTH".to_string()), "BTN_TL-BTN_TR-BTN_SOUTH must not leak in");
@@ -231,7 +231,7 @@ fn modifier_active_includes_commands() {
         vec![(btn_dpad_up, vec![btn_tl], vec!["previous-desktop".to_string()])],
         vec![btn_tl],
     );
-    let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     let keys = modifier_active_keys(&state);
     assert!(keys.contains(&"BTN_DPAD_UP".to_string()));
     assert_eq!(
@@ -250,7 +250,7 @@ fn modifier_active_label_propagated() {
         vec![], vec![btn_tl],
     );
     config.bindings.labels.insert((btn_north, vec![btn_tl]), "Copy".to_string());
-    let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[btn_tl], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(
         state["modifier_active"]["BTN_NORTH"]["label"].as_str().unwrap(),
         "Copy"
@@ -269,7 +269,7 @@ fn silent_binding_tagged_in_active_outputs() {
         vec![], vec![],
     );
     config.bindings.silent.insert((btn_south, vec![]));
-    let state = build_state(&config, &[], 0, false, false, &[btn_south], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, false, false, &[btn_south], &None, &["test".to_string()], &GamingModeConfig::default());
     let tagged = active_outputs_tagged(&state);
     assert_eq!(tagged, vec![("BTN_LEFT".to_string(), true)],
         "silent binding must appear in active_outputs with silent=true");
@@ -286,7 +286,7 @@ fn silent_combo_tagged_in_active_outputs() {
         vec![], vec![btn_tl],
     );
     config.bindings.silent.insert((btn_south, vec![btn_tl]));
-    let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_south], &None, &["test".to_string()]);
+    let state = build_state(&config, &[btn_tl], 0, false, false, &[btn_south], &None, &["test".to_string()], &GamingModeConfig::default());
     let tagged = active_outputs_tagged(&state);
     assert_eq!(tagged, vec![("BTN_LEFT".to_string(), true)],
         "silent combo must appear in active_outputs with silent=true");
@@ -300,7 +300,7 @@ fn non_silent_binding_tagged_false() {
         vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
         vec![], vec![],
     );
-    let state = build_state(&config, &[], 0, false, false, &[btn_south], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, false, false, &[btn_south], &None, &["test".to_string()], &GamingModeConfig::default());
     let tagged = active_outputs_tagged(&state);
     assert_eq!(tagged, vec![("KEY_ENTER".to_string(), false)]);
 }
@@ -314,7 +314,7 @@ fn silent_flag_in_bindings_json() {
         vec![], vec![],
     );
     config.bindings.silent.insert((btn_south, vec![]));
-    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(
         state["bindings"]["BTN_SOUTH"]["silent"].as_bool().unwrap(),
         true,
@@ -330,7 +330,7 @@ fn non_silent_binding_silent_false_in_json() {
         vec![(btn_south, vec![], vec![Key::KEY_ENTER])],
         vec![], vec![],
     );
-    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(
         state["bindings"]["BTN_SOUTH"]["silent"].as_bool().unwrap(),
         false
@@ -349,7 +349,7 @@ fn bindings_json_no_pause_flag() {
         vec![],
     );
     config.bindings.no_pause.insert((btn_thumbl, vec![]));
-    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(
         state["bindings"]["BTN_THUMBL"]["no_pause"].as_bool().unwrap(),
         true
@@ -375,6 +375,7 @@ fn context_active_buttons_and_held_modifiers() {
         &[btn_tl, btn_south],
         &None,
         &["test".to_string()],
+        &GamingModeConfig::default(),
     );
     let active_btns: Vec<_> = state["context"]["active_buttons"]
         .as_array().unwrap()
@@ -406,7 +407,7 @@ fn active_outputs_multi_modifier_combo() {
     // Sort the modifier combo the same way resolve_binding expects it.
     let mut mods = vec![btn_tl, btn_tr];
     mods.sort();
-    let state = build_state(&config, &mods, 0, false, false, &[btn_dpad_up], &None, &["test".to_string()]);
+    let state = build_state(&config, &mods, 0, false, false, &[btn_dpad_up], &None, &["test".to_string()], &GamingModeConfig::default());
     assert_eq!(active_outputs(&state), vec!["KEY_F1"]);
 }
 
@@ -431,6 +432,7 @@ fn indirect_modifier_match_via_output_key() {
         &config,
         &[Event::Key(Key::KEY_LEFTCTRL)],
         0, false, false, &[], &None, &["test".to_string()],
+        &GamingModeConfig::default(),
     );
     // BTN_TL should be detected as active → modifier_active shows BTN_TL-BTN_NORTH combo
     let keys = modifier_active_keys(&state);
@@ -502,6 +504,7 @@ fn override_remap_hides_base_command() {
     let state = build_state(
         &app, &[btn_tl], 0, false, false, &[], &None,
         &["Steam Deck".to_string(), "firefox".to_string()],
+        &GamingModeConfig::default(),
     );
 
     assert_eq!(
@@ -566,6 +569,7 @@ fn override_clears_base_label() {
     let state = build_state(
         &app, &[btn_tl], 0, false, false, &[], &None,
         &["Steam Deck".to_string(), "firefox".to_string()],
+        &GamingModeConfig::default(),
     );
 
     // label must be null, not "Previous Desktop"
@@ -625,6 +629,7 @@ fn override_label_replaces_base_label() {
     let state = build_state(
         &app, &[btn_tl], 0, false, false, &[], &None,
         &["Steam Deck".to_string(), "firefox".to_string()],
+        &GamingModeConfig::default(),
     );
 
     assert_eq!(
@@ -694,6 +699,7 @@ fn origin_override_vs_base() {
     let state = build_state(
         &config, &[], 0, false, false, &[], &None,
         &["Steam Deck".to_string(), "firefox".to_string()],
+        &GamingModeConfig::default(),
     );
 
     assert_eq!(
@@ -724,7 +730,7 @@ fn assemble_state(
     analog_state_export: bool,
 ) -> serde_json::Value {
     let config = empty_config();
-    let mut state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()]);
+    let mut state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     state["trackpads"] = trackpads;
     state["sticks"] = sticks;
     state["imu"] = imu;
@@ -807,7 +813,7 @@ fn null_fields_are_null_in_output() {
 
 fn ctx_flags(paused: bool, gaming_mode: bool) -> (bool, bool) {
     let config = make_config(vec![], vec![], vec![]);
-    let state = build_state(&config, &[], 0, paused, gaming_mode, &[], &None, &["test".to_string()]);
+    let state = build_state(&config, &[], 0, paused, gaming_mode, &[], &None, &["test".to_string()], &GamingModeConfig::default());
     let p = state["context"]["paused"].as_bool().expect("paused must be bool");
     let g = state["context"]["gaming_mode"].as_bool().expect("gaming_mode must be bool");
     (p, g)
@@ -849,4 +855,35 @@ fn clear_gaming_mode_while_paused() {
 fn clear_paused_while_gaming_mode_active() {
     // paused=false (resumed), gaming_mode=true
     assert_eq!(ctx_flags(false, true), (false, true));
+}
+
+// ── gaming_mode_trigger ───────────────────────────────────────────────────
+
+/// When a trigger is configured, state contains gaming_mode_trigger with
+/// the correct key name and the fixed label "Toggle Gaming Mode".
+#[test]
+fn gaming_mode_trigger_present_when_configured() {
+    use crate::config::DoubleclickTrigger;
+    let config = make_config(vec![], vec![], vec![]);
+    let gm_config = GamingModeConfig {
+        trigger: Some(DoubleclickTrigger { key: Key::BTN_BASE, ms: 400 }),
+        ..GamingModeConfig::default()
+    };
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &gm_config);
+    let trigger = &state["gaming_mode_trigger"];
+    assert!(!trigger.is_null(), "gaming_mode_trigger should be present");
+    assert_eq!(trigger["key"].as_str().unwrap(), "BTN_BASE");
+    assert_eq!(trigger["label"].as_str().unwrap(), "Gaming Mode");
+}
+
+/// When no trigger is configured (disabled), gaming_mode_trigger is null.
+#[test]
+fn gaming_mode_trigger_null_when_disabled() {
+    let config = make_config(vec![], vec![], vec![]);
+    let gm_config = GamingModeConfig {
+        trigger: None,
+        ..GamingModeConfig::default()
+    };
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &gm_config);
+    assert!(state["gaming_mode_trigger"].is_null(), "gaming_mode_trigger should be null when trigger is disabled");
 }
