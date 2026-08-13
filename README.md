@@ -6,6 +6,38 @@ The heart of Deckery — the input remapper. Reads raw evdev events directly fro
 
 ---
 
+## Setup
+
+Makima Deckery is installed and managed as part of the Deckery suite — no separate setup needed.
+
+→ [Deckery Setup Guide](https://plasma-deckery.github.io/deckery/setup-guide/)
+
+---
+
+## Development
+
+All development happens inside the `deckery` distrobox container (created by `install.sh`, shared with deckery-hud). After making source changes:
+
+```bash
+bash redeploy.sh          # build + restart service in one step
+```
+
+Running tests and building manually inside the container:
+
+```bash
+distrobox enter deckery
+cargo build --release
+cargo test
+```
+
+Or in one line without entering the container:
+
+```bash
+distrobox enter deckery -- cargo test
+```
+
+---
+
 ## What's different from upstream
 
 - **Bug fixes** — D-Pad remapping, x11rb Wayland crash, evdev reconnect on device error (all submitted as upstream PRs)
@@ -17,17 +49,9 @@ The heart of Deckery — the input remapper. Reads raw evdev events directly fro
 - **Lizard Mode suppression** — periodic hidraw heartbeat keeps the `hid-steam` kernel driver's built-in mouse/scroll fallback disabled without Steam running; configurable via `SUPPRESS_LIZARD_MODE`
 - **Pause / Resume IPC** — runtime control via Unix socket at `/tmp/makima-control.sock`
 - **Steam Deck keycodes** — `BTN_GRIPL/R/L2/R2` for the back paddles via patched `evdev` crate
-- **Unit test suite** — 140 tests covering resolver, state export, analog helpers, config parsing, trackpad routing, and haptic report encoding
+- **Unit test suite** — 150 tests covering resolver, state export, analog helpers, config parsing, trackpad routing, and haptic report encoding
 
 → [Full documentation](https://plasma-deckery.github.io/deckery/projects/makima-deckery/)
-
----
-
-## Installation
-
-Makima Deckery is installed and managed as part of the Deckery suite — no separate setup needed.
-
-→ [Deckery Setup Guide](https://plasma-deckery.github.io/deckery/setup-guide/)
 
 ---
 
@@ -126,45 +150,9 @@ When the setting is absent, Lizard Mode is **not** suppressed. Makima gracefully
 
 On every config or modifier change, makima writes a fully-resolved state snapshot to `/tmp/makima-state.json`. This allows the Deckery HUD overlay to display live button mappings without re-implementing any of makima's lookup logic.
 
-```json
-{
-  "context": {
-    "config_stack": ["Steam Deck", "org.mozilla.firefox"],
-    "layout": 0,
-    "paused": false,
-    "held_modifiers": ["BTN_TL"],
-    "active_buttons": ["BTN_TL", "BTN_DPAD_LEFT"],
-    "active_outputs": ["KEY_LEFT", "KEY_LEFTALT"]
-  },
-  "bindings": {
-    "BTN_SOUTH":          { "action": ["KEY_ENTER"],                    "kind": "remap",   "label": null,       "origin": "Steam Deck" },
-    "BTN_TL-BTN_DPAD_LEFT": { "action": ["KEY_LEFTALT", "KEY_LEFT"],   "kind": "remap",   "label": null,       "origin": "org.mozilla.firefox" },
-    "BTN_THUMBL":         { "action": ["deckery-hud-toggle"],           "kind": "command", "label": "Toggle HUD", "no_pause": true, "origin": "Steam Deck" }
-  },
-  "modifier_active": {
-    "BTN_DPAD_LEFT": { "action": ["KEY_LEFTALT", "KEY_LEFT"], "kind": "remap",   "label": null,            "origin": "org.mozilla.firefox" },
-    "BTN_DPAD_UP":   { "action": ["Previous Desktop"],        "kind": "command", "label": "Previous Desktop", "origin": "Steam Deck" }
-  },
-  "last_action": {
-    "type": "command",
-    "value": "deckery-hud-toggle",
-    "ts": 1748383200.123,
-    "label": "Toggle HUD"
-  }
-}
-```
+→ [Full state.json reference](https://plasma-deckery.github.io/deckery/reference/state-json/)
 
-- **`bindings`** — all remaps and commands from the active config; plain buttons as `"BTN_FOO"`, combos as `"MOD1-MOD2-BTN_FOO"`
-- **`modifier_active`** — empty when no modifier held; when a modifier is pressed, contains every trigger reachable via the **exact** current modifier set, keyed by trigger button; uses exact matching so it never suggests a binding that would fall through to a less-specific combo at runtime
-- **`held_modifiers`** — modifier buttons currently physically held
-- **`active_buttons`** — all input buttons currently held (for button highlighting in the HUD)
-- **`active_outputs`** — evdev keys currently being emitted (derived from held buttons + modifier context)
-- **`config_stack`** — active config layer chain: one entry (`["Steam Deck"]`) for the base config, two entries (`["Steam Deck", "org.mozilla.firefox"]`) when an app-specific config is active; the second entry is the window class without the base prefix
-- **`origin`** — which config layer a binding comes from: the base config name for inherited bindings, the app-specific part for overrides; lets the HUD visually distinguish base bindings from per-app additions
-- **`label`** — optional human-readable display name set via `label = "…"` in the config; present on `bindings`, `modifier_active`, and `last_action` entries
-- **`kind`** — binding type: `"remap"`, `"command"`, or `"movement"`
-- **`no_pause`** — `true` if the binding bypasses the global pause state (command bindings only)
-- **`last_action`** — the most recent discrete user action with a Unix timestamp (for HUD fade-out); carries `label` if set on the binding
+---
 
 ### Binding attributes
 
@@ -184,6 +172,8 @@ BTN_THUMBL = { run = ["deckery-hud-toggle"], no_pause = true, label = "Toggle HU
 | `label` | string | both | Human-readable name exported to the HUD |
 | `no_pause` | bool | command | Execute even when makima is paused |
 
+→ [Full bindings reference](https://plasma-deckery.github.io/deckery/projects/makima-deckery/bindings/)
+
 ---
 
 ### Pause / Resume IPC
@@ -198,34 +188,3 @@ echo "analog-state-export off" | socat - UNIX-CONNECT:/tmp/makima-control.sock
 ```
 
 When paused, all input passes through unmodified. The `paused` flag is reflected in `/tmp/makima-state.json`. The primary use case is **HUD dry-run mode**: the overlay can show the full binding map without any remapping actually taking effect — useful for exploring layouts without triggering actions.
-
----
-
-## Setup
-
-Requires [distrobox](https://github.com/containers/distrobox).
-
-```bash
-git clone https://github.com/Plasma-Deckery/makima-deckery
-cd makima-deckery
-bash install.sh          # one-time: container, systemd service, initial build
-```
-
-`install.sh` creates the `deckery` distrobox container (shared with deckery-hud), installs the Rust toolchain inside it, copies `systemd/makima.service.template` into `~/.config/systemd/user/`, and runs the first build. After code changes, use `redeploy.sh` instead (build + restart, no container setup).
-
-Prerequisites (manual, one-time):
-
-```bash
-sudo usermod -aG input $USER   # grants access to /dev/input/* and /dev/uinput
-# log out and back in after
-```
-
-The service environment variables (`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, etc.) are hardcoded in the unit because the service starts before the desktop session environment is fully inherited.
-
-Suspend/resume is handled in-process (see feature list above). The former external `makima-resume-watcher.service` companion unit has been removed — `install.sh` disables and deletes it automatically on upgrade.
-
----
-
-## Relationship to upstream
-
-Bug fixes are submitted to upstream as PRs. Features specific to the Deckery HUD architecture (state export, IPC) are maintained here; an upstream proposal may follow once the HUD design stabilises.
