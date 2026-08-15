@@ -1,0 +1,18 @@
+[Unit]
+Description=Deckery input remapper
+After=deckery-tray.service
+BindsTo=deckery-tray.service
+
+[Service]
+ExecStart=/usr/bin/makima-deckery
+Restart=on-failure
+RestartSec=3
+Environment=MAKIMA_CONFIG=%h/.config/makima
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=DISPLAY=:0
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_CURRENT_DESKTOP=KDE
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+[Install]
+WantedBy=deckery-tray.service

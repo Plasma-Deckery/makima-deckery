@@ -8,7 +8,7 @@
 
 set -e
 REPO="$(dirname "$(readlink -f "$0")")"
-BUILD_PACKAGES="rust pkgconf gcc systemd-libs"
+BUILD_PACKAGES="rust pkgconf gcc systemd-libs rpm-tools make"
 
 echo "Repo: $REPO"
 
