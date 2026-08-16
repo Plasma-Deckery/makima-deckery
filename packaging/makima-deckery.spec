@@ -28,6 +28,7 @@ BuildRequires:  cargo
 BuildRequires:  rust-packaging
 BuildRequires:  gcc
 BuildRequires:  pkgconfig(libevdev)
+BuildRequires:  pkgconfig(libudev)
 BuildRequires:  systemd-rpm-macros
 
 Requires:       systemd
