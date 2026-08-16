@@ -59,38 +59,6 @@ impl PadFrame {
     }
 }
 
-/// Given an evdev device path (e.g. `/dev/input/event5`), find the hidraw sibling
-/// that belongs to the same physical device via sysfs.
-///
-/// Sysfs layout on Steam Deck:
-///   evdev:   /sys/class/input/eventN/device  → …/usb_iface/HID_A/input/inputN
-///   hidraw:  /sys/class/hidraw/hidrawN/device → …/usb_iface/HID_B
-///
-/// evdev and hidraw may belong to different HID functions (e.g. .0003 vs .0005)
-/// of the same USB interface. We therefore go up to the shared USB interface
-/// (three levels above inputN: input/ → HID_A/ → usb_iface/) and look for any
-/// hidraw device whose sysfs path starts with that same USB interface path.
-pub fn find_hidraw_for_evdev(evdev_path: &std::path::Path) -> Option<PathBuf> {
-    let dev_name = evdev_path.file_name()?.to_str()?;
-    let evdev_sysfs =
-        std::fs::canonicalize(format!("/sys/class/input/{}/device", dev_name)).ok()?;
-    // evdev_sysfs is …/usb_iface/HID_A/input/inputN
-    // Go up three levels: inputN → input/ → HID_A/ → usb_iface/
-    let usb_iface = evdev_sysfs.parent()?.parent()?.parent()?;
-    for entry in std::fs::read_dir("/sys/class/hidraw/").ok()? {
-        let entry = entry.ok()?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Ok(hidraw_sysfs) =
-            std::fs::canonicalize(format!("/sys/class/hidraw/{}/device", name))
-        {
-            // The hidraw device lives at …/usb_iface/HID_B — its parent is usb_iface.
-            if hidraw_sysfs.parent() == Some(usb_iface) {
-                return Some(PathBuf::from(format!("/dev/{}", name)));
-            }
-        }
-    }
-    None
-}
 
 /// Reads hidraw reports and sends a `PadFrame` through `tx` each time the
 /// parsed frame differs from the last one sent. This is a plain mpsc channel
@@ -280,16 +248,18 @@ pub async fn run_pad_haptic_writer(path: PathBuf, mut rx: mpsc::Receiver<HapticC
     }
 }
 
-/// Spawns the pad hidraw reader task if a hidraw sibling is found for
-/// `evdev_path`. Returns the receiving end of the position/touch channel it
-/// feeds and the sending end of a haptic-command channel, or `None` if no
-/// hidraw sibling exists (trackpad position/touch will then simply never
-/// update — `MtTrackpad` mode requires hidraw, there is no evdev-based
-/// fallback).
+/// Spawns the pad hidraw reader and haptic writer tasks for the given hidraw
+/// path. Returns the receiving end of the position/touch channel and the
+/// sending end of a haptic-command channel, or `None` if `hidraw_path` is
+/// absent (trackpad position/touch will never update — `MtTrackpad` mode
+/// requires hidraw, there is no evdev-based fallback).
+///
+/// The path comes from `SteamDeckController::hidraw_path` — discovered once
+/// at device open time via sysfs and threaded through to avoid redundant scans.
 pub fn spawn(
-    evdev_path: &std::path::Path,
+    hidraw_path: Option<std::path::PathBuf>,
 ) -> Option<(mpsc::Receiver<PadFrame>, mpsc::Sender<HapticCommand>)> {
-    let hidraw_path = find_hidraw_for_evdev(evdev_path)?;
+    let hidraw_path = hidraw_path?;
     println!(
         "makima: pad hidraw reader attached to {:?}. +{}ms since startup",
         hidraw_path,
