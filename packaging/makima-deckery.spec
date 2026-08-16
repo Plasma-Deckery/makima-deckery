@@ -20,6 +20,11 @@ Source1:        %{name}-%{version}-vendor.tar.gz
 
 BuildRequires:  rust
 BuildRequires:  cargo
+# Provides the %%cargo_build / %%cargo_prep / %%cargo_install macros used
+# below. Without it, %%{cargo_build} is not expanded and gets executed
+# literally as a shell command, which fails with "no job control" and a
+# bad %%build exit status.
+BuildRequires:  rust-packaging
 BuildRequires:  gcc
 BuildRequires:  pkgconfig(libevdev)
 BuildRequires:  systemd-rpm-macros
