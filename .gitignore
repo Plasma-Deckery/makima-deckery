@@ -13,9 +13,10 @@ target/
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
-# Local `make srpm` output (see Makefile) — vendored deps and build artifacts
+# Local `make srpm` output (see .copr/Makefile) — vendored deps and build artifacts
 vendor/
 outdir/
+cargo-config.toml
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

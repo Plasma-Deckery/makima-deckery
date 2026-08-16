@@ -48,16 +48,13 @@ elevated privileges are required.
 %prep
 %autosetup -n %{name}-%{version}
 
-# Unpack vendored Cargo dependencies
+# Unpack vendored Cargo dependencies. cargo-config.toml is `cargo vendor`'s
+# own captured stdout output (see .copr/Makefile) — not hand-written, since
+# it must also cover any git dependencies (source replacement entries per
+# git URL), not just crates-io.
 tar xf %{SOURCE1}
 mkdir -p .cargo
-cat > .cargo/config.toml << 'EOF'
-[source.crates-io]
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = "vendor"
-EOF
+cp cargo-config.toml .cargo/config.toml
 
 %build
 %{cargo_build}

@@ -10,20 +10,15 @@
 # This runs entirely on Copr's own Fedora build infrastructure, in a mock
 # chroot that HAS internet access (unlike the isolated %build phase that
 # follows). This target vendors Cargo dependencies fresh on every build and
-# produces an SRPM — no separate CI step, no pre-uploaded tarball, and
-# nothing on this machine (no distrobox, nothing) is involved in the real
-# build at all.
+# produces an SRPM — no separate CI step and no pre-uploaded tarball needed.
 #
 # `outdir` and `spec` are passed in by Copr as command-line make variables
 # and override the defaults below.
 #
-# Optional local sanity check (not required — the deckery distrobox is only
-# for building the Rust binary during development via redeploy.sh; it is
-# not needed to ship the RPM package, since Copr builds it independently):
+# Optional local sanity check (not required to ship the package — Copr
+# builds it independently):
 #   make -f .copr/Makefile srpm
-# Result lands in outdir/. Requires rpmbuild + cargo on whatever machine you
-# run this on — if you don't have them, skip this step entirely and just
-# push; the real, authoritative build happens on Copr.
+# Result lands in outdir/. Requires rpmbuild + cargo wherever you run this.
 
 NAME    := makima-deckery
 VERSION := $(shell awk -F'"' '/^version/{print $$2; exit}' $(CURDIR)/Cargo.toml)
@@ -36,8 +31,8 @@ spec    ?= packaging/$(NAME).spec
 # %build BuildRequires (those only apply to the later, isolated %build
 # phase). Per the make_srpm docs, this script runs with root privileges and
 # is expected to install whatever it needs itself. Guarded by `command -v
-# dnf` so this is a no-op if run on a machine without dnf (e.g. locally on
-# Arch) where cargo/git/rpm-build are expected to already be present.
+# dnf` so this is a no-op wherever dnf isn't available and cargo/git/
+# rpm-build are expected to already be present.
 builddeps:
 	command -v dnf >/dev/null 2>&1 && ! command -v cargo >/dev/null 2>&1 \
 		&& dnf -y install cargo rust git rpm-build || true
@@ -55,8 +50,15 @@ srpm: builddeps vendor
 
 vendor: builddeps
 	mkdir -p $(outdir)
-	cargo vendor > /dev/null
-	tar czf $(outdir)/$(NAME)-$(VERSION)-vendor.tar.gz vendor/
+	# `cargo vendor`'s stdout is not just noise — it's the actual required
+	# .cargo/config.toml content, including a [source."git-url"] override
+	# for every git dependency (we have one: the evdev fork). A hand-typed
+	# config.toml in the spec only covers crates-io and silently breaks any
+	# git dependency, since Cargo then tries to clone it live in the
+	# network-isolated %build chroot. So: capture it and ship it, don't
+	# guess it.
+	cargo vendor > cargo-config.toml
+	tar czf $(outdir)/$(NAME)-$(VERSION)-vendor.tar.gz vendor/ cargo-config.toml
 
 clean:
 	rm -rf $(outdir) vendor
