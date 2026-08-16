@@ -32,9 +32,19 @@ VERSION := $(shell awk -F'"' '/^version/{print $$2; exit}' $(CURDIR)/Cargo.toml)
 outdir  ?= $(CURDIR)/outdir
 spec    ?= packaging/$(NAME).spec
 
-.PHONY: srpm vendor clean
+.PHONY: srpm vendor builddeps clean
 
-srpm: vendor
+# Copr's srpm-generation chroot is minimal — it does NOT contain the spec's
+# %build BuildRequires (those only apply to the later, isolated %build
+# phase). Per the make_srpm docs, this script runs with root privileges and
+# is expected to install whatever it needs itself. Guarded by `command -v
+# dnf` so this is a no-op on the (Arch-based) local dev distrobox, where
+# cargo/git/rpm-build are already provided as normal distrobox packages.
+builddeps:
+	command -v dnf >/dev/null 2>&1 && ! command -v cargo >/dev/null 2>&1 \
+		&& dnf -y install cargo rust git rpm-build || true
+
+srpm: builddeps vendor
 	mkdir -p $(outdir)
 	git archive --prefix=$(NAME)-$(VERSION)/ -o $(outdir)/$(NAME)-$(VERSION).tar HEAD
 	gzip -f $(outdir)/$(NAME)-$(VERSION).tar
@@ -45,7 +55,7 @@ srpm: vendor
 		$(spec)
 	@echo "SRPM written to $(outdir)"
 
-vendor:
+vendor: builddeps
 	mkdir -p $(outdir)
 	cargo vendor > /dev/null
 	tar czf $(outdir)/$(NAME)-$(VERSION)-vendor.tar.gz vendor/
