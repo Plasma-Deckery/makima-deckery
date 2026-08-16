@@ -7,25 +7,23 @@
 #
 #   make -f <cloned_repodir>/.copr/Makefile srpm outdir="<outdir>" spec="<spec_path>"
 #
-# This runs in a mock chroot that HAS internet access (unlike the isolated
-# %build phase that follows). This target vendors Cargo dependencies fresh
-# on every build and produces an SRPM — no separate CI step or pre-uploaded
-# tarball needed.
+# This runs entirely on Copr's own Fedora build infrastructure, in a mock
+# chroot that HAS internet access (unlike the isolated %build phase that
+# follows). This target vendors Cargo dependencies fresh on every build and
+# produces an SRPM — no separate CI step, no pre-uploaded tarball, and
+# nothing on this machine (no distrobox, nothing) is involved in the real
+# build at all.
 #
 # `outdir` and `spec` are passed in by Copr as command-line make variables
-# and override the defaults below; locally, the repo-root Makefile calls
-# this with no arguments, so the defaults apply.
+# and override the defaults below.
 #
-# Local usage inside the deckery distrobox (rpmbuild, cargo, git, make are
-# all part of its base packages — see install.sh):
-#   distrobox enter deckery -- make srpm
-# Result lands in outdir/.
-#
-# rpmbuild here is Arch's official `extra`-repo build (RPM.org fork,
-# currently RPM 6.x) — useful for local sanity checks, but not necessarily
-# identical to the RPM toolchain Copr's actual Fedora build chroots use
-# (typically RPM 4.x). Treat a real Copr build as the authoritative check;
-# this is just for catching spec errors early.
+# Optional local sanity check (not required — the deckery distrobox is only
+# for building the Rust binary during development via redeploy.sh; it is
+# not needed to ship the RPM package, since Copr builds it independently):
+#   make -f .copr/Makefile srpm
+# Result lands in outdir/. Requires rpmbuild + cargo on whatever machine you
+# run this on — if you don't have them, skip this step entirely and just
+# push; the real, authoritative build happens on Copr.
 
 NAME    := makima-deckery
 VERSION := $(shell awk -F'"' '/^version/{print $$2; exit}' $(CURDIR)/Cargo.toml)
@@ -38,8 +36,8 @@ spec    ?= packaging/$(NAME).spec
 # %build BuildRequires (those only apply to the later, isolated %build
 # phase). Per the make_srpm docs, this script runs with root privileges and
 # is expected to install whatever it needs itself. Guarded by `command -v
-# dnf` so this is a no-op on the (Arch-based) local dev distrobox, where
-# cargo/git/rpm-build are already provided as normal distrobox packages.
+# dnf` so this is a no-op if run on a machine without dnf (e.g. locally on
+# Arch) where cargo/git/rpm-build are expected to already be present.
 builddeps:
 	command -v dnf >/dev/null 2>&1 && ! command -v cargo >/dev/null 2>&1 \
 		&& dnf -y install cargo rust git rpm-build || true
