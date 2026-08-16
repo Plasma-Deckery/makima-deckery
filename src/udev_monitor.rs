@@ -36,11 +36,10 @@ pub struct Environment {
 pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: String, mut tasks: Vec<JoinHandle<()>>, gaming_mode: Arc<Mutex<bool>>) {
     let environment = set_environment();
     let device_error_notify = Arc::new(Notify::new());
-    // Separate signal from `device_error_notify`: a real evdev read error
-    // means the physical device may genuinely be gone/changed, so that path
-    // still does a full VirtualDevices recreate. Resume is (near-certainly)
-    // the same device coming back, so it's safe to reuse the existing
-    // VirtualDevices and skip the libinput-rediscovery cost (see issue #39).
+    // resume_notify is shared between the resume watcher (fires it on logind
+    // PrepareForSleep) and the per-device reconnecting reader task (listens to
+    // it for proactive reconnect on suspend). udev_monitor no longer acts on it
+    // directly — resume is now handled transparently inside the controller.
     let resume_notify = Arc::new(Notify::new());
     let active_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::Default));
     let window_changed: Arc<Notify> = Arc::new(Notify::new());
@@ -70,7 +69,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
         steam_deck_controller::start_background_tasks(lizard_cfg, resume_notify.clone());
     }
 
-    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
+    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), gaming_mode.clone());
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -138,11 +137,13 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                             task.abort();
                         }
                         tasks.clear();
-                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
+                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), gaming_mode.clone());
                     }
                 }
             }
             _ = device_error_notify.notified() => {
+                // A genuine device error (USB unplug or reconnect timeout from the
+                // controller's reconnecting task). Full reinit — rebuild VirtualDevices.
                 println!("---------------------\n\nDevice error detected, reinitializing...\n");
                 release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
                 for task in &tasks {
@@ -150,16 +151,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
-            }
-            _ = resume_notify.notified() => {
-                println!("---------------------\n\nResume detected, reinitializing...\n");
-                release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
-                for task in &tasks {
-                    task.abort();
-                }
-                tasks.clear();
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), prev_virt_dev.clone(), gaming_mode.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), gaming_mode.clone());
             }
             Some(_) = config_rx.recv() => {
                 // Debounce: drain any queued events, then wait briefly for the
@@ -173,7 +165,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                     task.abort();
                 }
                 tasks.clear();
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), gaming_mode.clone());
             }
         }
     }
@@ -214,7 +206,7 @@ pub fn launch_tasks(
     device_error_notify: Arc<Notify>,
     active_client: Arc<Mutex<Client>>,
     window_changed: Arc<Notify>,
-    reuse_virt_dev: Option<Arc<Mutex<VirtualDevices>>>,
+    resume_notify: Arc<Notify>,
     gaming_mode: Arc<Mutex<bool>>,
 ) -> (Option<Arc<Mutex<VirtualDevices>>>, Arc<Mutex<Vec<Event>>>) {
     // Unified Gaming Mode channel: steam detection and IPC both send here.
@@ -273,17 +265,6 @@ pub fn launch_tasks(
             false
         }
     };
-    // How many currently-enumerated devices have a name matching some config
-    // — computed up front so the reuse decision below can see the total
-    // before committing to it per-device (see `should_reuse_virt_dev`).
-    let matched_device_count = evdev::enumerate()
-        .filter(|device| {
-            config_files.iter().any(|config| {
-                let split_config_name = config.name.split("::").collect::<Vec<&str>>();
-                split_config_name[0] == device.1.name().unwrap_or_default().replace("/", "")
-            })
-        })
-        .count();
     let devices: evdev::EnumerateDevices = evdev::enumerate();
     let mut devices_found = 0;
     for device in devices {
@@ -345,22 +326,16 @@ pub fn launch_tasks(
                 .and_then(|c| c.settings.get("GRAB_DEVICE"))
                 .map_or(true, |v| v == "true");
             let controller = SteamDeckController::from_evdev(Path::new(&event_device));
-            let stream = Arc::new(Mutex::new(controller.open_event_stream(grab)));
-            // Reuse the previous VirtualDevices (same uinput devices, same
-            // /dev/input/eventN nodes) instead of rebuilding from scratch when
-            // asked to — libinput takes seconds to rediscover a freshly
-            // recreated uinput device (see issue #39), so a resume or
-            // transient-read-error reinit should keep the existing virtual
-            // devices alive rather than tearing them down and back up.
-            // Only safe when exactly one physical device matched this round:
-            // handing every device the same reused instance would silently
-            // give a second/third device virtual output built from a
-            // different device's capabilities.
-            let virt_dev = if should_reuse_virt_dev(matched_device_count, reuse_virt_dev.is_some()) {
-                reuse_virt_dev.as_ref().unwrap().clone()
-            } else {
-                Arc::new(Mutex::new(VirtualDevices::new(device.1)))
-            };
+            // start_event_task opens the device, queries capabilities once, and
+            // spawns a reconnecting reader that handles suspend/resume transparently.
+            // On genuine device removal it fires device_error_notify and closes the
+            // channel — EventReader exits and udev_monitor does a full reinit.
+            let (is_tablet, max_abs_wheel, event_rx) = controller.start_event_task(
+                grab,
+                resume_notify.clone(),
+                device_error_notify.clone(),
+            );
+            let virt_dev = Arc::new(Mutex::new(VirtualDevices::new(device.1)));
             virt_dev_holder = Some(virt_dev.clone());
             // First reader takes the real rx; subsequent readers get a dead one.
             let rx = gaming_mode_rx_opt.take().unwrap_or_else(|| {
@@ -370,11 +345,12 @@ pub fn launch_tasks(
             let reader = EventReader::new(
                 config_list.clone(),
                 virt_dev,
-                stream,
+                event_rx,
+                is_tablet,
+                max_abs_wheel,
                 modifiers.clone(),
                 modifier_was_activated.clone(),
                 environment.clone(),
-                device_error_notify.clone(),
                 active_client.clone(),
                 window_changed.clone(),
                 std::path::PathBuf::from(&event_device),
@@ -391,36 +367,7 @@ pub fn launch_tasks(
     } else if devices_found == 0 && user_has_access {
         println!("No matching devices found.\nNote: double-check that your device and its associated config file have the same name, as reported by 'evtest'.\n");
     }
-    if devices_found == 0 && reuse_virt_dev.is_some() {
-        // The caller's persisted VirtualDevices (and its live uinput devices)
-        // has no task left holding a clone of it after this call, so it gets
-        // dropped here — the next reinit that does find a device will pay
-        // the full libinput-rediscovery cost again. Likely a transient
-        // enumeration race (e.g. right after resume, before the device is
-        // back), not a bug, but worth surfacing since it silently forfeits
-        // the persistence this reuse mechanism exists for.
-        println!("Warning: no matching devices found this round, persisted virtual devices could not be carried over and will be rebuilt on next reinit.\n");
-    }
     (virt_dev_holder, modifiers)
-}
-
-/// Whether it's safe to reuse a previously-built `VirtualDevices` for this
-/// reinit round instead of constructing a fresh one. Reuse was requested by
-/// the caller (a resume/read-error reinit, not a USB replug or config
-/// reload) — but only actually safe when exactly one physical device
-/// matched this round's configs.
-///
-/// On Steam Deck there is always exactly one matched device (the built-in
-/// controller), so the guard never fires in practice. It exists for
-/// correctness in generic multi-controller configs: if two gamepads are
-/// both configured and a reinit runs, handing both the same reused
-/// `VirtualDevices` (built from the *previous* device's capabilities) would
-/// give the second device wrong uinput axis ranges, input IDs, etc. With
-/// `matched_device_count > 1` we fall back to the safe full-recreate path
-/// instead. Not live-tested with multiple devices — correctness follows from
-/// the logic, which is unit-tested below.
-fn should_reuse_virt_dev(matched_device_count: usize, reuse_requested: bool) -> bool {
-    reuse_requested && matched_device_count == 1
 }
 
 pub async fn start_reader(reader: EventReader, gaming_rx: mpsc::Receiver<bool>) {
@@ -555,6 +502,7 @@ mod tests {
         let window_changed = Arc::new(Notify::new());
 
         let gaming_mode = Arc::new(Mutex::new(false));
+        let resume_notify = Arc::new(Notify::new());
         let (virt_dev_opt, modifiers) = launch_tasks(
             &config_files,
             &mut tasks,
@@ -562,7 +510,7 @@ mod tests {
             error_notify,
             client,
             window_changed,
-            None,
+            resume_notify,
             gaming_mode,
         );
 
@@ -572,13 +520,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn should_reuse_virt_dev_only_when_requested_and_single_device() {
-        assert!(!should_reuse_virt_dev(0, true), "no matched device: nothing to reuse for");
-        assert!(should_reuse_virt_dev(1, true), "exactly one matched device: safe to reuse");
-        assert!(!should_reuse_virt_dev(2, true), "multiple matched devices: reuse would mix up per-device capabilities");
-        assert!(!should_reuse_virt_dev(1, false), "reuse not requested (USB replug / config reload): always rebuild");
-        assert!(!should_reuse_virt_dev(0, false));
-        assert!(!should_reuse_virt_dev(2, false));
-    }
 }

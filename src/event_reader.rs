@@ -10,7 +10,8 @@ use crate::trackpad_router;
 use crate::udev_monitor::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
-use evdev::{AbsoluteAxisType, EventStream, EventType, InputEvent, Key, RelativeAxisType};
+use crate::steam_deck_controller::ControllerEvent;
+use evdev::{AbsoluteAxisType, EventType, InputEvent, Key, RelativeAxisType};
 use fork::{fork, setsid, Fork};
 use std::{
     collections::HashMap,
@@ -24,7 +25,6 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::net::UnixListener;
-use tokio_stream::StreamExt;
 
 struct Stick {
     function: String,
@@ -57,7 +57,15 @@ struct Settings {
 
 pub struct EventReader {
     config: Vec<Config>,
-    stream: Arc<Mutex<EventStream>>,
+    /// Receiver for controller events from the reconnecting reader task.
+    /// `ControllerEvent::Input` carries normal evdev events; `Reconnected`
+    /// signals a transparent reconnect (EventReader must release held keys).
+    event_rx: Arc<Mutex<mpsc::Receiver<ControllerEvent>>>,
+    /// Whether the connected device is a graphics tablet (BTN_TOOL_PEN).
+    /// Queried once at open time and carried here to avoid re-querying on reconnect.
+    is_tablet: bool,
+    /// Maximum absolute axis value across all axes, queried once at open time.
+    max_abs_wheel: i32,
     virt_dev: Arc<Mutex<VirtualDevices>>,
     lstick_position: Arc<Mutex<Vec<i32>>>,
     rstick_position: Arc<Mutex<Vec<i32>>>,
@@ -87,7 +95,6 @@ pub struct EventReader {
     /// when a mid-hold modifier change (e.g. R1) switched the resolution to a combo.
     emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>>,
     device_is_connected: Arc<Mutex<bool>>,
-    device_error_notify: Arc<Notify>,
     active_layout: Arc<Mutex<u16>>,
     current_config: Arc<Mutex<Config>>,
     environment: Environment,
@@ -125,11 +132,12 @@ impl EventReader {
     pub fn new(
         config: Vec<Config>,
         virt_dev: Arc<Mutex<VirtualDevices>>,
-        stream: Arc<Mutex<EventStream>>,
+        event_rx: mpsc::Receiver<ControllerEvent>,
+        is_tablet: bool,
+        max_abs_wheel: i32,
         modifiers: Arc<Mutex<Vec<Event>>>,
         modifier_was_activated: Arc<Mutex<bool>>,
         environment: Environment,
-        device_error_notify: Arc<Notify>,
         active_client: Arc<Mutex<Client>>,
         window_changed: Arc<Notify>,
         device_path: std::path::PathBuf,
@@ -419,7 +427,9 @@ impl EventReader {
 
         Self {
             config,
-            stream,
+            event_rx: Arc::new(Mutex::new(event_rx)),
+            is_tablet,
+            max_abs_wheel,
             virt_dev,
             lstick_position,
             rstick_position,
@@ -438,7 +448,6 @@ impl EventReader {
             held_keys,
             emitted_outputs,
             device_is_connected,
-            device_error_notify,
             active_layout,
             current_config,
             environment,
@@ -545,22 +554,12 @@ impl EventReader {
             mut triggers_values,
             mut abs_wheel_position,
         ) = ((0, 0), (0, 0), (0, 0), (0, 0), 0);
-        let mut stream = self.stream.lock().await;
+        let mut rx = self.event_rx.lock().await;
         let mut pen_events: Vec<InputEvent> = Vec::new();
-        let is_tablet: bool = stream
-            .device()
-            .supported_keys()
-            .unwrap_or(&evdev::AttributeSet::new())
-            .contains(Key::BTN_TOOL_PEN);
-        let mut max_abs_wheel = 0;
-        if let Ok(abs_state) = stream.device().get_abs_state() {
-            for state in abs_state {
-                if state.maximum > max_abs_wheel {
-                    max_abs_wheel = state.maximum;
-                }
-            }
-        }
-        let mut had_device_error = false;
+        // is_tablet and max_abs_wheel were queried once at device open time
+        // (SteamDeckController::start_event_task) and don't change across reconnects.
+        let is_tablet = self.is_tablet;
+        let max_abs_wheel = self.max_abs_wheel;
         // Dirty flags for stick axes — set whenever ABS_X/Y or ABS_RX/RY arrive.
         let mut lstick_dirty = false;
         let mut rstick_dirty = false;
@@ -573,18 +572,19 @@ impl EventReader {
             .checked_sub(std::time::Duration::from_millis(17))
             .unwrap_or(std::time::Instant::now());
         loop {
-            let event = match stream.next().await {
-                Some(Ok(e)) => e,
-                Some(Err(e)) => {
-                    println!(
-                        "[makima] Device read error on \"{}\": {} — signaling reconnect.",
-                        self.current_config.lock().await.name,
-                        e
-                    );
-                    had_device_error = true;
+            let event = match rx.recv().await {
+                Some(ControllerEvent::Input(e)) => e,
+                Some(ControllerEvent::Reconnected) => {
+                    // Device briefly disappeared (suspend/resume). Release all held
+                    // output keys so the compositor doesn't see stuck modifiers.
+                    self.release_all_held().await;
+                    continue;
+                }
+                None => {
+                    // Channel closed: the reconnecting task gave up (device genuinely
+                    // gone, device_error_notify already fired by that task).
                     break;
                 }
-                None => break,
             };
             match (
                 event.event_type(),
@@ -1261,9 +1261,8 @@ impl EventReader {
                 _ => self.emit_default_event(event).await,
             }
         }
-        if had_device_error {
-            self.device_error_notify.notify_one();
-        }
+        // device_error_notify is fired by the reconnecting reader task (in
+        // steam_deck_controller) when it gives up — no need to fire it here.
         let mut device_is_connected = self.device_is_connected.lock().await;
         *device_is_connected = false;
 
@@ -1271,6 +1270,30 @@ impl EventReader {
             "Disconnected device \"{}\".\n",
             self.current_config.lock().await.name
         );
+    }
+
+    /// Release all currently held output keys and clear modifier/held-key state.
+    ///
+    /// Called on `ControllerEvent::Reconnected` after a suspend/resume cycle.
+    /// Emits key-up events for all keys tracked in `emitted_outputs` (the
+    /// actual output keys that got stuck) and clears `modifiers` and `held_keys`
+    /// so combo and HUD state don't carry stale data across the reconnect.
+    async fn release_all_held(&self) {
+        let mut vd = self.virt_dev.lock().await;
+        // Release all tracked emitted output keys.
+        let mut eo = self.emitted_outputs.lock().await;
+        for (_input_ev, output_keys) in eo.drain() {
+            for key in output_keys {
+                let _ = vd.keys.emit(&[InputEvent::new_now(EventType::KEY, key.code(), 0)]);
+            }
+        }
+        drop(eo);
+        // Release modifier output keys (e.g. Shift held via L4).
+        // `modifiers` tracks input events but those that map to output keys will
+        // already be in `emitted_outputs`; we clear modifiers to reset combo state.
+        self.modifiers.lock().await.clear();
+        // Clear HUD held-key state.
+        self.held_keys.lock().await.clear();
     }
 
     /// Bridges `trackpad_router::run`'s state-write *requests* to the actual
