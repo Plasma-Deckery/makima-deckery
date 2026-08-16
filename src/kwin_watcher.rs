@@ -20,7 +20,7 @@
 use crate::udev_monitor::Client;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
-use zbus::{dbus_interface, dbus_proxy, ConnectionBuilder};
+use zbus::{interface, proxy, connection::Builder};
 
 // ── KWin script ──────────────────────────────────────────────────────────────
 //
@@ -50,7 +50,7 @@ struct WatcherIface {
     notify: Arc<Notify>,
 }
 
-#[dbus_interface(name = "org.makima.watcher")]
+#[interface(name = "org.makima.watcher")]
 impl WatcherIface {
     /// Called by the KWin script on every window-activation change.
     /// Stores raw class, caption, and PID in active_client and fires notify.
@@ -71,17 +71,17 @@ impl WatcherIface {
 
 // ── KWin Scripting D-Bus proxy ────────────────────────────────────────────────
 
-#[dbus_proxy(
+#[proxy(
     interface = "org.kde.kwin.Scripting",
     default_service = "org.kde.KWin",
     default_path = "/Scripting"
 )]
 trait KwinScripting {
-    #[dbus_proxy(name = "loadScript")]
+    #[zbus(name = "loadScript")]
     async fn load_script(&self, path: &str, plugin_name: &str) -> zbus::Result<i32>;
-    #[dbus_proxy(name = "start")]
+    #[zbus(name = "start")]
     async fn start(&self) -> zbus::Result<()>;
-    #[dbus_proxy(name = "unloadScript")]
+    #[zbus(name = "unloadScript")]
     async fn unload_script(&self, plugin_name: &str) -> zbus::Result<bool>;
 }
 
@@ -102,7 +102,7 @@ pub async fn start_kwin_watcher(
         return;
     }
 
-    let conn = match ConnectionBuilder::session()
+    let conn = match Builder::session()
         .and_then(|b| b.name("org.makima.watcher"))
         .and_then(|b| {
             b.serve_at(

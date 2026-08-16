@@ -88,16 +88,31 @@ async fn main() {
                 Ok(user_home) => user_home,
                 _ => "/root".to_string(),
             };
-            let default_config_path = format!("{}/.config/makima", user_home);
-            println!(
-                "\nMAKIMA_CONFIG environment variable is not set, defaulting to {:?}.\n",
-                default_config_path
-            );
-            if !std::path::Path::new(&default_config_path).is_dir() {
-                println!("Directory not found, exiting Makima.");
+            let user_config_path = format!("{}/.config/makima", user_home);
+            // System-wide fallback: used when installed via RPM without per-user config.
+            // The deckery RPM meta-package installs default configs here.
+            let system_config_path = "/usr/share/makima-deckery/configs";
+            if std::path::Path::new(&user_config_path).is_dir() {
+                println!(
+                    "\nMAKIMA_CONFIG environment variable is not set, using {:?}.\n",
+                    user_config_path
+                );
+                user_config_path
+            } else if std::path::Path::new(system_config_path).is_dir() {
+                println!(
+                    "\nMAKIMA_CONFIG environment variable is not set. \
+                     No user config found at {:?}, falling back to system default at {:?}.\n",
+                    user_config_path, system_config_path
+                );
+                system_config_path.to_string()
+            } else {
+                println!(
+                    "\nMAKIMA_CONFIG environment variable is not set. \
+                     No config found at {:?} or {:?}, exiting.\n",
+                    user_config_path, system_config_path
+                );
                 std::process::exit(0);
             }
-            default_config_path
         }
     };
     let config_files = load_config_files(&config_dir);
