@@ -33,15 +33,15 @@
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
-use zbus::{dbus_proxy, Connection};
+use zbus::{proxy, Connection};
 
-#[dbus_proxy(
+#[proxy(
     interface = "org.freedesktop.login1.Manager",
     default_service = "org.freedesktop.login1",
     default_path = "/org/freedesktop/login1"
 )]
 trait LoginManager {
-    #[dbus_proxy(signal)]
+    #[zbus(signal)]
     fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
 }
 

@@ -14,7 +14,7 @@ swayipc-async = "2.0.2"
 x11rb = "0.13.0"
 toml = "0.7.3"
 fork = "0.1.23"
-zbus = { version = "3", features = ["tokio"] }
+zbus = { version = "4", features = ["tokio"] }
 notify = "6"
 libc = "0.2"
 
