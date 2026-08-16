@@ -23,3 +23,13 @@ libc = "0.2"
 # Using our fork until a new upstream release includes these codes.
 # Track: https://github.com/emberian/evdev/pull/178
 evdev = { git = "https://github.com/Plasma-Deckery/evdev", rev = "e428a6fe10c0f577ef05c38e85eaefd6eed8be1b" }
+
+# Fedora's %cargo_build RPM macro always builds with `--profile rpm`, which
+# must be defined in Cargo.toml itself (Cargo profiles can't be created via
+# CLI flags alone). Normally Fedora's %cargo_prep macro patches this in
+# automatically, but we don't use %cargo_prep — its vendoring mode doesn't
+# reliably handle git dependencies like our evdev fork above, so we vendor
+# and configure Cargo ourselves (see .copr/Makefile, packaging/*.spec).
+[profile.rpm]
+inherits = "release"
+debug = true
