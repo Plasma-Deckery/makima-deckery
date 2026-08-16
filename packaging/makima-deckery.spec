@@ -62,7 +62,7 @@ cp cargo-config.toml .cargo/config.toml
 
 %install
 # Binary
-install -Dm755 target/release/makima-deckery \
+install -Dm755 target/rpm/makima-deckery \
     %{buildroot}%{_bindir}/makima-deckery
 
 # Systemd user service (adapted for system install: ExecStart=/usr/bin/ instead of %h/.local/bin/)
