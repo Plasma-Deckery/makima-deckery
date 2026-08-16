@@ -111,7 +111,7 @@ fn make_clear_mappings_report() -> [u8; 64] {
 /// and reject our ioctls with `ETIMEDOUT`.  hidraw2 (sysfs device `.0005`,
 /// no input node) is the channel hid-steam exposes specifically for userspace
 /// controller communication.
-fn find_controller_hidraw_devices() -> Vec<PathBuf> {
+pub(super) fn find_controller_hidraw_devices() -> Vec<PathBuf> {
     let mut result = Vec::new();
     let Ok(dir) = fs::read_dir("/sys/class/hidraw") else {
         return result;
@@ -198,14 +198,21 @@ impl LizardModeSuppression {
 
 /// Runs the Lizard Mode suppression heartbeat loop.
 ///
-/// Spawned once at startup.  Gracefully skips if no suitable hidraw
-/// device is found (i.e. makima is running on non-Steam-Deck hardware).
-pub async fn run_lizard_mode_suppression(cfg: LizardModeSuppression) {
+/// Spawned once at startup via `SteamDeckController::start_background_tasks`.
+/// Accepts an optional `hidraw_path` hint from the controller (discovered via
+/// evdev-sibling sysfs traversal); if absent, falls back to a vendor-ID scan.
+/// Gracefully skips if no suitable hidraw device is found (non-Steam Deck).
+pub async fn run_lizard_mode_suppression(cfg: LizardModeSuppression, hidraw_hint: Option<PathBuf>) {
     if !cfg.is_any() {
         return;
     }
 
-    let candidates = find_controller_hidraw_devices();
+    // Use the hint from the controller if provided; otherwise fall back to scan.
+    let candidates: Vec<PathBuf> = match hidraw_hint {
+        Some(p) => vec![p],
+        None => find_controller_hidraw_devices(),
+    };
+
     if candidates.is_empty() {
         println!("Lizard Mode suppression: no suitable hidraw device found, skipping.");
         return;
@@ -277,5 +284,64 @@ pub async fn run_lizard_mode_suppression(cfg: LizardModeSuppression) {
                 path
             );
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_setting_parses_known_values() {
+        let both = LizardModeSuppression::from_setting("buttons,mouse").unwrap();
+        assert!(both.suppress_buttons && both.suppress_mouse);
+
+        let buttons = LizardModeSuppression::from_setting("buttons").unwrap();
+        assert!(buttons.suppress_buttons && !buttons.suppress_mouse);
+
+        let mouse = LizardModeSuppression::from_setting("mouse").unwrap();
+        assert!(!mouse.suppress_buttons && mouse.suppress_mouse);
+    }
+
+    #[test]
+    fn from_setting_rejects_disabled_values() {
+        assert!(LizardModeSuppression::from_setting("false").is_none());
+        assert!(LizardModeSuppression::from_setting("off").is_none());
+        assert!(LizardModeSuppression::from_setting("none").is_none());
+        assert!(LizardModeSuppression::from_setting("0").is_none());
+    }
+
+    #[test]
+    fn from_setting_rejects_unrecognised() {
+        assert!(LizardModeSuppression::from_setting("everything").is_none());
+        assert!(LizardModeSuppression::from_setting("").is_none());
+    }
+
+    #[test]
+    fn make_settings_report_header() {
+        let r = make_settings_report(&[(7u8, 0u16)]);
+        assert_eq!(r[0], ID_SET_SETTINGS_VALUES);
+        assert_eq!(r[1], 3); // 1 setting × 3 bytes
+        assert_eq!(r[2], 7); // index
+        assert_eq!(r[3], 0); // value lo
+        assert_eq!(r[4], 0); // value hi
+    }
+
+    #[test]
+    fn make_clear_mappings_report_id() {
+        let r = make_clear_mappings_report();
+        assert_eq!(r[0], ID_CLEAR_DIGITAL_MAPPINGS);
+        assert!(r[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn make_disable_settings_report_has_trackpad_none() {
+        let r = make_disable_settings_report();
+        assert_eq!(r[0], ID_SET_SETTINGS_VALUES);
+        // First setting at offset 2: SETTING_LEFT_TRACKPAD_MODE = 7, value = TRACKPAD_NONE = 7
+        assert_eq!(r[2], SETTING_LEFT_TRACKPAD_MODE);
+        assert_eq!(u16::from_le_bytes([r[3], r[4]]), TRACKPAD_NONE);
     }
 }

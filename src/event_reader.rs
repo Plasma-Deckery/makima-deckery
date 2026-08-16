@@ -99,9 +99,12 @@ pub struct EventReader {
     rpad: PadState,
     /// True while a combined gesture session is active.
     gesture_session: Arc<Mutex<bool>>,
-    /// Path of the evdev device this reader is attached to — used to locate the
-    /// corresponding hidraw sibling via sysfs at startup.
+    /// Path of the evdev device this reader is attached to (used for logging).
     device_path: std::path::PathBuf,
+    /// Raw controller hidraw path, discovered once at device open time by
+    /// `SteamDeckController::from_evdev` and threaded through to avoid
+    /// a redundant sysfs scan at `TrackpadSession::setup`.
+    hidraw_path: Option<std::path::PathBuf>,
     /// Gaming Mode trigger configuration (from `[gaming_mode]` in the base config).
     /// Stored here so `convert_event` can check it without locking anything.
     gaming_mode_config: GamingModeConfig,
@@ -130,6 +133,7 @@ impl EventReader {
         active_client: Arc<Mutex<Client>>,
         window_changed: Arc<Notify>,
         device_path: std::path::PathBuf,
+        hidraw_path: Option<std::path::PathBuf>,
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
     ) -> Self {
@@ -446,6 +450,7 @@ impl EventReader {
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
             device_path,
+            hidraw_path,
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
             haptic_tx: Arc::new(Mutex::new(None)),
@@ -457,7 +462,7 @@ impl EventReader {
         let name = &self.config.iter().find(|&x| x.associations == Associations::default()).unwrap().name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
-        let session = TrackpadSession::setup(&self.trackpad, &self.virt_dev, &self.device_path).await;
+        let session = TrackpadSession::setup(&self.trackpad, &self.virt_dev, &self.device_path, self.hidraw_path.clone()).await;
         // Wire the haptic channel so Gaming Mode toggle can fire haptic feedback.
         *self.haptic_tx.lock().await = session.haptic_tx();
         self.write_state().await;

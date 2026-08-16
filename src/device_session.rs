@@ -54,6 +54,7 @@ impl TrackpadSession {
         trackpad: &TrackpadConfig,
         virt_dev: &Arc<Mutex<VirtualDevices>>,
         device_path: &std::path::Path,
+        hidraw_path: Option<std::path::PathBuf>,
     ) -> Self {
         // Validate modes early so the warning appears before any device work.
         for (side, mode) in [("left", &trackpad.left.mode), ("right", &trackpad.right.mode)] {
@@ -84,7 +85,7 @@ impl TrackpadSession {
             }
         }
 
-        let (pad_rx, haptic_tx) = match pad_hidraw::spawn(device_path) {
+        let (pad_rx, haptic_tx) = match pad_hidraw::spawn(hidraw_path) {
             Some((rx, tx)) => {
                 (Some(rx), Some(tx))
             }

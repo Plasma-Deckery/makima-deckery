@@ -1,8 +1,8 @@
 use crate::config::{Associations, Event};
 use crate::event_reader::EventReader;
+use crate::steam_deck_controller::{self, SteamDeckController, LizardModeSuppression};
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
-use evdev::{Device, EventStream};
 use std::{env, path::Path, process::Command, sync::Arc};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -55,28 +55,19 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
         }
     }
 
-    // EXPERIMENTAL: in-process suspend/resume watcher (see resume_watcher.rs).
-    // Replaces the external makima-resume-watcher script + `systemctl restart`
-    // with a direct D-Bus subscription that triggers the existing in-process
-    // reinit path on resume, instead of a full process restart.
-    tokio::spawn(crate::resume_watcher::start_resume_watcher(
-        resume_notify.clone(),
-    ));
-
-    // Suppress Steam Deck Lizard Mode — persists across device reinitializations.
-    // Reads SUPPRESS_LIZARD_MODE from any base config; defaults to "buttons,mouse".
-    // Set SUPPRESS_LIZARD_MODE = "false" to opt out. Gracefully skips on non-Steam-Deck hardware.
+    // Spawn resume watcher + Lizard Mode suppression via the controller module.
+    // Both run for the lifetime of the process, independent of device reinits.
+    // SUPPRESS_LIZARD_MODE from any base config; defaults to "buttons,mouse".
+    // Set SUPPRESS_LIZARD_MODE = "false" to opt out. Gracefully skips on non-Steam Deck hardware.
     {
-        use crate::lizard_mode::LizardModeSuppression;
         let setting = config_files
             .iter()
             .filter(|c| c.associations == Associations::default())
             .find_map(|c| c.settings.get("SUPPRESS_LIZARD_MODE"))
             .map(|s| s.as_str())
             .unwrap_or("buttons,mouse");
-        if let Some(cfg) = LizardModeSuppression::from_setting(setting) {
-            tokio::spawn(crate::lizard_mode::run_lizard_mode_suppression(cfg));
-        }
+        let lizard_cfg = LizardModeSuppression::from_setting(setting);
+        steam_deck_controller::start_background_tasks(lizard_cfg, resume_notify.clone());
     }
 
     let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), None, gaming_mode.clone());
@@ -348,10 +339,13 @@ pub fn launch_tasks(
         }
         let event_device = device.0.as_path().to_str().unwrap().to_string();
         if config_list.len() != 0 {
-            let stream = Arc::new(Mutex::new(get_event_stream(
-                Path::new(&event_device),
-                config_list.clone(),
-            )));
+            let grab = config_list
+                .iter()
+                .find(|c| c.associations == Associations::default())
+                .and_then(|c| c.settings.get("GRAB_DEVICE"))
+                .map_or(true, |v| v == "true");
+            let controller = SteamDeckController::from_evdev(Path::new(&event_device));
+            let stream = Arc::new(Mutex::new(controller.open_event_stream(grab)));
             // Reuse the previous VirtualDevices (same uinput devices, same
             // /dev/input/eventN nodes) instead of rebuilding from scratch when
             // asked to — libinput takes seconds to rediscover a freshly
@@ -384,6 +378,7 @@ pub fn launch_tasks(
                 active_client.clone(),
                 window_changed.clone(),
                 std::path::PathBuf::from(&event_device),
+                controller.hidraw_path,
                 gaming_mode.clone(),
                 gaming_mode_tx.clone(),
             );
@@ -520,29 +515,6 @@ fn copy_variables() {
     }
 }
 
-pub fn get_event_stream(path: &Path, config: Vec<Config>) -> EventStream {
-    let mut device: Device = Device::open(path).expect("Couldn't open device path.");
-    match config
-        .iter()
-        .find(|&x| x.associations == Associations::default())
-        .unwrap()
-        .settings
-        .get("GRAB_DEVICE")
-    {
-        Some(value) => {
-            if value == &true.to_string() {
-                device
-                    .grab()
-                    .expect("Unable to grab device. Is another instance of Makima running?")
-            }
-        }
-        None => device
-            .grab()
-            .expect("Unable to grab device. Is another instance of Makima running?"),
-    }
-    let stream: EventStream = device.into_event_stream().unwrap();
-    return stream;
-}
 
 pub fn is_mapped(udev_device: &tokio_udev::Device, config_files: &Vec<Config>) -> bool {
     match udev_device.devnode() {

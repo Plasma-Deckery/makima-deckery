@@ -1,7 +1,5 @@
 // ── In-process suspend/resume watcher ────────────────────────────────────────
 //
-// EXPERIMENTAL (branch: experiment/inproc-resume-reconnect-v2).
-//
 // Replaces the external `makima-resume-watcher` bash script + `systemctl
 // --user restart makima.service` with an in-process D-Bus subscription to
 // logind's `PrepareForSleep` signal. On resume we trigger a dedicated
