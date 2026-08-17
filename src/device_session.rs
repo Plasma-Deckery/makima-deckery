@@ -17,7 +17,7 @@ use crate::config::TrackpadConfig;
 use crate::gesture_pad::{self, GesturePadConfig};
 use crate::kde_input_defaults::{self, GestureKdeConfig, PadKdeConfig};
 use crate::mt_trackpad::{self, HapticChain, MovementHaptic, MtTrackpadConfig};
-use crate::steam_deck_controller::{HapticPad, HidrawWrite, PadFrame};
+use crate::steam_deck_controller::{HapticPad, HapticRequest, PadFrame};
 use crate::trackpad::PadState;
 use crate::trackpad_router::{self, GestureEvent, SinglePadFrame, StateWrite};
 use crate::virtual_devices::VirtualDevices;
@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, Mutex};
 
 pub struct TrackpadSession {
     pad_rx:      Option<mpsc::Receiver<PadFrame>>,
-    hidraw_tx:   Option<mpsc::Sender<HidrawWrite>>,
+    haptic_tx:   Option<mpsc::Sender<HapticRequest>>,
     left_tx:     Option<mpsc::Sender<SinglePadFrame>>,
     left_rx:     Option<mpsc::Receiver<SinglePadFrame>>,
     right_tx:    Option<mpsc::Sender<SinglePadFrame>>,
@@ -50,13 +50,13 @@ impl TrackpadSession {
     /// writes KDE libinput defaults, creates virtual MT uinput nodes,
     /// and builds the routing channels. Call this before `run`.
     ///
-    /// `pad_rx` and `hidraw_tx` come from `ControllerSession` — the controller
+    /// `pad_rx` and `haptic_tx` come from `ControllerSession` — the controller
     /// already owns the hidraw fd and tasks. No hidraw path is opened here.
     pub async fn setup(
         trackpad: &TrackpadConfig,
         virt_dev: &Arc<Mutex<VirtualDevices>>,
         pad_rx: Option<mpsc::Receiver<PadFrame>>,
-        hidraw_tx: Option<mpsc::Sender<HidrawWrite>>,
+        haptic_tx: Option<mpsc::Sender<HapticRequest>>,
     ) -> Self {
         // Validate modes early so the warning appears before any device work.
         for (side, mode) in [("left", &trackpad.left.mode), ("right", &trackpad.right.mode)] {
@@ -114,7 +114,7 @@ impl TrackpadSession {
 
         Self {
             pad_rx,
-            hidraw_tx,
+            haptic_tx,
             left_tx,
             left_rx,
             right_tx,
@@ -142,9 +142,9 @@ impl TrackpadSession {
         state_tx: mpsc::Sender<StateWrite>,
         gaming_mode: Arc<Mutex<bool>>,
     ) {
-        let left_haptic    = self.hidraw_tx.clone();
-        let right_haptic   = self.hidraw_tx.clone();
-        let gesture_haptic = self.hidraw_tx;
+        let left_haptic    = self.haptic_tx.clone();
+        let right_haptic   = self.haptic_tx.clone();
+        let gesture_haptic = self.haptic_tx;
 
         tokio::join!(
             async {

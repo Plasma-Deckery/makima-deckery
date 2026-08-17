@@ -359,7 +359,7 @@ pub fn launch_tasks(
                 is_tablet,
                 max_abs_wheel,
                 session.pad_rx,
-                session.hidraw_tx,
+                session.haptic_tx,
                 modifiers.clone(),
                 modifier_was_activated.clone(),
                 environment.clone(),
