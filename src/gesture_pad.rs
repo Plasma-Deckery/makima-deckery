@@ -18,8 +18,8 @@
 //! This module owns that judgment call itself via `GesturePadConfig`,
 //! self-parsed from `[trackpad.gestures]` exactly like
 //! `mt_trackpad::MtTrackpadConfig` parses `[trackpad.left]`/`[trackpad.right]`.
-use crate::mt_trackpad::{pulse, HapticPulse};
-use crate::steam_deck_controller::{HapticPad, HidrawWrite};
+use crate::mt_trackpad::pulse;
+use crate::steam_deck_controller::{HapticPad, HapticPulse, HapticRequest};
 use crate::trackpad::emit_gesture_event;
 use crate::trackpad_router::{CombinedPadFrame, GestureEvent};
 use crate::virtual_devices::VirtualDevices;
@@ -140,7 +140,7 @@ fn frame_distance(prev: CombinedPadFrame, curr: CombinedPadFrame) -> f64 {
 pub async fn run(
     mut rx: mpsc::Receiver<GestureEvent>,
     virt_dev: &Arc<Mutex<VirtualDevices>>,
-    haptic_tx: Option<mpsc::Sender<HidrawWrite>>,
+    haptic_tx: Option<mpsc::Sender<HapticRequest>>,
     config: GesturePadConfig,
 ) {
     let mut prev_move_frame: Option<CombinedPadFrame> = None;

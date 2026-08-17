@@ -6,12 +6,15 @@
 //!   64-byte HID input reports. Position and touch state arrive atomically
 //!   from the same `read()` — no ordering hazard possible.
 //!
-//! - **Writer** (`run_hidraw_writer`): serializes all outbound HID feature
-//!   reports (haptic pulses, Lizard Mode heartbeats, future firmware settings)
-//!   through a single `mpsc` channel onto one file descriptor. One fd, one
-//!   writer, no concurrent-ioctl races.
+//! - **Writer** (`run_hidraw_writer`): serialises all outbound HID feature
+//!   reports onto one file descriptor, selected from two sources:
+//!   - `HapticCommand`s forwarded by the haptic player task (from callers)
+//!   - Lizard Mode heartbeat reports, driven by an internal timer +
+//!     `watch::Receiver<Option<LizardModeSuppression>>`
 //!
-//! Callers receive `(Receiver<PadFrame>, Sender<HidrawWrite>)` from
+//!   One fd, one writer — no concurrent-ioctl races.
+//!
+//! Callers receive `(Receiver<PadFrame>, Sender<HapticRequest>)` from
 //! `spawn_hidraw_tasks` and never touch the file descriptor directly.
 //!
 //! ## Byte offsets
@@ -24,8 +27,10 @@
 //! report (~4ms) — evidence that the evdev path goes through an extra
 //! translation layer in the hid-steam kernel driver.
 
+use super::haptic::{HapticCommand, HapticPad, HapticRequest};
+use super::lizard_mode::{self, LizardModeSuppression, HEARTBEAT_INTERVAL};
 use std::path::PathBuf;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 // ── PadFrame ─────────────────────────────────────────────────────────────────
 
@@ -35,12 +40,12 @@ use tokio::sync::mpsc;
 /// touch bit to reflect different points in time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PadFrame {
-    pub lx: i32,
-    pub ly: i32,
+    pub lx:     i32,
+    pub ly:     i32,
     pub ltouch: bool,
     pub lclick: bool,
-    pub rx: i32,
-    pub ry: i32,
+    pub rx:     i32,
+    pub ry:     i32,
     pub rtouch: bool,
     pub rclick: bool,
 }
@@ -49,8 +54,8 @@ impl PadFrame {
     fn parse(buf: &[u8; 64]) -> Self {
         let byte10 = buf[10];
         Self {
-            lx: i16::from_le_bytes([buf[16], buf[17]]) as i32,
-            ly: i16::from_le_bytes([buf[18], buf[19]]) as i32,
+            lx:     i16::from_le_bytes([buf[16], buf[17]]) as i32,
+            ly:     i16::from_le_bytes([buf[18], buf[19]]) as i32,
             ltouch: (byte10 & 0x08) != 0,
             // Click (physical press-through) lives in the same byte as touch —
             // confirmed against the upstream hid-steam kernel driver
@@ -58,97 +63,35 @@ impl PadFrame {
             // = b10 & BIT(2). Reading both from the same byte makes click
             // atomic with position/touch — no evdev ordering hazard.
             lclick: (byte10 & 0x02) != 0,
-            rx: i16::from_le_bytes([buf[20], buf[21]]) as i32,
-            ry: i16::from_le_bytes([buf[22], buf[23]]) as i32,
+            rx:     i16::from_le_bytes([buf[20], buf[21]]) as i32,
+            ry:     i16::from_le_bytes([buf[22], buf[23]]) as i32,
             rtouch: (byte10 & 0x10) != 0,
             rclick: (byte10 & 0x04) != 0,
         }
     }
 }
 
-// ── HapticPad ────────────────────────────────────────────────────────────────
-
-/// Which pad(s) a haptic pulse should play on.
-///
-/// Wire values are swapped relative to the hid-steam.c constant names
-/// (`STEAM_PAD_LEFT`/`RIGHT` = 0/1): on-hardware testing (2026-07-09) showed
-/// pressing the right pad buzzing the left actuator with the "obvious" values,
-/// so `Left → 1` and `Right → 0`. `Both` is unaffected.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HapticPad {
-    Left,
-    Right,
-    Both,
-}
-
-impl HapticPad {
-    fn wire_value(self) -> u8 {
-        match self {
-            HapticPad::Left => 1,
-            HapticPad::Right => 0,
-            HapticPad::Both => 2,
-        }
-    }
-}
-
-// ── HapticCommand ────────────────────────────────────────────────────────────
-
-/// One haptic "rumble" pulse to send to the trackpad's linear resonant
-/// actuator via the `ID_TRIGGER_HAPTIC_PULSE` (0x8F) HID feature report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HapticCommand {
-    pub pad: HapticPad,
-    /// Pulse duration in microseconds.
-    pub duration_us: u16,
-    /// Time between pulses in microseconds (only matters when `count > 1`).
-    pub interval_us: u16,
-    /// Number of pulses to fire.
-    pub count: u16,
-    /// Gain in decibels — roughly -24 (quiet) to +6 (loud) per the firmware.
-    pub gain_db: i8,
-}
-
-// ── HidrawWrite ──────────────────────────────────────────────────────────────
-
-/// A command to be serialized onto the hidraw file descriptor by the writer
-/// task.
-///
-/// External callers construct only `Haptic`. The `LizardReport` variant is an
-/// internal detail used by the lizard mode heartbeat task inside
-/// `steam_deck_controller` and is not part of the stable public API.
-pub enum HidrawWrite {
-    /// A haptic pulse sent via `HIDIOCSFEATURE(65)`.
-    Haptic(HapticCommand),
-    /// A raw 64-byte settings/Lizard Mode report sent via `HIDIOCSFEATURE(64)`.
-    /// Internal use by `lizard_mode` only — callers configure Lizard Mode via
-    /// `ControllerSession::lizard_tx` instead.
-    #[doc(hidden)]
-    LizardReport([u8; 64]),
-}
-
 // ── Haptic wire format ────────────────────────────────────────────────────────
 
-/// HID feature report ID for `ID_TRIGGER_HAPTIC_PULSE`, straight from
-/// upstream `hid-steam.c`.
+/// HID feature report ID for `ID_TRIGGER_HAPTIC_PULSE`, from hid-steam.c.
 const ID_TRIGGER_HAPTIC_PULSE: u8 = 0x8F;
 
 /// Serializes a `HapticCommand` into the exact 65-byte HID feature report
 /// buffer the kernel's `hid-steam` driver sends over USB/BT.
 ///
 /// Layout (from `steam_send_report`/`steam_haptic_pulse` in hid-steam.c):
-///   buf[0]    = 0x00           report ID (always 0)
-///   buf[1]    = 0x8F           ID_TRIGGER_HAPTIC_PULSE
-///   buf[2]    = 0x08           payload length (8 bytes follow)
-///   buf[3]    = pad            0=right, 1=left, 2=both (swapped — see HapticPad)
-///   buf[4..6] = duration (u16 LE, microseconds)
-///   buf[6..8] = interval (u16 LE, microseconds)
-///   buf[8..10]= count    (u16 LE, pulses)
-///   buf[10]   = gain (i8, dB)
+///   buf[0]     = 0x00           report ID (always 0)
+///   buf[1]     = 0x8F           ID_TRIGGER_HAPTIC_PULSE
+///   buf[2]     = 0x08           payload length (8 bytes follow)
+///   buf[3]     = pad            0=right, 1=left, 2=both (swapped — see HapticPad)
+///   buf[4..6]  = duration (u16 LE, microseconds)
+///   buf[6..8]  = interval (u16 LE, microseconds)
+///   buf[8..10] = count    (u16 LE, pulses)
+///   buf[10]    = gain (i8, dB)
 ///   buf[11..65] = 0 padding
 ///
-/// Pure and I/O-free — the wire format is unit-testable without a real device.
-pub fn build_haptic_report(cmd: &HapticCommand) -> [u8; 65] {
+/// Pure and I/O-free — wire format is unit-testable without a real device.
+fn build_haptic_report(cmd: &HapticCommand) -> [u8; 65] {
     let mut buf = [0u8; 65];
     buf[1] = ID_TRIGGER_HAPTIC_PULSE;
     buf[2] = 8;
@@ -167,15 +110,15 @@ pub fn build_haptic_report(cmd: &HapticCommand) -> [u8; 65] {
 /// Reproduces `#define HIDIOCSFEATURE(len) _IOC(_IOC_WRITE|_IOC_READ,'H',0x06,len)`
 /// from `<linux/hidraw.h>` — not exposed by `libc`, so computed by hand.
 const fn hidiocsfeature(len: usize) -> libc::c_ulong {
-    const IOC_NRSHIFT: u32 = 0;
+    const IOC_NRSHIFT:   u32 = 0;
     const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + 8;
     const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + 8;
-    const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + 14;
+    const IOC_DIRSHIFT:  u32 = IOC_SIZESHIFT + 14;
     const IOC_WRITE: u32 = 1;
-    const IOC_READ: u32 = 2;
-    let dir = IOC_WRITE | IOC_READ;
-    let ty = b'H' as u32;
-    let nr = 0x06u32;
+    const IOC_READ:  u32 = 2;
+    let dir  = IOC_WRITE | IOC_READ;
+    let ty   = b'H' as u32;
+    let nr   = 0x06u32;
     let size = len as u32;
     ((dir << IOC_DIRSHIFT) | (ty << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT) | (size << IOC_SIZESHIFT))
         as libc::c_ulong
@@ -185,9 +128,7 @@ const fn hidiocsfeature(len: usize) -> libc::c_ulong {
 ///
 /// Blocking syscall — callers in async context use `spawn_blocking`.
 fn send_feature_report_raw(fd: std::os::fd::RawFd, buf: &mut [u8], len: usize) -> std::io::Result<()> {
-    let ret = unsafe {
-        libc::ioctl(fd, hidiocsfeature(len) as _, buf.as_mut_ptr())
-    };
+    let ret = unsafe { libc::ioctl(fd, hidiocsfeature(len) as _, buf.as_mut_ptr()) };
     if ret < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 
@@ -209,7 +150,7 @@ pub async fn run_hidraw_reader(path: PathBuf, tx: mpsc::Sender<PadFrame>) {
         }
     };
     let mut reader = tokio::io::BufReader::new(file);
-    let mut buf = [0u8; 64];
+    let mut buf  = [0u8; 64];
     let mut last: Option<PadFrame> = None;
     loop {
         match reader.read_exact(&mut buf).await {
@@ -229,16 +170,22 @@ pub async fn run_hidraw_reader(path: PathBuf, tx: mpsc::Sender<PadFrame>) {
 
 // ── Writer task ───────────────────────────────────────────────────────────────
 
-/// Serializes all outbound hidraw writes onto a single file descriptor.
+/// Serialises all outbound hidraw writes onto a single file descriptor.
 ///
-/// All writers — haptic commands from `mt_trackpad`/`gesture_pad`, Lizard Mode
-/// heartbeats from `lizard_mode` — share one `Sender<HidrawWrite>`. This task
-/// is the sole owner of the write fd and processes commands sequentially,
-/// eliminating any possibility of concurrent-ioctl races between the old
-/// separate `run_pad_haptic_writer` and `lizard_mode` file handles.
+/// Selects from two sources:
+/// - `haptic_rx`: `HapticCommand`s forwarded by the haptic player task.
+/// - Lizard Mode heartbeat: timer-driven, config read from `lizard_rx` watch.
+///   On the initial write (or when config transitions from `None` to `Some`),
+///   the full disable-settings report is sent. Heartbeat ticks send the
+///   minimal watchdog report matching SDL's `FeedDeckLizardWatchdog`.
 ///
-/// Exits silently once the channel closes or the device can't be opened.
-pub async fn run_hidraw_writer(path: PathBuf, mut rx: mpsc::Receiver<HidrawWrite>) {
+/// Exits when `haptic_rx` closes (haptic player exited → session ending) or
+/// when `lizard_rx` sender is dropped (same signal).
+async fn run_hidraw_writer(
+    path: PathBuf,
+    mut haptic_rx: mpsc::Receiver<HapticCommand>,
+    mut lizard_rx: watch::Receiver<Option<LizardModeSuppression>>,
+) {
     use std::os::unix::io::AsRawFd;
     let file = match std::fs::OpenOptions::new().write(true).open(&path) {
         Ok(f) => f,
@@ -248,51 +195,119 @@ pub async fn run_hidraw_writer(path: PathBuf, mut rx: mpsc::Receiver<HidrawWrite
         }
     };
     let fd = file.as_raw_fd();
-    while let Some(write) = rx.recv().await {
-        let result = match write {
-            HidrawWrite::Haptic(cmd) => {
-                let mut buf = build_haptic_report(&cmd);
-                let len = buf.len(); // 65
-                tokio::task::spawn_blocking(move || send_feature_report_raw(fd, &mut buf, len)).await
+
+    let mut lizard_cfg = lizard_rx.borrow_and_update().clone();
+
+    // Consume the timer's immediate first tick before entering the loop,
+    // so the heartbeat fires after HEARTBEAT_INTERVAL, not immediately.
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.tick().await;
+
+    // Send initial Lizard Mode suppression reports if configured.
+    if let Some(ref cfg) = lizard_cfg {
+        send_lizard_reports(fd, cfg, true).await;
+        println!(
+            "makima: Lizard Mode suppression active (buttons={}, mouse={}). +{}ms since startup",
+            cfg.suppress_buttons, cfg.suppress_mouse, crate::startup_ms()
+        );
+    }
+
+    loop {
+        tokio::select! {
+            maybe_cmd = haptic_rx.recv() => {
+                match maybe_cmd {
+                    Some(cmd) => {
+                        let mut buf = build_haptic_report(&cmd);
+                        let len = buf.len(); // 65
+                        let result = tokio::task::spawn_blocking(move || {
+                            send_feature_report_raw(fd, &mut buf, len)
+                        }).await;
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => eprintln!("makima: haptic write failed: {}", e),
+                            Err(e)     => eprintln!("makima: haptic writer task panicked: {}", e),
+                        }
+                    }
+                    None => break, // haptic player exited — session ending
+                }
             }
-            HidrawWrite::LizardReport(mut buf) => {
-                let len = buf.len(); // 64
-                tokio::task::spawn_blocking(move || send_feature_report_raw(fd, &mut buf, len)).await
+            _ = heartbeat.tick() => {
+                if let Some(ref cfg) = lizard_cfg {
+                    send_lizard_reports(fd, cfg, false).await;
+                }
             }
-        };
+            changed = lizard_rx.changed() => {
+                if changed.is_err() { break; } // lizard_tx dropped — session ending
+                let new_cfg = lizard_rx.borrow_and_update().clone();
+                // Transition from disabled → enabled: send full initial reports.
+                if lizard_cfg.is_none() {
+                    if let Some(ref cfg) = new_cfg {
+                        send_lizard_reports(fd, cfg, true).await;
+                    }
+                }
+                lizard_cfg = new_cfg;
+            }
+        }
+    }
+}
+
+/// Sends Lizard Mode reports for the given config. `initial = true` sends the
+/// full disable-settings report (all fields); `initial = false` sends the
+/// minimal heartbeat report (SDL's watchdog pattern).
+async fn send_lizard_reports(
+    fd: std::os::fd::RawFd,
+    cfg: &LizardModeSuppression,
+    initial: bool,
+) {
+    for mut buf in lizard_mode::build_reports(cfg, initial) {
+        let len = buf.len(); // 64
+        let result = tokio::task::spawn_blocking(move || {
+            send_feature_report_raw(fd, &mut buf, len)
+        }).await;
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("makima: hidraw write failed: {}", e),
-            Err(e) => eprintln!("makima: hidraw writer task panicked: {}", e),
+            Ok(Err(e)) => eprintln!("makima: lizard mode write failed: {}", e),
+            Err(e)     => eprintln!("makima: lizard mode writer task panicked: {}", e),
         }
     }
 }
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
-/// Spawns the hidraw reader and writer tasks for the given path.
+/// Spawns the hidraw reader, haptic player, and unified writer tasks.
 ///
-/// Returns `(Receiver<PadFrame>, Sender<HidrawWrite>)` so the caller can
-/// subscribe to trackpad frames and send haptic/settings commands.
+/// Returns `(Receiver<PadFrame>, Sender<HapticRequest>)`:
+/// - `PadFrame` receiver: trackpad position frames (one per hidraw report change)
+/// - `HapticRequest` sender: callers send chains here; evaluation and fd I/O
+///   happen inside the spawned tasks, never in the caller.
 ///
-/// Called internally by `SteamDeckController::start()` — callers never
-/// open the hidraw fd directly.
+/// `lizard_rx` is consumed by the writer task — Lizard Mode config changes
+/// are applied live without restarting any task.
+///
+/// Called internally by `SteamDeckController::start()` — callers never open
+/// the hidraw fd directly.
 pub(super) fn spawn_hidraw_tasks(
     path: PathBuf,
-) -> (mpsc::Receiver<PadFrame>, mpsc::Sender<HidrawWrite>) {
+    lizard_rx: watch::Receiver<Option<LizardModeSuppression>>,
+) -> (mpsc::Receiver<PadFrame>, mpsc::Sender<HapticRequest>) {
     println!(
         "makima: hidraw attached to {:?}. +{}ms since startup",
         path,
         crate::startup_ms()
     );
-    let (frame_tx, frame_rx) = mpsc::channel(64);
-    let (write_tx, write_rx) = mpsc::channel::<HidrawWrite>(32);
+
+    let (frame_tx,   frame_rx)   = mpsc::channel::<PadFrame>(64);
+    let (request_tx, request_rx) = mpsc::channel::<HapticRequest>(32);
+    // Internal channel between haptic player and writer — never exposed outside
+    // this module group.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<HapticCommand>(32);
 
     let read_path = path.clone();
     tokio::spawn(async move { run_hidraw_reader(read_path, frame_tx).await });
-    tokio::spawn(async move { run_hidraw_writer(path, write_rx).await });
+    tokio::spawn(async move { super::haptic::run_haptic_player(request_rx, cmd_tx).await });
+    tokio::spawn(async move { run_hidraw_writer(path, cmd_rx, lizard_rx).await });
 
-    (frame_rx, write_tx)
+    (frame_rx, request_tx)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -301,8 +316,6 @@ pub(super) fn spawn_hidraw_tasks(
 mod tests {
     use super::*;
 
-    /// Builds a synthetic 64-byte hidraw report with given RPAD/LPAD position
-    /// and touch bits at the empirically-determined offsets.
     fn make_report(lx: i16, ly: i16, ltouch: bool, rx: i16, ry: i16, rtouch: bool) -> [u8; 64] {
         make_report_full(lx, ly, ltouch, false, rx, ry, rtouch, false)
     }
@@ -326,20 +339,16 @@ mod tests {
         buf
     }
 
-    /// Regression: LPAD X/Y at 16/18, RPAD X/Y at 20/22, touch bits in byte
-    /// 10 (0x08 = LPAD, 0x10 = RPAD). Pins the empirically-found offsets.
     #[test]
     fn parse_extracts_known_offsets_correctly() {
         let buf = make_report(1111, -2222, true, 3333, -4444, false);
         let frame = PadFrame::parse(&buf);
         assert_eq!(frame, PadFrame {
-            lx: 1111, ly: -2222, ltouch: true, lclick: false,
+            lx: 1111, ly: -2222, ltouch: true,  lclick: false,
             rx: 3333, ry: -4444, rtouch: false, rclick: false,
         });
     }
 
-    /// Click bits (1/2) must not be confused with touch bits (3/4) or the
-    /// other pad's bits.
     #[test]
     fn parse_extracts_click_bits_independently_of_touch_and_other_pad() {
         let buf = make_report_full(1, 2, true, true, 3, 4, true, false);
@@ -358,8 +367,6 @@ mod tests {
         assert!(!frame.rtouch && frame.rclick);
     }
 
-    /// Negative i16 values must round-trip correctly through little-endian
-    /// encoding.
     #[test]
     fn parse_handles_full_i16_range() {
         let buf = make_report(i16::MIN, i16::MAX, false, i16::MAX, i16::MIN, true);
@@ -370,8 +377,6 @@ mod tests {
         assert_eq!(frame.ry, i16::MIN as i32);
     }
 
-    /// Diagonal drag: every frame has both axes from the same read() — no
-    /// "staircase" intermediate state where only one axis updated.
     #[test]
     fn diagonal_movement_never_produces_a_half_updated_frame() {
         for step in 1..=20i16 {
@@ -384,7 +389,6 @@ mod tests {
         }
     }
 
-    /// Lift and retouch elsewhere must be two distinct, ordered frames.
     #[test]
     fn lift_and_retouch_elsewhere_are_seen_as_distinct_ordered_frames() {
         let touching_at_a = PadFrame::parse(&make_report(0, 0, false, 1000, 2000, true));
@@ -412,8 +416,8 @@ mod tests {
         assert_eq!(buf[1], 0x8F);
         assert_eq!(buf[2], 8);
         assert_eq!(buf[3], 0, "HapticPad::Right wire value must be 0 (swapped — see HapticPad)");
-        assert_eq!(&buf[4..6], &0x1234u16.to_le_bytes());
-        assert_eq!(&buf[6..8], &0x5678u16.to_le_bytes());
+        assert_eq!(&buf[4..6],  &0x1234u16.to_le_bytes());
+        assert_eq!(&buf[6..8],  &0x5678u16.to_le_bytes());
         assert_eq!(&buf[8..10], &3u16.to_le_bytes());
         assert_eq!(buf[10] as i8, -6);
         assert!(buf[11..].iter().all(|&b| b == 0));
@@ -428,14 +432,12 @@ mod tests {
         assert_eq!(build_haptic_report(&HapticCommand { pad: HapticPad::Both,  ..base })[3], 2);
     }
 
-    /// `HIDIOCSFEATURE(65)` must match the known Linux constant.
     #[test]
     fn hidiocsfeature_65_matches_known_constant() {
         let expected: u32 = (3u32 << 30) | (0x48u32 << 8) | 0x06u32 | (65u32 << 16);
         assert_eq!(hidiocsfeature(65) as u32, expected);
     }
 
-    /// `HIDIOCSFEATURE(64)` matches the constant used for settings/lizard reports.
     #[test]
     fn hidiocsfeature_64_matches_known_constant() {
         let expected: u32 = (3u32 << 30) | (0x48u32 << 8) | 0x06u32 | (64u32 << 16);

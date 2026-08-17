@@ -2,7 +2,7 @@ use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::device_session::TrackpadSession;
 use crate::mt_trackpad;
-use crate::steam_deck_controller::{HapticPad, HidrawWrite, PadFrame};
+use crate::steam_deck_controller::{HapticPad, HapticRequest, PadFrame};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::trackpad::PadState;
@@ -113,7 +113,7 @@ pub struct EventReader {
     pad_rx: Arc<Mutex<Option<mpsc::Receiver<PadFrame>>>>,
     /// Unified hidraw write channel from the controller session.
     /// Used to fire haptics on Gaming Mode toggle. Cloned into TrackpadSession.
-    hidraw_tx: Option<mpsc::Sender<HidrawWrite>>,
+    haptic_tx: Option<mpsc::Sender<HapticRequest>>,
     /// Gaming Mode trigger configuration (from `[gaming_mode]` in the base config).
     /// Stored here so `convert_event` can check it without locking anything.
     gaming_mode_config: GamingModeConfig,
@@ -135,7 +135,7 @@ impl EventReader {
         is_tablet: bool,
         max_abs_wheel: i32,
         pad_rx: Option<mpsc::Receiver<PadFrame>>,
-        hidraw_tx: Option<mpsc::Sender<HidrawWrite>>,
+        haptic_tx: Option<mpsc::Sender<HapticRequest>>,
         modifiers: Arc<Mutex<Vec<Event>>>,
         modifier_was_activated: Arc<Mutex<bool>>,
         environment: Environment,
@@ -460,7 +460,7 @@ impl EventReader {
             gesture_session: Arc::new(Mutex::new(false)),
             device_path,
             pad_rx: Arc::new(Mutex::new(pad_rx)),
-            hidraw_tx,
+            haptic_tx,
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
             gaming_mode_tx,
@@ -477,7 +477,7 @@ impl EventReader {
             &self.trackpad,
             &self.virt_dev,
             pad_rx,
-            self.hidraw_tx.clone(),
+            self.haptic_tx.clone(),
         ).await;
         self.write_state().await;
         self.start_control_socket().await;
@@ -521,7 +521,7 @@ impl EventReader {
             println!("makima: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
             let chain = if new_state { &self.gaming_mode_config.haptic_on }
                         else        { &self.gaming_mode_config.haptic_off };
-            mt_trackpad::fire_chain(&self.hidraw_tx, HapticPad::Both, chain).await;
+            mt_trackpad::fire_chain(&self.haptic_tx, HapticPad::Both, chain).await;
         }
         let label = if new_state { "Gaming Mode On" } else { "Gaming Mode Off" };
         *self.last_action.lock().await = Some(crate::state_export::LastAction {

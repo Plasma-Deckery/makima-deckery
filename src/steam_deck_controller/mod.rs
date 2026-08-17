@@ -11,7 +11,7 @@
 //! ```
 //! steam_deck_controller/
 //!   mod.rs            ← SteamDeckController, ControllerSession, public API
-//!   hidraw.rs         ← PadFrame reader + HidrawWrite writer (owns the fd)
+//!   hidraw.rs         ← PadFrame reader + unified writer (owns the fd)
 //!   lizard_mode.rs    ← Lizard Mode suppression heartbeat
 //!   resume_watcher.rs ← logind PrepareForSleep D-Bus watcher
 //! ```
@@ -26,7 +26,7 @@
 //! let session = controller.start(grab, resume_notify, device_error_notify, lizard_cfg);
 //! // session.event_rx  — ControllerEvent channel (suspend-transparent)
 //! // session.pad_rx    — PadFrame channel (trackpad position)
-//! // session.hidraw_tx — HidrawWrite channel (haptics, settings)
+//! // session.haptic_tx — HapticRequest channel (send chains to play haptics)
 //! // session.lizard_tx — live Lizard Mode config
 //! ```
 //!
@@ -37,13 +37,18 @@
 //! let session = controller.start(false, Arc::new(Notify::new()), Arc::new(Notify::new()), None);
 //! ```
 
+pub mod haptic;
 pub mod hidraw;
 pub mod lizard_mode;
 pub mod resume_watcher;
 
 // Re-export the types that consumers need so they import from here,
 // not from the internal submodule. This is the stable public API surface.
-pub use hidraw::{HapticCommand, HapticPad, HidrawWrite, PadFrame};
+//
+// Haptic types live in haptic.rs — HapticCommand and HidrawWrite are internal
+// implementation details never exposed outside this module group.
+pub use haptic::{HapticChain, HapticChainStep, HapticPad, HapticPulse, HapticRequest};
+pub use hidraw::PadFrame;
 pub use lizard_mode::LizardModeSuppression;
 
 use evdev::{Device, EventStream, InputEvent};
@@ -100,10 +105,10 @@ pub struct ControllerSession {
     /// was found (non-Steam Deck hardware or sysfs traversal failed).
     pub pad_rx: Option<mpsc::Receiver<PadFrame>>,
 
-    /// Unified hidraw write channel. Send `HidrawWrite::Haptic(cmd)` for
-    /// haptic pulses; future `HidrawWrite::Settings(...)` for firmware config.
-    /// `None` if no hidraw sibling was found.
-    pub hidraw_tx: Option<mpsc::Sender<HidrawWrite>>,
+    /// Haptic request channel. Send `HapticRequest { pad, chain }` to play
+    /// haptic feedback; the controller evaluates the chain (including inter-step
+    /// sleeps) internally. `None` if no hidraw sibling was found.
+    pub haptic_tx: Option<mpsc::Sender<HapticRequest>>,
 
     /// Live Lizard Mode configuration. Send `None` to disable the heartbeat,
     /// `Some(cfg)` to enable or change timing/reports without restarting tasks.
@@ -186,13 +191,19 @@ impl SteamDeckController {
             device_error_notify,
         ));
 
-        // ── hidraw ──
-        let (pad_rx, hidraw_tx) = match &self.hidraw_path {
+        // ── hidraw + Lizard Mode ──
+        // The writer task owns the fd and handles both haptic commands (from
+        // the haptic player) and the Lizard Mode heartbeat (from the timer +
+        // lizard_rx watch). No separate lizard task needed.
+        let (lizard_tx, lizard_rx) = watch::channel(initial_lizard_cfg);
+        let (pad_rx, haptic_tx) = match &self.hidraw_path {
             Some(p) => {
-                let (rx, tx) = hidraw::spawn_hidraw_tasks(p.clone());
+                let (rx, tx) = hidraw::spawn_hidraw_tasks(p.clone(), lizard_rx);
                 (Some(rx), Some(tx))
             }
             None => {
+                // lizard_rx dropped here — lizard_tx still valid but sends to nobody.
+                drop(lizard_rx);
                 println!(
                     "makima: no hidraw sibling found for {:?} — trackpad position/haptics not available",
                     self.evdev_path
@@ -201,13 +212,7 @@ impl SteamDeckController {
             }
         };
 
-        // ── Lizard Mode ──
-        let (lizard_tx, lizard_rx) = watch::channel(initial_lizard_cfg);
-        if let Some(tx) = hidraw_tx.clone() {
-            tokio::spawn(lizard_mode::run_lizard_mode_suppression(lizard_rx, tx));
-        }
-
-        ControllerSession { event_rx, pad_rx, hidraw_tx, lizard_tx }
+        ControllerSession { event_rx, pad_rx, haptic_tx, lizard_tx }
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────

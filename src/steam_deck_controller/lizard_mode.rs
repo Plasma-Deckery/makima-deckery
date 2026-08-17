@@ -9,22 +9,20 @@
 /// runs.  When this task is cancelled or the process exits, Lizard Mode
 /// re-activates automatically within ~8 s (two missed heartbeats).
 ///
-/// In Phase 3 the heartbeat no longer opens its own hidraw fd — it sends
-/// `HidrawWrite::LizardReport` through the controller's unified writer task,
-/// which owns the single shared fd. This eliminates the old race condition
-/// where lizard mode and the haptic writer could issue concurrent ioctls.
+/// The heartbeat and haptic writes are both handled by the unified
+/// `run_hidraw_writer` task in `hidraw.rs`, which selects on the haptic
+/// command receiver and a timer simultaneously. This module provides the
+/// configuration type and the report-builder helpers called by that task.
 ///
 /// Protocol reference: SDL `SDL_hidapi_steamdeck.c` (`DisableDeckLizardMode` /
 /// `FeedDeckLizardWatchdog`) and Linux `drivers/hid/hid-steam.c`
 /// (`steam_set_lizard_mode`).
-use tokio::sync::{mpsc, watch};
-use tokio::time::{self, Duration};
-
-use super::hidraw::HidrawWrite;
+use tokio::time::Duration;
 
 /// How often to re-send the suppression heartbeat.
 /// The controller re-enables Lizard Mode after ~8 s without a heartbeat.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
+/// `pub(super)` so `hidraw.rs` can use this constant for the timer interval.
+pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 
 // ── Report IDs (from SDL controller_constants.h / hid-steam.c) ───────────────
 
@@ -144,90 +142,17 @@ impl LizardModeSuppression {
     }
 }
 
-// ── Main task ─────────────────────────────────────────────────────────────────
-
-/// Runs the Lizard Mode suppression heartbeat loop.
-///
-/// Sends `HidrawWrite::LizardReport` through the controller's unified hidraw
-/// writer — no fd ownership here. The writer task serializes all hidraw writes
-/// onto a single file descriptor, eliminating the old race condition between
-/// lizard heartbeats and haptic commands.
-///
-/// `lizard_rx` is a watch channel carrying the current configuration. The task:
-/// - Exits immediately if the initial value is `None`.
-/// - Sends initial suppression reports, then heartbeats on `HEARTBEAT_INTERVAL`.
-/// - On config change: updates heartbeat reports live (no task restart needed).
-/// - On `None` config update or closed channel: exits (Lizard Mode re-activates
-///   naturally after ~8 s of missed heartbeats).
-pub(super) async fn run_lizard_mode_suppression(
-    mut lizard_rx: watch::Receiver<Option<LizardModeSuppression>>,
-    hidraw_tx: mpsc::Sender<HidrawWrite>,
-) {
-    // Wait for a non-None initial config.
-    // borrow_and_update() holds a guard — clone before next call to lizard_rx.
-    let mut cfg = loop {
-        let value = lizard_rx.borrow_and_update().clone();
-        match value {
-            Some(c) => break c,
-            None => {
-                if lizard_rx.changed().await.is_err() { return; }
-            }
-        }
-    };
-
-    if !cfg.is_any() { return; }
-
-    /// Sends a slice of raw reports through the unified hidraw writer.
-    /// Returns false if the channel is closed (writer gone — exit).
-    async fn send_reports(
-        tx: &mpsc::Sender<HidrawWrite>,
-        reports: &[[u8; 64]],
-    ) -> bool {
-        for &r in reports {
-            if tx.send(HidrawWrite::LizardReport(r)).await.is_err() {
-                return false;
-            }
-        }
-        true
-    }
-
-    let initial_reports = build_reports(&cfg, true);
-    let mut heartbeat_reports = build_reports(&cfg, false);
-
-    println!(
-        "Lizard Mode suppression active (buttons={}, mouse={}). +{}ms since startup",
-        cfg.suppress_buttons, cfg.suppress_mouse, crate::startup_ms()
-    );
-
-    if !send_reports(&hidraw_tx, &initial_reports).await { return; }
-
-    let mut interval = time::interval(HEARTBEAT_INTERVAL);
-    interval.tick().await; // skip the immediate first tick — initial already sent
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                if !send_reports(&hidraw_tx, &heartbeat_reports).await { return; }
-            }
-            result = lizard_rx.changed() => {
-                if result.is_err() { return; } // sender dropped
-                match lizard_rx.borrow_and_update().clone() {
-                    None => return, // disabled
-                    Some(new_cfg) => {
-                        cfg = new_cfg;
-                        heartbeat_reports = build_reports(&cfg, false);
-                    }
-                }
-            }
-        }
-    }
-}
+// ── Report builder ────────────────────────────────────────────────────────────
 
 /// Builds the list of reports for either the initial send or a heartbeat tick.
 ///
+/// Called by `hidraw::run_hidraw_writer` — the task that owns the fd and drives
+/// the heartbeat timer. `pub(super)` so it is accessible from the sibling
+/// `hidraw` module but not from the rest of the crate.
+///
 /// Initial send: uses `make_disable_settings_report` (sets all fields).
 /// Heartbeat: uses `make_heartbeat_settings_report` (SDL's minimal watchdog).
-fn build_reports(cfg: &LizardModeSuppression, initial: bool) -> Vec<[u8; 64]> {
+pub(super) fn build_reports(cfg: &LizardModeSuppression, initial: bool) -> Vec<[u8; 64]> {
     let mut v = Vec::new();
     if cfg.suppress_buttons { v.push(make_clear_mappings_report()); }
     if cfg.suppress_mouse {
