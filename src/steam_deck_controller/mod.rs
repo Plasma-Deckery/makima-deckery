@@ -96,25 +96,20 @@ impl ClickPressureHandle {
 
 /// Setter handle for the Lizard Mode suppression config on a running session.
 ///
-/// Obtained from `ControllerSession::lizard_mode`. Call `set()` to update the
-/// config live — the writer task applies the change on the next heartbeat cycle
-/// without restarting anything.
+/// Lifetime guard for the Lizard Mode writer channel.
 ///
-/// Dropping this handle signals the writer that the session is ending, which
-/// causes it to exit cleanly. The handle must therefore be kept alive for the
-/// full session lifetime — store it in `EventReader` or an equivalent owner.
-#[allow(dead_code)] // Public API: set() is for live config updates; field kept for future use
-pub struct LizardModeHandle(watch::Sender<Option<LizardModeSuppression>>);
-
-impl LizardModeHandle {
-    /// Update the Lizard Mode suppression config. The writer task picks up the
-    /// new config immediately. Pass `None` to disable suppression.
-    #[allow(dead_code)] // Public API for live config updates — not yet called from makima itself
-    pub fn set(&self, cfg: Option<LizardModeSuppression>) {
-        // Err means the writer already exited (session teardown) — safe to ignore.
-        let _ = self.0.send(cfg);
-    }
-}
+/// Obtained from `ControllerSession::lizard_mode`. Store it in `EventReader`
+/// (or equivalent session owner) for the full session lifetime — dropping it
+/// closes the watch channel and signals the hidraw writer to exit cleanly.
+///
+/// A `set(cfg)` method will be added here when config hot-reload is wired up
+/// (i.e. when a live Lizard-Mode update path exists in the running session).
+/// Until then the handle is a pure lifetime token.
+pub struct LizardModeHandle(
+    // Never read directly — held for its Drop, which closes the watch channel
+    // and signals the hidraw writer to exit when the session ends.
+    #[allow(dead_code)] watch::Sender<Option<LizardModeSuppression>>,
+);
 
 use evdev::{Device, EventStream, InputEvent};
 use std::path::{Path, PathBuf};
@@ -228,8 +223,11 @@ impl SteamDeckController {
     ///
     /// For makima: use `from_evdev` instead — the udev_monitor already has the
     /// path via config-file-name matching. `find()` is for callers without
-    /// makima infrastructure (`deckery-auth`, standalone tools).
-    #[allow(dead_code)] // Used by standalone tools (deckery-auth) — not called from makima itself
+    /// makima infrastructure (standalone tools). It lives under `#[cfg(test)]`
+    /// for now because the only in-crate caller is a smoke test; when
+    /// `steam_deck_controller` is split into its own library crate this
+    /// becomes a regular `pub` entry point.
+    #[cfg(test)]
     pub fn find() -> Option<Self> {
         for (path, device) in evdev::enumerate() {
             if let Some(name) = device.name() {
