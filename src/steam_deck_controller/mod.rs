@@ -103,11 +103,13 @@ impl ClickPressureHandle {
 /// Dropping this handle signals the writer that the session is ending, which
 /// causes it to exit cleanly. The handle must therefore be kept alive for the
 /// full session lifetime — store it in `EventReader` or an equivalent owner.
+#[allow(dead_code)] // Public API: set() is for live config updates; field kept for future use
 pub struct LizardModeHandle(watch::Sender<Option<LizardModeSuppression>>);
 
 impl LizardModeHandle {
     /// Update the Lizard Mode suppression config. The writer task picks up the
     /// new config immediately. Pass `None` to disable suppression.
+    #[allow(dead_code)] // Public API for live config updates — not yet called from makima itself
     pub fn set(&self, cfg: Option<LizardModeSuppression>) {
         // Err means the writer already exited (session teardown) — safe to ignore.
         let _ = self.0.send(cfg);
@@ -227,6 +229,7 @@ impl SteamDeckController {
     /// For makima: use `from_evdev` instead — the udev_monitor already has the
     /// path via config-file-name matching. `find()` is for callers without
     /// makima infrastructure (`deckery-auth`, standalone tools).
+    #[allow(dead_code)] // Used by standalone tools (deckery-auth) — not called from makima itself
     pub fn find() -> Option<Self> {
         for (path, device) in evdev::enumerate() {
             if let Some(name) = device.name() {

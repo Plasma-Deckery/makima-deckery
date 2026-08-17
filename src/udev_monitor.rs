@@ -463,7 +463,6 @@ pub async fn launch_tasks(
                 environment.clone(),
                 active_client.clone(),
                 window_changed.clone(),
-                std::path::PathBuf::from(&event_device),
                 gaming_mode.clone(),
                 gaming_mode_tx.clone(),
             );
