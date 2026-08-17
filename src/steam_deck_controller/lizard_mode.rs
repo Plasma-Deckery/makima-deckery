@@ -149,10 +149,6 @@ impl LizardModeSuppression {
         }
         Some(LizardModeSuppression { suppress_buttons, suppress_mouse })
     }
-
-    pub fn is_any(&self) -> bool {
-        self.suppress_buttons || self.suppress_mouse
-    }
 }
 
 // ── Report builder ────────────────────────────────────────────────────────────

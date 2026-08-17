@@ -27,7 +27,9 @@
 //! report (~4ms) — evidence that the evdev path goes through an extra
 //! translation layer in the hid-steam kernel driver.
 
-use super::haptic::{HapticCommand, HapticPad, HapticRequest};
+use super::haptic::{HapticCommand, HapticRequest};
+#[cfg(test)]
+use super::haptic::HapticPad;
 use super::lizard_mode::{self, LizardModeSuppression, HEARTBEAT_INTERVAL};
 use super::ClickPressureConfig;
 use std::path::PathBuf;

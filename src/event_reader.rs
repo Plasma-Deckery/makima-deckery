@@ -106,8 +106,6 @@ pub struct EventReader {
     rpad: PadState,
     /// True while a combined gesture session is active.
     gesture_session: Arc<Mutex<bool>>,
-    /// Path of the evdev device this reader is attached to (used for logging).
-    device_path: std::path::PathBuf,
     /// Unified hidraw write channel from the controller session.
     /// Used to fire haptics on Gaming Mode toggle. Cloned into TrackpadSession.
     haptic_tx: Option<mpsc::Sender<HapticRequest>>,
@@ -143,7 +141,6 @@ impl EventReader {
         environment: Environment,
         active_client: Arc<Mutex<Client>>,
         window_changed: Arc<Notify>,
-        device_path: std::path::PathBuf,
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
     ) -> Self {
@@ -460,7 +457,6 @@ impl EventReader {
             lpad: PadState::new(true),
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
-            device_path,
             haptic_tx,
             _lizard_mode: lizard_mode,
             gaming_mode_config,
