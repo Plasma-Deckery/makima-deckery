@@ -271,13 +271,10 @@ mod tests {
             ]),
         }).await.unwrap();
 
-        let recv = |rx: &mut mpsc::Receiver<HapticCommand>| async move {
-            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-                .await.expect("timed out").expect("channel closed")
-        };
-
-        let first  = recv(&mut cmd_rx).await;
-        let second = recv(&mut cmd_rx).await;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+            .await.expect("timed out on first command").expect("channel closed");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+            .await.expect("timed out on second command").expect("channel closed");
 
         assert_eq!(first.duration_us,  pulse_a.duration_us);
         assert_eq!(second.duration_us, pulse_b.duration_us);
@@ -348,7 +345,7 @@ mod tests {
             req_tx.send(HapticRequest {
                 pad: HapticPad::Right,
                 chain: HapticChain::Single(HapticPulse {
-                    duration_us: i as u32 * 100,
+                    duration_us: i * 100,
                     interval_us: 100,
                     count: 1,
                     gain_db: 0,
@@ -356,7 +353,7 @@ mod tests {
             }).await.unwrap();
         }
 
-        for i in 0..3u32 {
+        for i in 0..3u16 {
             let cmd = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 cmd_rx.recv(),

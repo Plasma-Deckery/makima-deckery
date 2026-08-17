@@ -271,7 +271,13 @@ async fn run_hidraw_writer(
                         click_pressure_alive = false;
                     }
                     Ok(()) => {
-                        if let Some(cfg) = click_pressure_rx.borrow_and_update().clone() {
+                        // Extract the value into an owned Option before the await so the
+                        // watch::Ref guard (non-Send RwLockReadGuard) is dropped here,
+                        // not held across the spawn_blocking await inside send_click_pressure.
+                        let cfg: Option<ClickPressureConfig> = {
+                            click_pressure_rx.borrow_and_update().clone()
+                        };
+                        if let Some(cfg) = cfg {
                             send_click_pressure(fd, cfg).await;
                         }
                     }
