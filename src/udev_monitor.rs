@@ -1,6 +1,7 @@
 use crate::config::{Associations, Event};
 use crate::event_reader::EventReader;
-use crate::steam_deck_controller::{self, SteamDeckController, LizardModeSuppression};
+use crate::steam_deck_controller::{SteamDeckController, LizardModeSuppression};
+use crate::steam_deck_controller::resume_watcher;
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
 use std::{env, path::Path, process::Command, sync::Arc};
@@ -54,22 +55,24 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
         }
     }
 
-    // Spawn resume watcher + Lizard Mode suppression via the controller module.
-    // Both run for the lifetime of the process, independent of device reinits.
-    // SUPPRESS_LIZARD_MODE from any base config; defaults to "buttons,mouse".
-    // Set SUPPRESS_LIZARD_MODE = "false" to opt out. Gracefully skips on non-Steam Deck hardware.
-    {
+    // Spawn the resume watcher once — fires resume_notify on logind
+    // PrepareForSleep(false). Lives for the lifetime of the process.
+    tokio::spawn(resume_watcher::start_resume_watcher(resume_notify.clone()));
+
+    // Parse Lizard Mode config once from the base config section.
+    // Passed into launch_tasks so controller.start() can set up the heartbeat.
+    // Defaults to "buttons,mouse"; set SUPPRESS_LIZARD_MODE = "false" to opt out.
+    let lizard_cfg = {
         let setting = config_files
             .iter()
             .filter(|c| c.associations == Associations::default())
             .find_map(|c| c.settings.get("SUPPRESS_LIZARD_MODE"))
             .map(|s| s.as_str())
             .unwrap_or("buttons,mouse");
-        let lizard_cfg = LizardModeSuppression::from_setting(setting);
-        steam_deck_controller::start_background_tasks(lizard_cfg, resume_notify.clone());
-    }
+        LizardModeSuppression::from_setting(setting)
+    };
 
-    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), gaming_mode.clone());
+    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), lizard_cfg.clone(), gaming_mode.clone());
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -137,7 +140,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                             task.abort();
                         }
                         tasks.clear();
-                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), gaming_mode.clone());
+                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), lizard_cfg.clone(), gaming_mode.clone());
                     }
                 }
             }
@@ -151,7 +154,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), gaming_mode.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), lizard_cfg.clone(), gaming_mode.clone());
             }
             Some(_) = config_rx.recv() => {
                 // Debounce: drain any queued events, then wait briefly for the
@@ -165,7 +168,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                     task.abort();
                 }
                 tasks.clear();
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), gaming_mode.clone());
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), resume_notify.clone(), lizard_cfg.clone(), gaming_mode.clone());
             }
         }
     }
@@ -207,6 +210,7 @@ pub fn launch_tasks(
     active_client: Arc<Mutex<Client>>,
     window_changed: Arc<Notify>,
     resume_notify: Arc<Notify>,
+    lizard_cfg: Option<LizardModeSuppression>,
     gaming_mode: Arc<Mutex<bool>>,
 ) -> (Option<Arc<Mutex<VirtualDevices>>>, Arc<Mutex<Vec<Event>>>) {
     // Unified Gaming Mode channel: steam detection and IPC both send here.
@@ -326,39 +330,46 @@ pub fn launch_tasks(
                 .and_then(|c| c.settings.get("GRAB_DEVICE"))
                 .map_or(true, |v| v == "true");
             let controller = SteamDeckController::from_evdev(Path::new(&event_device));
-            // start_event_task opens the device, queries capabilities once, and
-            // spawns a reconnecting reader that handles suspend/resume transparently.
-            // On genuine device removal it fires device_error_notify and closes the
-            // channel — EventReader exits and udev_monitor does a full reinit.
-            let (is_tablet, max_abs_wheel, event_rx) = controller.start_event_task(
+            // controller.start() spawns the reconnecting evdev reader, hidraw
+            // reader/writer, and Lizard Mode heartbeat — all suspend-transparent.
+            // On genuine device removal it fires device_error_notify and closes
+            // the channel — EventReader exits, udev_monitor does a full reinit.
+            let session = controller.start(
                 grab,
                 resume_notify.clone(),
                 device_error_notify.clone(),
+                lizard_cfg.clone(),
             );
+            // Steam Deck controller capabilities are known hardware constants —
+            // no runtime query needed. is_tablet=false: no BTN_TOOL_PEN.
+            // max_abs_wheel=0: EventReader uses its default scroll scaling.
+            let is_tablet = false;
+            let max_abs_wheel = 0i32;
             let virt_dev = Arc::new(Mutex::new(VirtualDevices::new(device.1)));
             virt_dev_holder = Some(virt_dev.clone());
             // First reader takes the real rx; subsequent readers get a dead one.
-            let rx = gaming_mode_rx_opt.take().unwrap_or_else(|| {
+            let gaming_rx = gaming_mode_rx_opt.take().unwrap_or_else(|| {
                 let (_, dead_rx) = mpsc::channel(1);
                 dead_rx
             });
             let reader = EventReader::new(
                 config_list.clone(),
                 virt_dev,
-                event_rx,
+                session.event_rx,
                 is_tablet,
                 max_abs_wheel,
+                session.pad_rx,
+                session.hidraw_tx,
                 modifiers.clone(),
                 modifier_was_activated.clone(),
                 environment.clone(),
                 active_client.clone(),
                 window_changed.clone(),
                 std::path::PathBuf::from(&event_device),
-                controller.hidraw_path,
                 gaming_mode.clone(),
                 gaming_mode_tx.clone(),
             );
-            tasks.push(tokio::spawn(start_reader(reader, rx)));
+            tasks.push(tokio::spawn(start_reader(reader, gaming_rx)));
             devices_found += 1
         }
     }
@@ -511,6 +522,7 @@ mod tests {
             client,
             window_changed,
             resume_notify,
+            None, // no lizard cfg in test
             gaming_mode,
         );
 

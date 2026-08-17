@@ -6,26 +6,21 @@
 /// module takes over that role so makima can operate without Steam.
 ///
 /// Safety mechanism: the suppression only holds as long as the heartbeat
-/// runs.  When this task is cancelled or the process exits, the file
-/// descriptors are closed and Lizard Mode re-activates automatically within
-/// ~8 s (two missed heartbeats).
+/// runs.  When this task is cancelled or the process exits, Lizard Mode
+/// re-activates automatically within ~8 s (two missed heartbeats).
+///
+/// In Phase 3 the heartbeat no longer opens its own hidraw fd — it sends
+/// `HidrawWrite::LizardReport` through the controller's unified writer task,
+/// which owns the single shared fd. This eliminates the old race condition
+/// where lizard mode and the haptic writer could issue concurrent ioctls.
 ///
 /// Protocol reference: SDL `SDL_hidapi_steamdeck.c` (`DisableDeckLizardMode` /
 /// `FeedDeckLizardWatchdog`) and Linux `drivers/hid/hid-steam.c`
 /// (`steam_set_lizard_mode`).
-use std::fs::{self, OpenOptions};
-use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Duration};
 
-/// Valve USB vendor ID, as it appears in sysfs uevent files.
-const VALVE_VENDOR_ID: &str = "000028DE";
-
-/// `HIDIOCSFEATURE(64)` ioctl request code.
-///
-/// Calculated as `_IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, 64)`:
-///   `(3 << 30) | (0x48 << 8) | 0x06 | (64 << 16)` = `0xC040_4806`
-const HIDIOCSFEATURE_64: libc::c_ulong = 0xC040_4806;
+use super::hidraw::HidrawWrite;
 
 /// How often to re-send the suppression heartbeat.
 /// The controller re-enables Lizard Mode after ~8 s without a heartbeat.
@@ -101,51 +96,6 @@ fn make_clear_mappings_report() -> [u8; 64] {
     buf
 }
 
-// ── Device discovery ──────────────────────────────────────────────────────────
-
-/// Finds Valve hidraw devices that are the **raw controller interface** —
-/// identified by having no `input/` subdirectory in sysfs (as opposed to the
-/// emulated keyboard/mouse hidraw nodes which do have one).
-///
-/// hidraw0/hidraw1 back the Lizard Mode keyboard and mouse emulation devices
-/// and reject our ioctls with `ETIMEDOUT`.  hidraw2 (sysfs device `.0005`,
-/// no input node) is the channel hid-steam exposes specifically for userspace
-/// controller communication.
-pub(super) fn find_controller_hidraw_devices() -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    let Ok(dir) = fs::read_dir("/sys/class/hidraw") else {
-        return result;
-    };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else { continue };
-
-        let base = format!("/sys/class/hidraw/{}/device", name_str);
-
-        // Must be a Valve device.
-        let uevent = fs::read_to_string(format!("{}/uevent", base)).unwrap_or_default();
-        if !uevent.contains(VALVE_VENDOR_ID) {
-            continue;
-        }
-
-        // Must NOT have an associated input device (i.e. not an emulated kb/mouse).
-        if std::path::Path::new(&format!("{}/input", base)).exists() {
-            continue;
-        }
-
-        result.push(PathBuf::from(format!("/dev/{}", name_str)));
-    }
-    result.sort();
-    result
-}
-
-// ── ioctl helper ─────────────────────────────────────────────────────────────
-
-fn send_feature_report(fd: libc::c_int, buf: &[u8; 64]) -> bool {
-    let ret = unsafe { libc::ioctl(fd, HIDIOCSFEATURE_64, buf.as_ptr()) };
-    ret >= 0
-}
-
 // ── Config ───────────────────────────────────────────────────────────────────
 
 /// Which aspects of Lizard Mode to suppress.
@@ -198,93 +148,92 @@ impl LizardModeSuppression {
 
 /// Runs the Lizard Mode suppression heartbeat loop.
 ///
-/// Spawned once at startup via `SteamDeckController::start_background_tasks`.
-/// Accepts an optional `hidraw_path` hint from the controller (discovered via
-/// evdev-sibling sysfs traversal); if absent, falls back to a vendor-ID scan.
-/// Gracefully skips if no suitable hidraw device is found (non-Steam Deck).
-pub async fn run_lizard_mode_suppression(cfg: LizardModeSuppression, hidraw_hint: Option<PathBuf>) {
-    if !cfg.is_any() {
-        return;
-    }
-
-    // Use the hint from the controller if provided; otherwise fall back to scan.
-    let candidates: Vec<PathBuf> = match hidraw_hint {
-        Some(p) => vec![p],
-        None => find_controller_hidraw_devices(),
-    };
-
-    if candidates.is_empty() {
-        println!("Lizard Mode suppression: no suitable hidraw device found, skipping.");
-        return;
-    }
-
-    // Pre-build reports based on config so the hot loop doesn't branch.
-    let initial_reports: Vec<[u8; 64]> = {
-        let mut v = Vec::new();
-        if cfg.suppress_buttons { v.push(make_clear_mappings_report()); }
-        if cfg.suppress_mouse   { v.push(make_disable_settings_report()); }
-        v
-    };
-    // SDL's FeedDeckLizardWatchdog sends 0x81 + 0x87 on every tick.
-    let heartbeat_reports: Vec<[u8; 64]> = {
-        let mut v = Vec::new();
-        if cfg.suppress_buttons { v.push(make_clear_mappings_report()); }
-        if cfg.suppress_mouse   { v.push(make_heartbeat_settings_report()); }
-        v
-    };
-
-    // Open the first candidate that accepts all initial suppression reports.
-    let (file, path) = match candidates.iter().find_map(|p| {
-        let file = OpenOptions::new().read(true).write(true).open(p).ok()?;
-        let fd = file.as_raw_fd();
-        let ok = initial_reports.iter().all(|r| send_feature_report(fd, r));
-        if ok { Some((file, p.clone())) } else { None }
-    }) {
-        Some(pair) => pair,
-        None => {
-            eprintln!(
-                "Lizard Mode suppression: found hidraw candidate(s) but none accepted \
-                 the suppression reports. Skipping."
-            );
-            return;
+/// Sends `HidrawWrite::LizardReport` through the controller's unified hidraw
+/// writer — no fd ownership here. The writer task serializes all hidraw writes
+/// onto a single file descriptor, eliminating the old race condition between
+/// lizard heartbeats and haptic commands.
+///
+/// `lizard_rx` is a watch channel carrying the current configuration. The task:
+/// - Exits immediately if the initial value is `None`.
+/// - Sends initial suppression reports, then heartbeats on `HEARTBEAT_INTERVAL`.
+/// - On config change: updates heartbeat reports live (no task restart needed).
+/// - On `None` config update or closed channel: exits (Lizard Mode re-activates
+///   naturally after ~8 s of missed heartbeats).
+pub(super) async fn run_lizard_mode_suppression(
+    mut lizard_rx: watch::Receiver<Option<LizardModeSuppression>>,
+    hidraw_tx: mpsc::Sender<HidrawWrite>,
+) {
+    // Wait for a non-None initial config.
+    // borrow_and_update() holds a guard — clone before next call to lizard_rx.
+    let mut cfg = loop {
+        let value = lizard_rx.borrow_and_update().clone();
+        match value {
+            Some(c) => break c,
+            None => {
+                if lizard_rx.changed().await.is_err() { return; }
+            }
         }
     };
+
+    if !cfg.is_any() { return; }
+
+    /// Sends a slice of raw reports through the unified hidraw writer.
+    /// Returns false if the channel is closed (writer gone — exit).
+    async fn send_reports(
+        tx: &mpsc::Sender<HidrawWrite>,
+        reports: &[[u8; 64]],
+    ) -> bool {
+        for &r in reports {
+            if tx.send(HidrawWrite::LizardReport(r)).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    let initial_reports = build_reports(&cfg, true);
+    let mut heartbeat_reports = build_reports(&cfg, false);
 
     println!(
-        "Lizard Mode suppression active on {:?} (buttons={}, mouse={}). +{}ms since startup",
-        path, cfg.suppress_buttons, cfg.suppress_mouse, crate::startup_ms()
+        "Lizard Mode suppression active (buttons={}, mouse={}). +{}ms since startup",
+        cfg.suppress_buttons, cfg.suppress_mouse, crate::startup_ms()
     );
 
-    // Drop file immediately — holding it sets client_opened=true in hid-steam,
-    // which stops the driver from emitting any cursor/scroll events.
-    // On Steam Deck (STEAM_QUIRK_DECK) closing the fd does NOT reset firmware modes.
-    drop(file);
+    if !send_reports(&hidraw_tx, &initial_reports).await { return; }
 
     let mut interval = time::interval(HEARTBEAT_INTERVAL);
-    interval.tick().await; // consume the immediate first tick (already sent above)
+    interval.tick().await; // skip the immediate first tick — initial already sent
 
     loop {
-        interval.tick().await;
-        let ok = match OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(f) => {
-                let fd = f.as_raw_fd();
-                let ok = heartbeat_reports.iter().all(|r| send_feature_report(fd, r));
-                drop(f);
-                ok
+        tokio::select! {
+            _ = interval.tick() => {
+                if !send_reports(&hidraw_tx, &heartbeat_reports).await { return; }
             }
-            Err(e) => {
-                eprintln!("Lizard Mode suppression: failed to reopen {:?}: {}", path, e);
-                false
+            result = lizard_rx.changed() => {
+                if result.is_err() { return; } // sender dropped
+                match lizard_rx.borrow_and_update().clone() {
+                    None => return, // disabled
+                    Some(new_cfg) => {
+                        cfg = new_cfg;
+                        heartbeat_reports = build_reports(&cfg, false);
+                    }
+                }
             }
-        };
-        if !ok {
-            eprintln!(
-                "Lizard Mode suppression: heartbeat failed on {:?}. \
-                 Lizard Mode may reactivate.",
-                path
-            );
         }
     }
+}
+
+/// Builds the list of reports for either the initial send or a heartbeat tick.
+///
+/// Initial send: uses `make_disable_settings_report` (sets all fields).
+/// Heartbeat: uses `make_heartbeat_settings_report` (SDL's minimal watchdog).
+fn build_reports(cfg: &LizardModeSuppression, initial: bool) -> Vec<[u8; 64]> {
+    let mut v = Vec::new();
+    if cfg.suppress_buttons { v.push(make_clear_mappings_report()); }
+    if cfg.suppress_mouse {
+        v.push(if initial { make_disable_settings_report() } else { make_heartbeat_settings_report() });
+    }
+    v
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

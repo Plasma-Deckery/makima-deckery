@@ -1,8 +1,8 @@
 //! Multi-touch trackpad emulation handler.
 //!
-//! `pad_hidraw.rs` is a pure raw-frame *producer*: it knows nothing about
-//! trackpad modes, gesture sessions, or haptics — it just turns hidraw
-//! reports into `PadFrame`s and accepts `HapticCommand`s to write back.
+//! `steam_deck_controller/hidraw.rs` is a pure raw-frame *producer*: it
+//! knows nothing about trackpad modes, gesture sessions, or haptics — it just
+//! turns hidraw reports into `PadFrame`s and accepts `HidrawWrite`s.
 //! `trackpad_router.rs` owns Core routing: gesture-session entry/exit,
 //! click-edge-independent state.json export, and deciding which per-channel
 //! handler input (`SinglePadFrame`/`CombinedPadFrame`) each frame goes to.
@@ -14,9 +14,8 @@
 //! configuration and is expected to grow siblings: a "trackball" mode
 //! (`TRACKPAD_RELATIVE_MOUSE`) or a future multi-zone/radial mode would each
 //! be their own handler module consuming the same per-channel frame stream
-//! and `HapticCommand` sink, without touching this file or
-//! `trackpad_router.rs`.
-use crate::pad_hidraw::{HapticCommand, HapticPad};
+//! and `HidrawWrite` sink, without touching this file or `trackpad_router.rs`.
+use crate::steam_deck_controller::{HapticCommand, HapticPad, HidrawWrite};
 use crate::trackpad::PadState;
 use crate::trackpad_router::SinglePadFrame;
 use crate::virtual_devices::VirtualDevices;
@@ -25,7 +24,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
 /// Parameters of a single haptic "click tick" — how a physical trackpad
-/// click should feel. Kept here (not in `pad_hidraw.rs`) because "what a
+/// click should feel. Kept here (not in the hidraw layer) because "what a
 /// click feels like" is an emulation policy, not a property of the raw
 /// channel; a future handler (e.g. trackball) can pick entirely different
 /// values, or trigger pulses on cursor deceleration instead of clicks.
@@ -184,22 +183,21 @@ impl HapticChain {
 
 /// Fires a haptic pulse on `pad` per `pulse`, best-effort: a missing/failed
 /// rumble motor must never affect input handling, so send errors are
-/// dropped silently (the channel itself already logs failures at the
-/// `pad_hidraw` writer level).
+/// dropped silently (the unified hidraw writer task logs failures internally).
 ///
 /// `pub(crate)` rather than private: `gesture_pad.rs` reuses this instead of
 /// duplicating the same three-line send — the "how to fire a pulse" plumbing
 /// is shared infrastructure, only the "when/with what parameters" policy is
 /// per-handler.
-pub(crate) async fn pulse(haptic_tx: &Option<mpsc::Sender<HapticCommand>>, pad: HapticPad, pulse: HapticPulse) {
+pub(crate) async fn pulse(haptic_tx: &Option<mpsc::Sender<HidrawWrite>>, pad: HapticPad, pulse: HapticPulse) {
     if let Some(tx) = haptic_tx {
-        tx.send(HapticCommand {
+        tx.send(HidrawWrite::Haptic(HapticCommand {
             pad,
             duration_us: pulse.duration_us,
             interval_us: pulse.interval_us,
             count: pulse.count,
             gain_db: pulse.gain_db,
-        })
+        }))
         .await
         .ok();
     }
@@ -208,7 +206,7 @@ pub(crate) async fn pulse(haptic_tx: &Option<mpsc::Sender<HapticCommand>>, pad: 
 /// Fires a `HapticChain` on `pad`: single pulse or ordered sequence with
 /// per-step pauses. This is the single execution point for all chain logic —
 /// callers never inspect the chain shape themselves.
-pub(crate) async fn fire_chain(haptic_tx: &Option<mpsc::Sender<HapticCommand>>, pad: HapticPad, chain: &HapticChain) {
+pub(crate) async fn fire_chain(haptic_tx: &Option<mpsc::Sender<HidrawWrite>>, pad: HapticPad, chain: &HapticChain) {
     match chain {
         HapticChain::Single(p) => pulse(haptic_tx, pad, *p).await,
         HapticChain::Chain(steps) => {
@@ -235,7 +233,7 @@ pub async fn run_single(
     mut rx: mpsc::Receiver<SinglePadFrame>,
     virt_dev: &Arc<Mutex<VirtualDevices>>,
     pad: &PadState,
-    haptic_tx: Option<mpsc::Sender<HapticCommand>>,
+    haptic_tx: Option<mpsc::Sender<HidrawWrite>>,
     haptic_pad: HapticPad,
     press_chain: HapticChain,
     release_chain: Option<HapticChain>,

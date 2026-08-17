@@ -1,7 +1,7 @@
 //! Core trackpad routing — owned by `EventReader`, not by any interpretation
 //! handler (see `mt_trackpad.rs`'s module docs and GitHub issue #17 for the
 //! full rationale). This module consumes the raw `PadFrame` stream produced
-//! by `pad_hidraw.rs` and is responsible for:
+//! by `steam_deck_controller/hidraw.rs` and is responsible for:
 //!
 //!   - always updating `PadState` (position/touch/pressed) for state.json
 //!     export, regardless of which (if any) handler is attached to a pad —
@@ -27,7 +27,7 @@
 //! cannot be fully eliminated without libinput-side continuity support. The
 //! debounce in `run` mitigates brief session restarts that would otherwise
 //! multiply the effect.
-use crate::pad_hidraw::PadFrame;
+use crate::steam_deck_controller::PadFrame;
 use crate::trackpad::PadState;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -38,9 +38,9 @@ use tokio::sync::{mpsc, Mutex};
 /// virtual device — see the `tests` module below. This is a router concern,
 /// not a raw-production one: the meaning of "changed" here is entirely about
 /// what `run` below does with it (which channel(s) to route to, whether a
-/// state.json write must happen immediately) — `pad_hidraw.rs`'s own reader
-/// loop dedupes independently via a plain frame equality check and never
-/// calls this.
+/// state.json write must happen immediately) — the hidraw reader loop
+/// dedupes independently via a plain frame equality check and never calls
+/// this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PadDelta {
     pub l_changed: bool,
@@ -202,7 +202,7 @@ pub async fn run(
 ) {
     // Previous frame, to know which pad(s) actually changed and whether a
     // touch transition happened — every recv() is already a real change vs.
-    // the *last sent* frame (deduped in pad_hidraw.rs), but that dedup is
+    // the *last sent* frame (deduped in the hidraw reader), but that dedup is
     // over the whole frame, not per pad.
     let mut prev = PadFrame::default();
     // Gesture session state: true once both pads were simultaneously
@@ -421,7 +421,7 @@ mod tests {
     /// Regression guard for the "staircase diagonal" bug: on evdev, X and Y
     /// arrived as two separate SYN_REPORT frames, so software had to coalesce
     /// intermediate half-updated states. `PadFrame` has no such intermediate
-    /// state (see `pad_hidraw.rs`'s atomicity tests), so every step of a
+    /// state (hidraw frames are atomic — X and Y arrive together), so every step of a
     /// diagonal drag must be detected as changed here too.
     #[test]
     fn diagonal_movement_is_always_detected_as_changed() {
