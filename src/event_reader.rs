@@ -2,7 +2,7 @@ use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::device_session::TrackpadSession;
 use crate::mt_trackpad;
-use crate::steam_deck_controller::{HapticPad, HapticRequest, PadFrame};
+use crate::steam_deck_controller::{HapticPad, HapticRequest, LizardModeHandle};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::trackpad::PadState;
@@ -60,7 +60,7 @@ pub struct EventReader {
     /// Receiver for controller events from the reconnecting reader task.
     /// `ControllerEvent::Input` carries normal evdev events; `Reconnected`
     /// signals a transparent reconnect (EventReader must release held keys).
-    event_rx: Arc<Mutex<mpsc::Receiver<ControllerEvent>>>,
+    event_rx: Mutex<mpsc::Receiver<ControllerEvent>>,
     /// Whether the connected device is a graphics tablet (BTN_TOOL_PEN).
     /// Queried once at open time and carried here to avoid re-querying on reconnect.
     is_tablet: bool,
@@ -108,12 +108,14 @@ pub struct EventReader {
     gesture_session: Arc<Mutex<bool>>,
     /// Path of the evdev device this reader is attached to (used for logging).
     device_path: std::path::PathBuf,
-    /// Raw trackpad position frames from the controller's hidraw reader task.
-    /// Taken once in `start()` and passed to `TrackpadSession::setup`.
-    pad_rx: Arc<Mutex<Option<mpsc::Receiver<PadFrame>>>>,
     /// Unified hidraw write channel from the controller session.
     /// Used to fire haptics on Gaming Mode toggle. Cloned into TrackpadSession.
     haptic_tx: Option<mpsc::Sender<HapticRequest>>,
+    /// Setter handle for Lizard Mode config. Kept here for its lifetime —
+    /// dropping it signals the hidraw writer to exit. Call `lizard_mode.set(cfg)`
+    /// to update suppression settings live without a session reinit.
+    /// `None` for non-Steam-Deck devices (no hidraw writer to signal).
+    _lizard_mode: Option<LizardModeHandle>,
     /// Gaming Mode trigger configuration (from `[gaming_mode]` in the base config).
     /// Stored here so `convert_event` can check it without locking anything.
     gaming_mode_config: GamingModeConfig,
@@ -134,8 +136,8 @@ impl EventReader {
         event_rx: mpsc::Receiver<ControllerEvent>,
         is_tablet: bool,
         max_abs_wheel: i32,
-        pad_rx: Option<mpsc::Receiver<PadFrame>>,
         haptic_tx: Option<mpsc::Sender<HapticRequest>>,
+        lizard_mode: Option<LizardModeHandle>,
         modifiers: Arc<Mutex<Vec<Event>>>,
         modifier_was_activated: Arc<Mutex<bool>>,
         environment: Environment,
@@ -427,7 +429,7 @@ impl EventReader {
 
         Self {
             config,
-            event_rx: Arc::new(Mutex::new(event_rx)),
+            event_rx: Mutex::new(event_rx),
             is_tablet,
             max_abs_wheel,
             virt_dev,
@@ -459,26 +461,18 @@ impl EventReader {
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
             device_path,
-            pad_rx: Arc::new(Mutex::new(pad_rx)),
             haptic_tx,
+            _lizard_mode: lizard_mode,
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
             gaming_mode_tx,
         }
     }
 
-    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>) {
+    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>, session: Option<TrackpadSession>) {
         let name = &self.config.iter().find(|&x| x.associations == Associations::default()).unwrap().name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
-        // Take pad_rx once — it's a Receiver and can't be cloned.
-        let pad_rx = self.pad_rx.lock().await.take();
-        let session = TrackpadSession::setup(
-            &self.trackpad,
-            &self.virt_dev,
-            pad_rx,
-            self.haptic_tx.clone(),
-        ).await;
         self.write_state().await;
         self.start_control_socket().await;
 
@@ -491,7 +485,11 @@ impl EventReader {
             self.window_changed_loop(),
             self.gaming_mode_set_loop(gaming_rx),
             self.state_write_loop(state_rx),
-            session.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()),
+            async {
+                if let Some(s) = session {
+                    s.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()).await;
+                }
+            },
         );
     }
 
