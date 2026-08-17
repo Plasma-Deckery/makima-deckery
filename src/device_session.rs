@@ -16,7 +16,8 @@
 use crate::config::TrackpadConfig;
 use crate::gesture_pad::{self, GesturePadConfig};
 use crate::kde_input_defaults::{self, GestureKdeConfig, PadKdeConfig};
-use crate::mt_trackpad::{self, HapticChain, MovementHaptic, MtTrackpadConfig};
+use crate::mt_trackpad::{self, MovementHaptic, MtTrackpadConfig};
+use crate::steam_deck_controller::HapticChain;
 use crate::steam_deck_controller::{ClickPressureConfig, ClickPressureHandle, HapticPad, HapticRequest, PadFrame};
 use crate::trackpad::PadState;
 use crate::trackpad_router::{self, GestureEvent, SinglePadFrame, StateWrite};

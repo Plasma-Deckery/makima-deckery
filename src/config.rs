@@ -1,4 +1,4 @@
-use crate::mt_trackpad::{HapticChain, HapticPulse};
+use crate::steam_deck_controller::{HapticChain, HapticPulse};
 use crate::udev_monitor::Client;
 use evdev::Key;
 use serde;
@@ -317,11 +317,11 @@ impl Default for GamingModeConfig {
         // Two staccato pings (8 ms burst, 150 ms apart) for both on and off.
         // On/off use the same feel by default; users can differentiate via TOML.
         let default_chain = HapticChain::Chain(vec![
-            crate::mt_trackpad::HapticChainStep {
+            crate::steam_deck_controller::HapticChainStep {
                 pulse: HapticPulse { duration_us: 8000, interval_us: 8000, count: 1, gain_db: 0 },
                 pause_ms: Some(150),
             },
-            crate::mt_trackpad::HapticChainStep {
+            crate::steam_deck_controller::HapticChainStep {
                 pulse: HapticPulse { duration_us: 8000, interval_us: 8000, count: 1, gain_db: 0 },
                 pause_ms: None,
             },
