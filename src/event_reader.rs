@@ -2,7 +2,7 @@ use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::device_session::TrackpadSession;
 use crate::mt_trackpad;
-use crate::pad_hidraw::{HapticCommand, HapticPad};
+use crate::steam_deck_controller::{HapticPad, HidrawWrite, PadFrame};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::trackpad::PadState;
@@ -108,20 +108,19 @@ pub struct EventReader {
     gesture_session: Arc<Mutex<bool>>,
     /// Path of the evdev device this reader is attached to (used for logging).
     device_path: std::path::PathBuf,
-    /// Raw controller hidraw path, discovered once at device open time by
-    /// `SteamDeckController::from_evdev` and threaded through to avoid
-    /// a redundant sysfs scan at `TrackpadSession::setup`.
-    hidraw_path: Option<std::path::PathBuf>,
+    /// Raw trackpad position frames from the controller's hidraw reader task.
+    /// Taken once in `start()` and passed to `TrackpadSession::setup`.
+    pad_rx: Arc<Mutex<Option<mpsc::Receiver<PadFrame>>>>,
+    /// Unified hidraw write channel from the controller session.
+    /// Used to fire haptics on Gaming Mode toggle. Cloned into TrackpadSession.
+    hidraw_tx: Option<mpsc::Sender<HidrawWrite>>,
     /// Gaming Mode trigger configuration (from `[gaming_mode]` in the base config).
     /// Stored here so `convert_event` can check it without locking anything.
     gaming_mode_config: GamingModeConfig,
     /// Timestamp of the last Gaming Mode trigger button press.
     /// Used to detect a double-click within `gaming_mode_config.double_click_ms`.
     gaming_mode_trigger_ts: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Haptic command channel, wired from `TrackpadSession` after setup.
-    /// `None` when the hidraw sibling was not found (trackpad position unavailable).
-    haptic_tx: Arc<Mutex<Option<mpsc::Sender<HapticCommand>>>>,
-    /// Sender half of the unified Gaming Mode channel.  Cloned into the IPC
+    /// Sender half of the unified Gaming Mode channel. Cloned into the IPC
     /// handler so external commands (`gaming_mode enable/disable`) go through
     /// the same `gaming_mode_set_loop` as steam auto-detection.
     gaming_mode_tx: mpsc::Sender<bool>,
@@ -135,13 +134,14 @@ impl EventReader {
         event_rx: mpsc::Receiver<ControllerEvent>,
         is_tablet: bool,
         max_abs_wheel: i32,
+        pad_rx: Option<mpsc::Receiver<PadFrame>>,
+        hidraw_tx: Option<mpsc::Sender<HidrawWrite>>,
         modifiers: Arc<Mutex<Vec<Event>>>,
         modifier_was_activated: Arc<Mutex<bool>>,
         environment: Environment,
         active_client: Arc<Mutex<Client>>,
         window_changed: Arc<Notify>,
         device_path: std::path::PathBuf,
-        hidraw_path: Option<std::path::PathBuf>,
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
     ) -> Self {
@@ -459,10 +459,10 @@ impl EventReader {
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
             device_path,
-            hidraw_path,
+            pad_rx: Arc::new(Mutex::new(pad_rx)),
+            hidraw_tx,
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
-            haptic_tx: Arc::new(Mutex::new(None)),
             gaming_mode_tx,
         }
     }
@@ -471,9 +471,14 @@ impl EventReader {
         let name = &self.config.iter().find(|&x| x.associations == Associations::default()).unwrap().name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
-        let session = TrackpadSession::setup(&self.trackpad, &self.virt_dev, &self.device_path, self.hidraw_path.clone()).await;
-        // Wire the haptic channel so Gaming Mode toggle can fire haptic feedback.
-        *self.haptic_tx.lock().await = session.haptic_tx();
+        // Take pad_rx once — it's a Receiver and can't be cloned.
+        let pad_rx = self.pad_rx.lock().await.take();
+        let session = TrackpadSession::setup(
+            &self.trackpad,
+            &self.virt_dev,
+            pad_rx,
+            self.hidraw_tx.clone(),
+        ).await;
         self.write_state().await;
         self.start_control_socket().await;
 
@@ -516,8 +521,7 @@ impl EventReader {
             println!("makima: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
             let chain = if new_state { &self.gaming_mode_config.haptic_on }
                         else        { &self.gaming_mode_config.haptic_off };
-            let tx = self.haptic_tx.lock().await.clone();
-            mt_trackpad::fire_chain(&tx, HapticPad::Both, chain).await;
+            mt_trackpad::fire_chain(&self.hidraw_tx, HapticPad::Both, chain).await;
         }
         let label = if new_state { "Gaming Mode On" } else { "Gaming Mode Off" };
         *self.last_action.lock().await = Some(crate::state_export::LastAction {
@@ -566,8 +570,7 @@ impl EventReader {
         // Dirty flag for IMU axes (ABS_HAT2X/Y).
         let mut imu_dirty = false;
         // Rate-limit state.json writes from stick/gyro movement to ~60 Hz.
-        // (Trackpad state.json writes are handled by trackpad_router, driven by hidraw
-        // frames — see pad_hidraw.rs.)
+        // (Trackpad state.json writes are handled by trackpad_router, driven by hidraw frames.)
         let mut last_stick_state_write = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_millis(17))
             .unwrap_or(std::time::Instant::now());
@@ -605,11 +608,11 @@ impl EventReader {
                         pen_events.push(event)
                     }
                     // Left trackpad physical click (BTN_THUMB) is read directly
-                    // from hidraw by trackpad_router instead (see pad_hidraw.rs —
-                    // click lives in the same byte as touch, so it comes in
-                    // atomically with position/touch there). Swallow it here so
-                    // it doesn't fall through to emit_default_event and leak
-                    // onto the generic key device.
+                    // from hidraw by trackpad_router instead — click lives in
+                    // the same hidraw byte as touch, so it arrives atomically
+                    // with position/touch. Swallow it here so it doesn't fall
+                    // through to emit_default_event and leak onto the generic
+                    // key device.
                     Key::BTN_THUMB if self.trackpad.left.mode == "mt-trackpad" => {}
                     // Right trackpad physical click (BTN_THUMB2) — same as above.
                     Key::BTN_THUMB2 if self.trackpad.right.mode == "mt-trackpad" => {}
@@ -669,8 +672,8 @@ impl EventReader {
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
                 (_, _, AbsoluteAxisType::ABS_HAT0X, _) => {
                     // Trackpad position/touch now comes from hidraw (trackpad_router) in
-                    // MtTrackpad mode — see pad_hidraw.rs. This handler only remains
-                    // for the D-pad hat-switch case on non-Steam-Deck controllers.
+                    // MtTrackpad mode. This handler only remains for the D-pad
+                    // hat-switch case on non-Steam-Deck controllers.
                     if self.trackpad.left.mode != "mt-trackpad" {
                         match event.value() {
                             -1 => {
@@ -713,8 +716,8 @@ impl EventReader {
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT0Y, _) => {
                     // Trackpad position/touch now comes from hidraw (trackpad_router) in
-                    // MtTrackpad mode — see pad_hidraw.rs. This handler only remains
-                    // for the D-pad hat-switch case on non-Steam-Deck controllers.
+                    // MtTrackpad mode. This handler only remains for the D-pad
+                    // hat-switch case on non-Steam-Deck controllers.
                     if self.trackpad.left.mode != "mt-trackpad" {
                         match event.value() {
                             -1 => {
@@ -756,8 +759,8 @@ impl EventReader {
                     }
                 }
                 // RPAD position (ABS_HAT1X/Y) is read directly from hidraw by trackpad_router
-                // instead (see pad_hidraw.rs) — swallow these here so they don't fall
-                // through to emit_default_event and leak onto the generic ABS device.
+                // instead — swallow these here so they don't fall through to
+                // emit_default_event and leak onto the generic ABS device.
                 (_, _, AbsoluteAxisType::ABS_HAT1X | AbsoluteAxisType::ABS_HAT1Y, _) => {}
                 // IMU (gyroscope/accelerometer): ABS_HAT2X/Y, range 0..32767.
                 // Stored for state export; not forwarded.
@@ -1246,9 +1249,9 @@ impl EventReader {
                 }
                 (EventType::SYNCHRONIZATION, _, _, _) => {
                     // Trackpad handling (position, touch, gestures, its own state.json
-                    // writes) has moved entirely to trackpad_router, driven by hidraw frames —
-                    // see pad_hidraw.rs. This SYN handler now only rate-limits
-                    // state.json writes triggered by stick/gyro movement.
+                    // writes) has moved entirely to trackpad_router, driven by hidraw
+                    // frames. This SYN handler now only rate-limits state.json writes
+                    // triggered by stick/gyro movement.
                     let stick_changed = lstick_dirty || rstick_dirty || imu_dirty;
                     if lstick_dirty { lstick_dirty = false; }
                     if rstick_dirty { rstick_dirty = false; }

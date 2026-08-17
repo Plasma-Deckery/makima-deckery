@@ -17,7 +17,7 @@ use crate::config::TrackpadConfig;
 use crate::gesture_pad::{self, GesturePadConfig};
 use crate::kde_input_defaults::{self, GestureKdeConfig, PadKdeConfig};
 use crate::mt_trackpad::{self, HapticChain, MovementHaptic, MtTrackpadConfig};
-use crate::pad_hidraw::{self, HapticCommand, HapticPad, PadFrame};
+use crate::steam_deck_controller::{HapticPad, HidrawWrite, PadFrame};
 use crate::trackpad::PadState;
 use crate::trackpad_router::{self, GestureEvent, SinglePadFrame, StateWrite};
 use crate::virtual_devices::VirtualDevices;
@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, Mutex};
 
 pub struct TrackpadSession {
     pad_rx:      Option<mpsc::Receiver<PadFrame>>,
-    haptic_tx:   Option<mpsc::Sender<HapticCommand>>,
+    hidraw_tx:   Option<mpsc::Sender<HidrawWrite>>,
     left_tx:     Option<mpsc::Sender<SinglePadFrame>>,
     left_rx:     Option<mpsc::Receiver<SinglePadFrame>>,
     right_tx:    Option<mpsc::Sender<SinglePadFrame>>,
@@ -48,13 +48,15 @@ pub struct TrackpadSession {
 impl TrackpadSession {
     /// Wires up the full trackpad stack for one device session:
     /// writes KDE libinput defaults, creates virtual MT uinput nodes,
-    /// connects hidraw, parses handler configs, and builds the routing
-    /// channels. Call this before `run` and before anything reads the pad.
+    /// and builds the routing channels. Call this before `run`.
+    ///
+    /// `pad_rx` and `hidraw_tx` come from `ControllerSession` — the controller
+    /// already owns the hidraw fd and tasks. No hidraw path is opened here.
     pub async fn setup(
         trackpad: &TrackpadConfig,
         virt_dev: &Arc<Mutex<VirtualDevices>>,
-        device_path: &std::path::Path,
-        hidraw_path: Option<std::path::PathBuf>,
+        pad_rx: Option<mpsc::Receiver<PadFrame>>,
+        hidraw_tx: Option<mpsc::Sender<HidrawWrite>>,
     ) -> Self {
         // Validate modes early so the warning appears before any device work.
         for (side, mode) in [("left", &trackpad.left.mode), ("right", &trackpad.right.mode)] {
@@ -85,19 +87,6 @@ impl TrackpadSession {
             }
         }
 
-        let (pad_rx, haptic_tx) = match pad_hidraw::spawn(hidraw_path) {
-            Some((rx, tx)) => {
-                (Some(rx), Some(tx))
-            }
-            None => {
-                println!(
-                    "makima: no hidraw sibling found for {:?}, trackpad position/touch will not be available",
-                    device_path
-                );
-                (None, None)
-            }
-        };
-
         // Each handler self-parses its own config slice — Core only knows
         // mode and click_pressure; everything else is handler-owned.
         let left_mt  = MtTrackpadConfig::from_toml_value(&trackpad.left.handler_config);
@@ -125,7 +114,7 @@ impl TrackpadSession {
 
         Self {
             pad_rx,
-            haptic_tx,
+            hidraw_tx,
             left_tx,
             left_rx,
             right_tx,
@@ -142,13 +131,6 @@ impl TrackpadSession {
         }
     }
 
-    /// Returns a clone of the haptic command sender, if one was established.
-    /// `None` when no hidraw sibling was found (trackpad position not available).
-    /// Used by `EventReader` to fire haptics on Gaming Mode toggle.
-    pub fn haptic_tx(&self) -> Option<mpsc::Sender<HapticCommand>> {
-        self.haptic_tx.clone()
-    }
-
     /// Runs the trackpad router and all per-handler tasks until the session
     /// ends (hidraw channel closes). Consumes `self`.
     pub async fn run(
@@ -160,9 +142,9 @@ impl TrackpadSession {
         state_tx: mpsc::Sender<StateWrite>,
         gaming_mode: Arc<Mutex<bool>>,
     ) {
-        let left_haptic    = self.haptic_tx.clone();
-        let right_haptic   = self.haptic_tx.clone();
-        let gesture_haptic = self.haptic_tx;
+        let left_haptic    = self.hidraw_tx.clone();
+        let right_haptic   = self.hidraw_tx.clone();
+        let gesture_haptic = self.hidraw_tx;
 
         tokio::join!(
             async {

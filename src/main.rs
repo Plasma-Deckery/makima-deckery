@@ -8,7 +8,6 @@ mod kde_input_defaults;
 mod kwin_watcher;
 mod steam_detector;
 mod mt_trackpad;
-mod pad_hidraw;
 mod resolver;
 mod steam_deck_controller;
 mod scroll_pad;
