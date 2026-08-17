@@ -203,3 +203,165 @@ fn to_command(pad: HapticPad, pulse: HapticPulse) -> HapticCommand {
         gain_db:     pulse.gain_db,
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn default_pulse() -> HapticPulse {
+        HapticPulse { duration_us: 1000, interval_us: 500, count: 3, gain_db: 0 }
+    }
+
+    // ── to_command mapping ───────────────────────────────────────────────────
+
+    #[test]
+    fn to_command_maps_all_pulse_fields() {
+        let pulse = HapticPulse { duration_us: 0x1234, interval_us: 0x5678, count: 7, gain_db: -6 };
+        let cmd = to_command(HapticPad::Left, pulse);
+        assert_eq!(cmd.pad,          HapticPad::Left);
+        assert_eq!(cmd.duration_us,  0x1234);
+        assert_eq!(cmd.interval_us,  0x5678);
+        assert_eq!(cmd.count,        7);
+        assert_eq!(cmd.gain_db,      -6);
+    }
+
+    // ── run_haptic_player — channel routing ──────────────────────────────────
+
+    #[tokio::test]
+    async fn single_chain_produces_exactly_one_command() {
+        let (req_tx, req_rx) = mpsc::channel::<HapticRequest>(4);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<HapticCommand>(4);
+
+        tokio::spawn(run_haptic_player(req_rx, cmd_tx));
+
+        let pulse = default_pulse();
+        req_tx.send(HapticRequest {
+            pad: HapticPad::Right,
+            chain: HapticChain::Single(pulse),
+        }).await.unwrap();
+
+        let cmd = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cmd_rx.recv(),
+        ).await.expect("timed out waiting for command").expect("channel closed");
+
+        assert_eq!(cmd.pad,         HapticPad::Right);
+        assert_eq!(cmd.duration_us, pulse.duration_us);
+        assert_eq!(cmd.count,       pulse.count);
+    }
+
+    #[tokio::test]
+    async fn chain_with_two_steps_produces_two_commands_in_order() {
+        let (req_tx, req_rx) = mpsc::channel::<HapticRequest>(4);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<HapticCommand>(8);
+
+        tokio::spawn(run_haptic_player(req_rx, cmd_tx));
+
+        let pulse_a = HapticPulse { duration_us: 100, interval_us: 100, count: 1, gain_db: 0 };
+        let pulse_b = HapticPulse { duration_us: 200, interval_us: 200, count: 2, gain_db: -3 };
+
+        req_tx.send(HapticRequest {
+            pad: HapticPad::Left,
+            chain: HapticChain::Chain(vec![
+                HapticChainStep { pulse: pulse_a, pause_ms: None },
+                HapticChainStep { pulse: pulse_b, pause_ms: None },
+            ]),
+        }).await.unwrap();
+
+        let recv = |rx: &mut mpsc::Receiver<HapticCommand>| async move {
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await.expect("timed out").expect("channel closed")
+        };
+
+        let first  = recv(&mut cmd_rx).await;
+        let second = recv(&mut cmd_rx).await;
+
+        assert_eq!(first.duration_us,  pulse_a.duration_us);
+        assert_eq!(second.duration_us, pulse_b.duration_us);
+        assert_eq!(second.count,       pulse_b.count);
+    }
+
+    #[tokio::test]
+    async fn chain_step_pause_is_respected() {
+        // Use tokio::time::pause so the test is instant but the sleep is observed.
+        tokio::time::pause();
+
+        let (req_tx, req_rx) = mpsc::channel::<HapticRequest>(4);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<HapticCommand>(8);
+
+        tokio::spawn(run_haptic_player(req_rx, cmd_tx));
+
+        let pulse = default_pulse();
+        req_tx.send(HapticRequest {
+            pad: HapticPad::Both,
+            chain: HapticChain::Chain(vec![
+                HapticChainStep { pulse, pause_ms: Some(200) },
+                HapticChainStep { pulse, pause_ms: None },
+            ]),
+        }).await.unwrap();
+
+        // First command arrives immediately (before the 200 ms pause).
+        let _first = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cmd_rx.recv(),
+        ).await.expect("timed out on first command").expect("closed");
+
+        // Second command is blocked behind the 200 ms pause — not yet available.
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "second command must not arrive before the step pause has elapsed"
+        );
+
+        // Advance mock clock past the pause — second command must now arrive.
+        tokio::time::advance(Duration::from_millis(201)).await;
+        let _second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cmd_rx.recv(),
+        ).await.expect("timed out waiting for second command after advance").expect("closed");
+    }
+
+    #[tokio::test]
+    async fn player_exits_when_request_channel_closes() {
+        let (req_tx, req_rx) = mpsc::channel::<HapticRequest>(4);
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<HapticCommand>(4);
+
+        let handle = tokio::spawn(run_haptic_player(req_rx, cmd_tx));
+        drop(req_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("haptic player did not exit within 1 s after channel closed")
+            .expect("haptic player task panicked");
+    }
+
+    #[tokio::test]
+    async fn multiple_requests_are_processed_sequentially() {
+        let (req_tx, req_rx) = mpsc::channel::<HapticRequest>(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<HapticCommand>(8);
+
+        tokio::spawn(run_haptic_player(req_rx, cmd_tx));
+
+        for i in 0..3u16 {
+            req_tx.send(HapticRequest {
+                pad: HapticPad::Right,
+                chain: HapticChain::Single(HapticPulse {
+                    duration_us: i as u32 * 100,
+                    interval_us: 100,
+                    count: 1,
+                    gain_db: 0,
+                }),
+            }).await.unwrap();
+        }
+
+        for i in 0..3u32 {
+            let cmd = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                cmd_rx.recv(),
+            ).await.expect("timed out").expect("closed");
+            assert_eq!(cmd.duration_us, i * 100, "commands must arrive in send order");
+        }
+    }
+}

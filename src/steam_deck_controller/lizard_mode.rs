@@ -47,18 +47,31 @@ const TRACKPAD_NONE: u16 = 7;
 
 /// Builds the initial Lizard Mode disable report (`ID_SET_SETTINGS_VALUES`).
 ///
-/// Sets both trackpads to `TRACKPAD_NONE`, disables absolute mouse, and
-/// maximises click pressure thresholds (matching SDL's `DisableDeckLizardMode`).
+/// Sets both trackpads to `TRACKPAD_NONE` and disables absolute mouse.
+/// Click pressure thresholds are managed separately via `ClickPressureHandle` /
+/// `make_click_pressure_report` so they can be updated independently of Lizard
+/// Mode (e.g. from trackpad config) without re-sending the full disable packet.
 fn make_disable_settings_report() -> [u8; 64] {
     // Settings: (index: u8, value_lo: u8, value_hi: u8)
     let settings: &[(u8, u16)] = &[
         (SETTING_LEFT_TRACKPAD_MODE, TRACKPAD_NONE),
         (SETTING_RIGHT_TRACKPAD_MODE, TRACKPAD_NONE),
         (SETTING_SMOOTH_ABSOLUTE_MOUSE, 0),
-        (SETTING_LEFT_TRACKPAD_CLICK_PRESSURE, 0xFFFF),
-        (SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE, 0xFFFF),
     ];
     make_settings_report(settings)
+}
+
+/// Builds a 64-byte `ID_SET_SETTINGS_VALUES` report that sets the physical
+/// click-pressure thresholds for both trackpads.
+///
+/// Higher values require more force to register a click; `0xFFFF` effectively
+/// disables physical clicks.  Called by `hidraw::run_hidraw_writer` when a new
+/// value arrives on the `click_pressure_rx` watch channel.
+pub(super) fn make_click_pressure_report(left: u16, right: u16) -> [u8; 64] {
+    make_settings_report(&[
+        (SETTING_LEFT_TRACKPAD_CLICK_PRESSURE, left),
+        (SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE, right),
+    ])
 }
 
 /// Builds the heartbeat settings report (`ID_SET_SETTINGS_VALUES`).
@@ -217,5 +230,23 @@ mod tests {
         // First setting at offset 2: SETTING_LEFT_TRACKPAD_MODE = 7, value = TRACKPAD_NONE = 7
         assert_eq!(r[2], SETTING_LEFT_TRACKPAD_MODE);
         assert_eq!(u16::from_le_bytes([r[3], r[4]]), TRACKPAD_NONE);
+        // Click pressure is no longer part of this report — it is managed separately.
+        let n = r[1] as usize / 3; // number of settings
+        for i in 0..n {
+            let idx = r[2 + i * 3];
+            assert_ne!(idx, SETTING_LEFT_TRACKPAD_CLICK_PRESSURE,  "click pressure must not appear in disable report");
+            assert_ne!(idx, SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE, "click pressure must not appear in disable report");
+        }
+    }
+
+    #[test]
+    fn make_click_pressure_report_round_trips() {
+        let r = make_click_pressure_report(1000, 2000);
+        assert_eq!(r[0], ID_SET_SETTINGS_VALUES);
+        assert_eq!(r[1], 6); // 2 settings × 3 bytes
+        assert_eq!(r[2], SETTING_LEFT_TRACKPAD_CLICK_PRESSURE);
+        assert_eq!(u16::from_le_bytes([r[3], r[4]]), 1000);
+        assert_eq!(r[5], SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE);
+        assert_eq!(u16::from_le_bytes([r[6], r[7]]), 2000);
     }
 }

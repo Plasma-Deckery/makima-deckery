@@ -19,22 +19,22 @@
 //! ## Usage (makima path — device path already known)
 //!
 //! ```ignore
-//! let resume_notify = Arc::new(Notify::new());
-//! tokio::spawn(resume_watcher::start_resume_watcher(resume_notify.clone()));
-//!
 //! let controller = SteamDeckController::from_evdev(Path::new(&event_device));
-//! let session = controller.start(grab, resume_notify, device_error_notify, lizard_cfg);
-//! // session.event_rx  — ControllerEvent channel (suspend-transparent)
-//! // session.pad_rx    — PadFrame channel (trackpad position)
-//! // session.haptic_tx — HapticRequest channel (send chains to play haptics)
-//! // session.lizard_tx — live Lizard Mode config
+//! let session = controller.start(grab, device_error_notify, lizard_cfg);
+//! // session.event_rx            — ControllerEvent channel (suspend-transparent)
+//! // session.pad_rx              — PadFrame channel (trackpad position)
+//! // session.haptic_tx           — HapticRequest channel (send chains to play haptics)
+//! // session.lizard_mode.set(cfg)  — live Lizard Mode update
+//! // session.click_pressure        — pass to TrackpadSession::setup()
+//! // Resume watcher spawned internally — no external Notify needed
 //! ```
 //!
 //! ## Usage (standalone path — no makima infrastructure)
 //!
 //! ```ignore
 //! let controller = SteamDeckController::find()?;
-//! let session = controller.start(false, Arc::new(Notify::new()), Arc::new(Notify::new()), None);
+//! // device_error_notify: pass a dead Notify if you don't need error signalling.
+//! let session = controller.start(false, Arc::new(Notify::new()), None);
 //! ```
 
 pub mod haptic;
@@ -50,6 +50,69 @@ pub mod resume_watcher;
 pub use haptic::{HapticChain, HapticChainStep, HapticPad, HapticPulse, HapticRequest};
 pub use hidraw::PadFrame;
 pub use lizard_mode::LizardModeSuppression;
+
+// ── ClickPressureConfig / ClickPressureHandle ────────────────────────────────
+
+/// Physical click-pressure thresholds for the left and right trackpads.
+///
+/// Higher values require more force to register a physical click press.
+/// `0xFFFF` effectively disables physical clicks. Configured per-side in
+/// the `[trackpad.left]` / `[trackpad.right]` TOML sections as
+/// `click_pressure = <u16>`.
+///
+/// Sent to the controller once at session start (via `ClickPressureHandle`)
+/// and never re-sent by the Lizard Mode heartbeat — the controller firmware
+/// retains the value until a USB reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClickPressureConfig {
+    pub left:  u16,
+    pub right: u16,
+}
+
+/// Setter handle for the click-pressure thresholds on a running session.
+///
+/// Obtained from `ControllerSession::click_pressure`. Call `set()` once (in
+/// `TrackpadSession::setup`) to push the user-configured values; the writer
+/// task applies the change immediately.
+///
+/// Dropping this handle signals the writer that no further click-pressure
+/// updates will arrive — the writer simply stops listening on that arm, but
+/// does NOT exit or reset the firmware value (safe to drop after the initial
+/// `set()`). Store in `TrackpadSession` for the full session lifetime so
+/// future dynamic updates (e.g. gaming-mode pressure changes) remain possible.
+pub struct ClickPressureHandle(watch::Sender<Option<ClickPressureConfig>>);
+
+impl ClickPressureHandle {
+    /// Push a new click-pressure config. `None` is a no-op on the firmware
+    /// (the writer ignores it), but can be used to "unset" a pending value
+    /// before a real config arrives.
+    pub fn set(&self, cfg: Option<ClickPressureConfig>) {
+        // Err means the writer already exited (session teardown) — safe to ignore.
+        let _ = self.0.send(cfg);
+    }
+}
+
+// ── LizardModeHandle ─────────────────────────────────────────────────────────
+
+/// Setter handle for the Lizard Mode suppression config on a running session.
+///
+/// Obtained from `ControllerSession::lizard_mode`. Call `set()` to update the
+/// config live — the writer task applies the change on the next heartbeat cycle
+/// without restarting anything.
+///
+/// Dropping this handle signals the writer that the session is ending, which
+/// causes it to exit cleanly. The handle must therefore be kept alive for the
+/// full session lifetime — store it in `EventReader` or an equivalent owner.
+pub struct LizardModeHandle(watch::Sender<Option<LizardModeSuppression>>);
+
+impl LizardModeHandle {
+    /// Update the Lizard Mode suppression config. The writer task picks up the
+    /// new config immediately. Pass `None` to disable suppression.
+    pub fn set(&self, cfg: Option<LizardModeSuppression>) {
+        // Err means the writer already exited (session teardown) — safe to ignore.
+        let _ = self.0.send(cfg);
+    }
+}
 
 use evdev::{Device, EventStream, InputEvent};
 use std::path::{Path, PathBuf};
@@ -74,6 +137,15 @@ const KNOWN_DEVICE_NAMES: &[&str] = &[
     "Steam Deck",
     "Valve Software Steam Controller",
 ];
+
+/// Returns `true` if `name` matches one of the known Steam Deck device names.
+///
+/// Used by `udev_monitor` to decide whether to use the full Steam Deck
+/// controller path (hidraw, Lizard Mode, haptics) or the generic evdev-only
+/// path for a matched device.
+pub fn is_known_device_name(name: &str) -> bool {
+    KNOWN_DEVICE_NAMES.iter().any(|&known| name.contains(known))
+}
 
 // ── Public event type ────────────────────────────────────────────────────────
 
@@ -102,7 +174,7 @@ pub struct ControllerSession {
     pub event_rx: mpsc::Receiver<ControllerEvent>,
 
     /// Raw trackpad position frames from hidraw. `None` if no hidraw sibling
-    /// was found (non-Steam Deck hardware or sysfs traversal failed).
+    /// was found (sysfs traversal failed).
     pub pad_rx: Option<mpsc::Receiver<PadFrame>>,
 
     /// Haptic request channel. Send `HapticRequest { pad, chain }` to play
@@ -110,9 +182,17 @@ pub struct ControllerSession {
     /// sleeps) internally. `None` if no hidraw sibling was found.
     pub haptic_tx: Option<mpsc::Sender<HapticRequest>>,
 
-    /// Live Lizard Mode configuration. Send `None` to disable the heartbeat,
-    /// `Some(cfg)` to enable or change timing/reports without restarting tasks.
-    pub lizard_tx: watch::Sender<Option<LizardModeSuppression>>,
+    /// Setter for live Lizard Mode config updates. Call `lizard_mode.set(cfg)`
+    /// to change suppression settings without restarting the session.
+    /// **Must be kept alive for the session lifetime** — dropping it signals
+    /// the writer to exit. Store in `EventReader` or equivalent session owner.
+    pub lizard_mode: LizardModeHandle,
+
+    /// Setter for click-pressure thresholds. `None` if no hidraw sibling was
+    /// found. Pass to `TrackpadSession::setup()` — the session stores it for
+    /// its lifetime (allowing future dynamic updates) and calls `set()` once
+    /// with the user-configured values.
+    pub click_pressure: Option<ClickPressureHandle>,
 }
 
 // ── SteamDeckController ──────────────────────────────────────────────────────
@@ -122,10 +202,10 @@ pub struct ControllerSession {
 /// Owns the device paths (evdev + hidraw) discovered at construction time.
 /// Call `start()` to spawn all internal tasks and receive a `ControllerSession`.
 pub struct SteamDeckController {
-    pub evdev_path: PathBuf,
+    pub(crate) evdev_path: PathBuf,
     /// Raw controller hidraw path. `None` on non-Steam Deck hardware or if
     /// sysfs traversal failed.
-    pub hidraw_path: Option<PathBuf>,
+    pub(crate) hidraw_path: Option<PathBuf>,
 }
 
 impl SteamDeckController {
@@ -150,7 +230,7 @@ impl SteamDeckController {
     pub fn find() -> Option<Self> {
         for (path, device) in evdev::enumerate() {
             if let Some(name) = device.name() {
-                if KNOWN_DEVICE_NAMES.iter().any(|&known| name.contains(known)) {
+                if is_known_device_name(name) {
                     return Some(Self::from_evdev(&path));
                 }
             }
@@ -159,27 +239,39 @@ impl SteamDeckController {
     }
 
     /// Open the device and spawn all internal tasks. Returns a `ControllerSession`
-    /// with the caller-facing channel ends.
+    /// with the caller-facing channel ends, or `None` if the device cannot be
+    /// opened (permission denied, path not found, device disappeared mid-scan).
     ///
-    /// Spawns:
+    /// Spawns on success:
     /// - reconnecting evdev reader (suspend-transparent `ControllerEvent` stream)
     /// - hidraw reader → `pad_rx`
-    /// - hidraw writer ← `hidraw_tx` (serializes haptics, Lizard Mode reports, …)
-    /// - Lizard Mode heartbeat task (driven by `lizard_tx` watch channel)
+    /// - hidraw writer (serialises haptics + Lizard Mode heartbeat onto one fd)
     ///
-    /// `resume_notify` is fired by `resume_watcher::start_resume_watcher` (call
-    /// that separately, once per process). Passing `Arc::new(Notify::new())` is
-    /// safe but disables proactive reconnect — the task still reconnects reactively
-    /// on stream errors.
+    /// Spawns the resume watcher internally — no external `Notify` needed.
+    /// The watcher fires on logind `PrepareForSleep(false)` and triggers a
+    /// proactive evdev reconnect before the first post-suspend event arrives.
     pub fn start(
         &self,
         grab: bool,
-        resume_notify: Arc<Notify>,
         device_error_notify: Arc<Notify>,
         initial_lizard_cfg: Option<LizardModeSuppression>,
-    ) -> ControllerSession {
-        // ── evdev ──
-        let stream = self.open_event_stream_inner(grab);
+    ) -> Option<ControllerSession> {
+        // ── evdev + suspend/resume ──
+        let stream = match self.open_event_stream_inner(grab) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "makima: cannot open {:?}: {} — skipping device",
+                    self.evdev_path, e
+                );
+                return None;
+            }
+        };
+        // The resume watcher belongs to the controller: it is Steam-Deck-specific
+        // and tightly coupled to the reconnecting reader task below.
+        let resume_notify = Arc::new(Notify::new());
+        tokio::spawn(resume_watcher::start_resume_watcher(resume_notify.clone()));
+
         let (event_tx, event_rx) = mpsc::channel(64);
         let path = self.evdev_path.clone();
         tokio::spawn(reconnecting_reader_task(
@@ -191,40 +283,50 @@ impl SteamDeckController {
             device_error_notify,
         ));
 
-        // ── hidraw + Lizard Mode ──
-        // The writer task owns the fd and handles both haptic commands (from
-        // the haptic player) and the Lizard Mode heartbeat (from the timer +
-        // lizard_rx watch). No separate lizard task needed.
-        let (lizard_tx, lizard_rx) = watch::channel(initial_lizard_cfg);
-        let (pad_rx, haptic_tx) = match &self.hidraw_path {
+        // ── hidraw + Lizard Mode + Click Pressure ──
+        // Two watch channels carry live config updates to the writer task:
+        //   - lizard_tx / lizard_rx: Lizard Mode suppression (heartbeat + initial)
+        //   - click_pressure_tx / click_pressure_rx: per-pad click thresholds
+        // Both senders are returned as typed handles. Dropping them is safe —
+        // the writer's arms become no-ops rather than causing teardown (except
+        // for lizard_rx, whose Err triggers a clean writer exit).
+        let (lizard_tx,         lizard_rx)         = watch::channel(initial_lizard_cfg);
+        let (click_pressure_tx, click_pressure_rx) = watch::channel::<Option<ClickPressureConfig>>(None);
+        let (pad_rx, haptic_tx, click_pressure) = match &self.hidraw_path {
             Some(p) => {
-                let (rx, tx) = hidraw::spawn_hidraw_tasks(p.clone(), lizard_rx);
-                (Some(rx), Some(tx))
+                let (rx, tx) = hidraw::spawn_hidraw_tasks(p.clone(), lizard_rx, click_pressure_rx);
+                (Some(rx), Some(tx), Some(ClickPressureHandle(click_pressure_tx)))
             }
             None => {
-                // lizard_rx dropped here — lizard_tx still valid but sends to nobody.
+                // No hidraw — drop both receivers; handles become no-ops.
                 drop(lizard_rx);
+                drop(click_pressure_rx);
+                drop(click_pressure_tx);
                 println!(
                     "makima: no hidraw sibling found for {:?} — trackpad position/haptics not available",
                     self.evdev_path
                 );
-                (None, None)
+                (None, None, None)
             }
         };
 
-        ControllerSession { event_rx, pad_rx, haptic_tx, lizard_tx }
+        Some(ControllerSession {
+            event_rx,
+            pad_rx,
+            haptic_tx,
+            lizard_mode: LizardModeHandle(lizard_tx),
+            click_pressure,
+        })
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    fn open_event_stream_inner(&self, grab: bool) -> EventStream {
-        let mut device = Device::open(&self.evdev_path)
-            .expect("Couldn't open device path.");
+    fn open_event_stream_inner(&self, grab: bool) -> std::io::Result<EventStream> {
+        let mut device = Device::open(&self.evdev_path)?;
         if grab {
-            device.grab()
-                .expect("Unable to grab device. Is another instance of Makima running?");
+            device.grab()?;
         }
-        device.into_event_stream().unwrap()
+        device.into_event_stream()
     }
 }
 
@@ -240,7 +342,7 @@ impl SteamDeckController {
 /// If the device does not return within `RECONNECT_TIMEOUT`, fires
 /// `device_error_notify` (triggering a full reinit in `udev_monitor`) and
 /// exits — dropping `tx` closes the channel, causing `EventReader` to exit.
-async fn reconnecting_reader_task(
+pub(crate) async fn reconnecting_reader_task(
     mut stream: EventStream,
     path: PathBuf,
     grab: bool,
@@ -317,8 +419,8 @@ async fn reconnecting_reader_task(
 }
 
 /// Try to open an evdev device and return an `EventStream`. Non-panicking —
-/// used in the reconnect poll loop.
-fn try_open_event_stream(path: &Path, grab: bool) -> std::io::Result<EventStream> {
+/// used in the reconnect poll loop and by `udev_monitor` for generic devices.
+pub(crate) fn try_open_event_stream(path: &Path, grab: bool) -> std::io::Result<EventStream> {
     let mut device = Device::open(path)?;
     if grab { device.grab()?; }
     device.into_event_stream()

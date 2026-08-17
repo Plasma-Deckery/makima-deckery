@@ -17,7 +17,7 @@ use crate::config::TrackpadConfig;
 use crate::gesture_pad::{self, GesturePadConfig};
 use crate::kde_input_defaults::{self, GestureKdeConfig, PadKdeConfig};
 use crate::mt_trackpad::{self, HapticChain, MovementHaptic, MtTrackpadConfig};
-use crate::steam_deck_controller::{HapticPad, HapticRequest, PadFrame};
+use crate::steam_deck_controller::{ClickPressureConfig, ClickPressureHandle, HapticPad, HapticRequest, PadFrame};
 use crate::trackpad::PadState;
 use crate::trackpad_router::{self, GestureEvent, SinglePadFrame, StateWrite};
 use crate::virtual_devices::VirtualDevices;
@@ -43,6 +43,11 @@ pub struct TrackpadSession {
     right_movement_pulse: Option<MovementHaptic>,
 
     gesture_pad_config: GesturePadConfig,
+
+    /// Keeps the click-pressure watch channel alive for the session lifetime,
+    /// allowing future dynamic updates (e.g. gaming-mode pressure changes).
+    /// `None` if no hidraw sibling was found for this device.
+    _click_pressure: Option<ClickPressureHandle>,
 }
 
 impl TrackpadSession {
@@ -52,11 +57,17 @@ impl TrackpadSession {
     ///
     /// `pad_rx` and `haptic_tx` come from `ControllerSession` — the controller
     /// already owns the hidraw fd and tasks. No hidraw path is opened here.
+    ///
+    /// `click_pressure` is the `ClickPressureHandle` from `ControllerSession`.
+    /// If the user configured click-pressure thresholds in the trackpad config,
+    /// they are pushed immediately via `handle.set()`. The handle is then stored
+    /// for the session lifetime so future dynamic updates remain possible.
     pub async fn setup(
         trackpad: &TrackpadConfig,
         virt_dev: &Arc<Mutex<VirtualDevices>>,
         pad_rx: Option<mpsc::Receiver<PadFrame>>,
         haptic_tx: Option<mpsc::Sender<HapticRequest>>,
+        click_pressure: Option<ClickPressureHandle>,
     ) -> Self {
         // Validate modes early so the warning appears before any device work.
         for (side, mode) in [("left", &trackpad.left.mode), ("right", &trackpad.right.mode)] {
@@ -112,6 +123,21 @@ impl TrackpadSession {
             (None, None)
         };
 
+        // Push user-configured click-pressure thresholds to the firmware.
+        // Only sent if at least one side has an explicit value in the config;
+        // if neither side is configured, the firmware default stands and we
+        // avoid sending an unnecessary HID feature report.
+        if let Some(ref handle) = click_pressure {
+            let left  = trackpad.left.click_pressure;
+            let right = trackpad.right.click_pressure;
+            if left.is_some() || right.is_some() {
+                handle.set(Some(ClickPressureConfig {
+                    left:  left.unwrap_or(0xFFFF),
+                    right: right.unwrap_or(0xFFFF),
+                }));
+            }
+        }
+
         Self {
             pad_rx,
             haptic_tx,
@@ -128,6 +154,7 @@ impl TrackpadSession {
             right_release_chain:  right_mt.release_chain(),
             right_movement_pulse: right_mt.movement_pulse(),
             gesture_pad_config,
+            _click_pressure: click_pressure,
         }
     }
 
