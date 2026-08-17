@@ -105,11 +105,24 @@ impl ClickPressureHandle {
 /// A `set(cfg)` method will be added here when config hot-reload is wired up
 /// (i.e. when a live Lizard-Mode update path exists in the running session).
 /// Until then the handle is a pure lifetime token.
-pub struct LizardModeHandle(
-    // Never read directly — held for its Drop, which closes the watch channel
-    // and signals the hidraw writer to exit when the session ends.
-    #[allow(dead_code)] watch::Sender<Option<LizardModeSuppression>>,
-);
+// `#[allow(dead_code)]` on this whole block: LizardModeHandle and its set()
+// method are intentional public API surface for the upcoming steam_deck_controller
+// library crate. In a binary crate, unused `pub` items always trigger dead_code
+// warnings regardless of design intent — the suppression is structural, not a
+// sign of dead code in the usual sense.
+#[allow(dead_code)]
+pub struct LizardModeHandle(watch::Sender<Option<LizardModeSuppression>>);
+
+#[allow(dead_code)]
+impl LizardModeHandle {
+    /// Update the Lizard Mode suppression config live. The hidraw writer picks
+    /// up the new value immediately — no session restart needed.
+    /// Pass `None` to disable suppression entirely.
+    pub fn set(&self, cfg: Option<LizardModeSuppression>) {
+        // Err = writer already exited (session teardown) — safe to ignore.
+        let _ = self.0.send(cfg);
+    }
+}
 
 use evdev::{Device, EventStream, InputEvent};
 use std::path::{Path, PathBuf};
@@ -223,11 +236,12 @@ impl SteamDeckController {
     ///
     /// For makima: use `from_evdev` instead — the udev_monitor already has the
     /// path via config-file-name matching. `find()` is for callers without
-    /// makima infrastructure (standalone tools). It lives under `#[cfg(test)]`
-    /// for now because the only in-crate caller is a smoke test; when
-    /// `steam_deck_controller` is split into its own library crate this
-    /// becomes a regular `pub` entry point.
-    #[cfg(test)]
+    /// makima infrastructure (`deckery-auth`, standalone tools).
+    ///
+    /// `#[allow(dead_code)]`: not called from the makima binary itself, but
+    /// required by external clients. Binary crates warn on unused `pub` items
+    /// regardless of external intent — suppression is structural here.
+    #[allow(dead_code)]
     pub fn find() -> Option<Self> {
         for (path, device) in evdev::enumerate() {
             if let Some(name) = device.name() {
