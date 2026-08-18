@@ -27,7 +27,7 @@
 //! cannot be fully eliminated without libinput-side continuity support. The
 //! debounce in `run` mitigates brief session restarts that would otherwise
 //! multiply the effect.
-use crate::steam_deck_controller::PadFrame;
+use deckery_controller::PadFrame;
 use crate::trackpad::PadState;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};

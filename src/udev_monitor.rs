@@ -1,7 +1,7 @@
 use crate::config::{Associations, Event};
 use crate::device_session::TrackpadSession;
 use crate::event_reader::EventReader;
-use crate::steam_deck_controller::{
+use deckery_controller::{
     is_known_device_name, SteamDeckController, LizardModeSuppression,
     ControllerEvent,
 };
@@ -51,7 +51,7 @@ fn spawn_event_reader(
     grab: bool,
     device_error_notify: Arc<Notify>,
 ) -> Option<mpsc::Receiver<ControllerEvent>> {
-    use crate::steam_deck_controller::{try_open_event_stream, reconnecting_reader_task};
+    use deckery_controller::{try_open_event_stream, reconnecting_reader_task};
     let stream = match try_open_event_stream(&path, grab) {
         Ok(s) => s,
         Err(e) => {

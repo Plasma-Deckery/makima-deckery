@@ -15,7 +15,7 @@
 //! The haptic types (`HapticPulse`, `HapticChain`, `HapticChainStep`) live in
 //! `steam_deck_controller/haptic.rs` so any tool (makima, deckery-auth, etc.)
 //! can play chains without re-implementing the evaluation logic.
-use crate::steam_deck_controller::{HapticChain, HapticPad, HapticPulse, HapticRequest};
+use deckery_controller::{HapticChain, HapticPad, HapticPulse, HapticRequest};
 use crate::trackpad::PadState;
 use crate::trackpad_router::SinglePadFrame;
 use crate::virtual_devices::VirtualDevices;

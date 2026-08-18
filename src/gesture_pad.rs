@@ -19,7 +19,7 @@
 //! self-parsed from `[trackpad.gestures]` exactly like
 //! `mt_trackpad::MtTrackpadConfig` parses `[trackpad.left]`/`[trackpad.right]`.
 use crate::mt_trackpad::pulse;
-use crate::steam_deck_controller::{HapticPad, HapticPulse, HapticRequest};
+use deckery_controller::{HapticPad, HapticPulse, HapticRequest};
 use crate::trackpad::emit_gesture_event;
 use crate::trackpad_router::{CombinedPadFrame, GestureEvent};
 use crate::virtual_devices::VirtualDevices;

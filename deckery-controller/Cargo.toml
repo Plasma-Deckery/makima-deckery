@@ -1,0 +1,17 @@
+[package]
+name = "deckery-controller"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+evdev = { version = "0.12.1", features = ["tokio", "serde"] }
+tokio = { version = "1.28.1", features = ["full"] }
+serde = { version = "1.0.163", features = ["derive"] }
+tokio-stream = "0.1.14"
+zbus = { version = "4", features = ["tokio"] }
+libc = "0.2"
+
+[dev-dependencies]
+# test-util enables tokio::time::pause() and tokio::time::advance() for
+# deterministic timing tests without real sleeps.
+tokio = { version = "1.28.1", features = ["test-util"] }

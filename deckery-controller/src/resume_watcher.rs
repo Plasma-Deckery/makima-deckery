@@ -52,7 +52,7 @@ pub async fn start_resume_watcher(resume_notify: Arc<Notify>) {
     let conn = match Connection::system().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("makima: resume_watcher: system bus connection failed: {e}");
+            eprintln!("deckery-controller: resume_watcher: system bus connection failed: {e}");
             return;
         }
     };
@@ -60,7 +60,7 @@ pub async fn start_resume_watcher(resume_notify: Arc<Notify>) {
     let proxy = match LoginManagerProxy::new(&conn).await {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("makima: resume_watcher: failed to create logind proxy: {e}");
+            eprintln!("deckery-controller: resume_watcher: failed to create logind proxy: {e}");
             return;
         }
     };
@@ -68,13 +68,13 @@ pub async fn start_resume_watcher(resume_notify: Arc<Notify>) {
     let mut signals = match proxy.receive_prepare_for_sleep().await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("makima: resume_watcher: failed to subscribe to PrepareForSleep: {e}");
+            eprintln!("deckery-controller: resume_watcher: failed to subscribe to PrepareForSleep: {e}");
             return;
         }
     };
 
     println!(
-        "makima: resume_watcher: subscribed to PrepareForSleep. +{}ms since startup",
+        "deckery-controller: resume_watcher: subscribed to PrepareForSleep. +{}ms since startup",
         crate::startup_ms()
     );
 
@@ -82,12 +82,12 @@ pub async fn start_resume_watcher(resume_notify: Arc<Notify>) {
         let Ok(args) = signal.args() else { continue };
         if args.start {
             println!(
-                "makima: resume_watcher: suspend starting. +{}ms since startup",
+                "deckery-controller: resume_watcher: suspend starting. +{}ms since startup",
                 crate::startup_ms()
             );
         } else {
             println!(
-                "makima: resume_watcher: resume detected, triggering in-process reinit. +{}ms since startup",
+                "deckery-controller: resume_watcher: resume detected, triggering in-process reinit. +{}ms since startup",
                 crate::startup_ms()
             );
             resume_notify.notify_waiters();

@@ -2,7 +2,7 @@ use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::device_session::TrackpadSession;
 use crate::mt_trackpad;
-use crate::steam_deck_controller::{HapticPad, HapticRequest, LizardModeHandle};
+use deckery_controller::{HapticPad, HapticRequest, LizardModeHandle};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::trackpad::PadState;
@@ -10,7 +10,7 @@ use crate::trackpad_router;
 use crate::udev_monitor::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
-use crate::steam_deck_controller::ControllerEvent;
+use deckery_controller::ControllerEvent;
 use evdev::{AbsoluteAxisType, EventType, InputEvent, Key, RelativeAxisType};
 use fork::{fork, setsid, Fork};
 use std::{
