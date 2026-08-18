@@ -251,9 +251,14 @@ impl SteamDeckController {
         None
     }
 
-    /// Open the device and spawn all internal tasks. Returns a `ControllerSession`
-    /// with the caller-facing channel ends, or `None` if the device cannot be
-    /// opened (permission denied, path not found, device disappeared mid-scan).
+    /// Consume the controller and spawn all internal tasks. Returns a
+    /// `ControllerSession` with the caller-facing channel ends, or `None` if
+    /// the device cannot be opened (permission denied, path not found, device
+    /// disappeared mid-scan).
+    ///
+    /// Takes `self` by value — the `SteamDeckController` is not needed after
+    /// the session is created; consuming it makes this explicit in the type
+    /// system.
     ///
     /// Spawns on success:
     /// - reconnecting evdev reader (suspend-transparent `ControllerEvent` stream)
@@ -264,13 +269,13 @@ impl SteamDeckController {
     /// The watcher fires on logind `PrepareForSleep(false)` and triggers a
     /// proactive evdev reconnect before the first post-suspend event arrives.
     pub fn start(
-        &self,
+        self,
         grab: bool,
         device_error_notify: Arc<Notify>,
         initial_lizard_cfg: Option<LizardModeSuppression>,
     ) -> Option<ControllerSession> {
         // ── evdev + suspend/resume ──
-        let stream = match self.open_event_stream_inner(grab) {
+        let stream = match Self::open_event_stream_inner(&self.evdev_path, grab) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
@@ -327,8 +332,8 @@ impl SteamDeckController {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    fn open_event_stream_inner(&self, grab: bool) -> std::io::Result<EventStream> {
-        let mut device = Device::open(&self.evdev_path)?;
+    fn open_event_stream_inner(evdev_path: &Path, grab: bool) -> std::io::Result<EventStream> {
+        let mut device = Device::open(evdev_path)?;
         if grab {
             device.grab()?;
         }
