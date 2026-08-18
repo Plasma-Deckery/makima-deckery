@@ -148,7 +148,7 @@ pub async fn run_hidraw_reader(path: PathBuf, tx: mpsc::Sender<PadFrame>) {
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("makima: hidraw reader: cannot open {:?}: {}", path, e);
+            eprintln!("deckery-controller: hidraw reader: cannot open {:?}: {}", path, e);
             return;
         }
     };
@@ -221,7 +221,7 @@ async fn run_hidraw_writer(
     if let Some(ref cfg) = lizard_cfg {
         send_lizard_reports(fd, cfg, true).await;
         println!(
-            "makima: Lizard Mode suppression active (buttons={}, mouse={}). +{}ms since startup",
+            "deckery-controller: Lizard Mode suppression active (buttons={}, mouse={}). +{}ms since startup",
             cfg.suppress_buttons, cfg.suppress_mouse, crate::startup_ms()
         );
     }
@@ -238,8 +238,8 @@ async fn run_hidraw_writer(
                         }).await;
                         match result {
                             Ok(Ok(())) => {}
-                            Ok(Err(e)) => eprintln!("makima: haptic write failed: {}", e),
-                            Err(e)     => eprintln!("makima: haptic writer task panicked: {}", e),
+                            Ok(Err(e)) => eprintln!("deckery-controller: haptic write failed: {}", e),
+                            Err(e)     => eprintln!("deckery-controller: haptic writer task panicked: {}", e),
                         }
                     }
                     None => break, // haptic player exited — session ending
@@ -304,8 +304,8 @@ async fn send_lizard_reports(
         }).await;
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("makima: lizard mode write failed: {}", e),
-            Err(e)     => eprintln!("makima: lizard mode writer task panicked: {}", e),
+            Ok(Err(e)) => eprintln!("deckery-controller: lizard mode write failed: {}", e),
+            Err(e)     => eprintln!("deckery-controller: lizard mode writer task panicked: {}", e),
         }
     }
 }
@@ -319,8 +319,8 @@ async fn send_click_pressure(fd: std::os::fd::RawFd, cfg: ClickPressureConfig) {
     }).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("makima: click pressure write failed: {}", e),
-        Err(e)     => eprintln!("makima: click pressure writer task panicked: {}", e),
+        Ok(Err(e)) => eprintln!("deckery-controller: click pressure write failed: {}", e),
+        Err(e)     => eprintln!("deckery-controller: click pressure writer task panicked: {}", e),
     }
 }
 
@@ -350,7 +350,7 @@ pub(super) fn spawn_hidraw_tasks(
     click_pressure_rx: watch::Receiver<Option<ClickPressureConfig>>,
 ) -> (mpsc::Receiver<PadFrame>, mpsc::Sender<HapticRequest>) {
     println!(
-        "makima: hidraw attached to {:?}. +{}ms since startup",
+        "deckery-controller: hidraw attached to {:?}. +{}ms since startup",
         path,
         crate::startup_ms()
     );
@@ -366,7 +366,7 @@ pub(super) fn spawn_hidraw_tasks(
     let write_file = match std::fs::OpenOptions::new().write(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("makima: hidraw writer: cannot open {:?}: {}", path, e);
+            eprintln!("deckery-controller: hidraw writer: cannot open {:?}: {}", path, e);
             // Writer won't run — drop channels so dependent tasks exit cleanly.
             drop(lizard_rx);
             drop(click_pressure_rx);

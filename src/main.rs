@@ -9,7 +9,6 @@ mod kwin_watcher;
 mod steam_detector;
 mod mt_trackpad;
 mod resolver;
-mod steam_deck_controller;
 mod scroll_pad;
 mod state_export;
 mod trackball;
