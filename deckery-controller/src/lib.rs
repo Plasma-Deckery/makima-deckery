@@ -276,7 +276,14 @@ impl SteamDeckController {
     ) -> Option<ControllerSession> {
         // ── evdev + suspend/resume ──
         let stream = match Self::open_event_stream_inner(&self.evdev_path, grab) {
-            Ok(s) => s,
+            Ok(s) => {
+                if grab {
+                    println!("deckery-controller: grabbed {:?} (exclusive evdev access)", self.evdev_path);
+                } else {
+                    println!("deckery-controller: opened {:?} (no grab)", self.evdev_path);
+                }
+                s
+            }
             Err(e) => {
                 eprintln!(
                     "deckery-controller: cannot open {:?}: {} — skipping device",
@@ -413,7 +420,11 @@ pub async fn reconnecting_reader_task(
         stream = loop {
             match try_open_event_stream(&path, grab) {
                 Ok(s) => {
-                    println!("deckery-controller: reconnected to {:?}", path);
+                    if grab {
+                        println!("deckery-controller: reconnected to {:?} (grab re-acquired)", path);
+                    } else {
+                        println!("deckery-controller: reconnected to {:?}", path);
+                    }
                     if tx.send(ControllerEvent::Reconnected).await.is_err() {
                         return; // consumer dropped — session ending
                     }
