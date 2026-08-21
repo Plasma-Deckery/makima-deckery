@@ -90,7 +90,12 @@ pub async fn start_resume_watcher(resume_notify: Arc<Notify>) {
                 "deckery-controller: resume_watcher: resume detected, triggering in-process reinit. +{}ms since startup",
                 crate::startup_ms()
             );
-            resume_notify.notify_waiters();
+            // notify_one() stores a permit — safe even if the reader task is
+            // briefly busy processing events (tx.send) when we fire. The
+            // permit survives until the task loops back into its select! and
+            // calls notified().await.  notify_waiters() does NOT store a
+            // permit, so it would be silently lost in that race.
+            resume_notify.notify_one();
         }
     }
 }

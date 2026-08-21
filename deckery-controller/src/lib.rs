@@ -389,43 +389,49 @@ pub async fn reconnecting_reader_task(
             }
         };
 
-        // Reactive reconnect: give the kernel a moment to reset the device.
-        // Proactive: try immediately — the device is likely already back.
+        // ── Drop old stream BEFORE reconnecting ────────────────────────────────
+        // CRITICAL: the old EventStream holds an open evdev fd. If grab=true,
+        // that fd holds EVIOCGRAB. Keeping it alive while try_open_event_stream
+        // attempts a new grab would fail with EBUSY, causing every reconnect
+        // attempt to silently fail for the full RECONNECT_TIMEOUT before
+        // triggering a spurious full reinit.
+        //
+        // After drop, `stream` is uninitialized — Rust allows re-assignment
+        // below because control flow either reaches `stream = s` (re-init) or
+        // exits via `return` (so `stream` is never used uninitialized).
+        drop(stream);
+
+        // Reactive reconnect: give the kernel a moment to complete the USB
+        // reset and re-enumerate the device. Proactive: the device should
+        // already be back — try immediately, polling handles any brief gap.
         if !was_proactive {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
         // ── Reconnect phase: poll until device is back or timeout ─────────────
         let deadline = tokio::time::Instant::now() + RECONNECT_TIMEOUT;
-        let new_stream = loop {
+        stream = loop {
             match try_open_event_stream(&path, grab) {
-                Ok(s) => break Some(s),
-                Err(_) => {
+                Ok(s) => {
+                    println!("deckery-controller: reconnected to {:?}", path);
+                    if tx.send(ControllerEvent::Reconnected).await.is_err() {
+                        return; // consumer dropped — session ending
+                    }
+                    break s;
+                }
+                Err(e) => {
                     if tokio::time::Instant::now() >= deadline {
-                        break None;
+                        eprintln!(
+                            "deckery-controller: {:?} did not return within {:?} (last error: {}) — triggering full reinit",
+                            path, RECONNECT_TIMEOUT, e
+                        );
+                        device_error_notify.notify_one();
+                        return;
                     }
                     tokio::time::sleep(RECONNECT_POLL_INTERVAL).await;
                 }
             }
         };
-
-        match new_stream {
-            Some(s) => {
-                stream = s;
-                println!("deckery-controller: reconnected to {:?}", path);
-                if tx.send(ControllerEvent::Reconnected).await.is_err() {
-                    return;
-                }
-            }
-            None => {
-                eprintln!(
-                    "deckery-controller: {:?} did not return within {:?} — triggering full reinit",
-                    path, RECONNECT_TIMEOUT
-                );
-                device_error_notify.notify_one();
-                return;
-            }
-        }
     }
 }
 
