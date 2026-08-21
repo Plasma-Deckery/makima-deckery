@@ -53,7 +53,14 @@ fn spawn_event_reader(
 ) -> Option<mpsc::Receiver<ControllerEvent>> {
     use deckery_controller::{try_open_event_stream, reconnecting_reader_task};
     let stream = match try_open_event_stream(&path, grab) {
-        Ok(s) => s,
+        Ok(s) => {
+            if grab {
+                println!("makima: grabbed {:?} (exclusive evdev access)", path);
+            } else {
+                println!("makima: opened {:?} (no grab)", path);
+            }
+            s
+        }
         Err(e) => {
             eprintln!("makima: cannot open {:?}: {} — skipping device", path, e);
             return None;
