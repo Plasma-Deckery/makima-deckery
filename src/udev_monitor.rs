@@ -369,7 +369,7 @@ pub async fn launch_tasks(
                 .iter()
                 .find(|c| c.associations == Associations::default())
                 .and_then(|c| c.settings.get("GRAB_DEVICE"))
-                .map_or(true, |v| v == "true");
+                .map_or(false, |v| v == "true");
 
             // Determine whether this is a Steam Deck controller or a generic device.
             // Steam Deck: use the full controller path (hidraw, Lizard Mode, haptics,
