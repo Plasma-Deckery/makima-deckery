@@ -72,13 +72,45 @@ fn active_outputs(state: &serde_json::Value) -> Vec<String> {
     active_output_keys(state)
 }
 
+/// Returns the keys of available_modifiers (now a map, not an array).
 fn available_modifiers(state: &serde_json::Value) -> Vec<String> {
     state["context"]["available_modifiers"]
-        .as_array()
+        .as_object()
         .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
+        .keys()
+        .cloned()
         .collect()
+}
+
+/// Returns has_app_combos for a specific modifier key.
+fn avail_mod_has_app_combos(state: &serde_json::Value, key: &str) -> bool {
+    state["context"]["available_modifiers"][key]["has_app_combos"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+/// Like make_config but with override_bindings set (simulates an app-specific layer).
+fn make_config_with_override(
+    remap: Vec<(Event, Vec<Event>, Vec<Key>)>,
+    commands: Vec<(Event, Vec<Event>, Vec<String>)>,
+    custom_modifiers: Vec<Event>,
+    override_remap: Vec<(Event, Vec<Event>, Vec<Key>)>,
+) -> Config {
+    let mut base = make_config(remap, commands, custom_modifiers);
+    let mut ov_remap: HashMap<Event, HashMap<Vec<Event>, Vec<Key>>> = HashMap::new();
+    for (trigger, combo, keys) in override_remap {
+        ov_remap.entry(trigger).or_default().insert(combo, keys);
+    }
+    base.override_bindings = Some(Bindings {
+        remap: ov_remap,
+        commands: HashMap::new(),
+        movements: HashMap::new(),
+        no_pause: HashSet::new(),
+        while_gaming: HashSet::new(),
+        labels: HashMap::new(),
+        silent: HashSet::new(),
+    });
+    base
 }
 
 fn modifier_active_keys(state: &serde_json::Value) -> Vec<String> {
@@ -197,6 +229,70 @@ fn available_modifiers_filters_satisfied() {
     let avail = available_modifiers(&state);
     assert!(!avail.contains(&"BTN_TL".to_string()), "BTN_TL is already active");
     assert!(avail.contains(&"BTN_TR".to_string()), "BTN_TR unlocks a BTN_TL+BTN_TR combo");
+}
+
+// ── available_modifiers: has_app_combos ──────────────────────────────────────
+
+#[test]
+fn has_app_combos_false_when_no_override() {
+    // No override_bindings → has_app_combos must be false for all modifiers.
+    let btn_tl = key(Key::BTN_TL);
+    let btn_north = key(Key::BTN_NORTH);
+    let config = make_config(
+        vec![(btn_north, vec![btn_tl], vec![Key::KEY_F5])],
+        vec![], vec![btn_tl],
+    );
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
+    assert!(!avail_mod_has_app_combos(&state, "BTN_TL"),
+        "no override_bindings → has_app_combos must be false");
+}
+
+#[test]
+fn has_app_combos_true_when_override_has_qualifying_combo() {
+    // override_bindings has a BTN_TL combo → has_app_combos must be true for BTN_TL.
+    let btn_tl = key(Key::BTN_TL);
+    let btn_tr = key(Key::BTN_TR);
+    let btn_north = key(Key::BTN_NORTH);
+    let btn_south = key(Key::BTN_SOUTH);
+    // Base: BTN_TL has a base combo (BTN_NORTH+BTN_TL), BTN_TR has a base combo.
+    // Override: only BTN_TL has an app-specific combo (BTN_SOUTH+BTN_TL).
+    let config = make_config_with_override(
+        vec![
+            (btn_north, vec![btn_tl], vec![Key::KEY_F5]),
+            (btn_south, vec![btn_tl], vec![Key::KEY_F6]),
+            (btn_north, vec![btn_tr], vec![Key::KEY_F7]),
+        ],
+        vec![], vec![btn_tl, btn_tr],
+        vec![(btn_south, vec![btn_tl], vec![Key::KEY_F6])], // app-specific
+    );
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string(), "firefox".to_string()], &GamingModeConfig::default());
+    assert!(avail_mod_has_app_combos(&state, "BTN_TL"),
+        "BTN_TL has an app-specific combo → has_app_combos must be true");
+    assert!(!avail_mod_has_app_combos(&state, "BTN_TR"),
+        "BTN_TR has no app-specific combo → has_app_combos must be false");
+}
+
+#[test]
+fn has_app_combos_false_when_override_has_no_qualifying_combo() {
+    // override_bindings exists but contains only BTN_TR combos, not BTN_TL.
+    // BTN_TL must still report has_app_combos: false.
+    let btn_tl = key(Key::BTN_TL);
+    let btn_tr = key(Key::BTN_TR);
+    let btn_north = key(Key::BTN_NORTH);
+    let btn_south = key(Key::BTN_SOUTH);
+    let config = make_config_with_override(
+        vec![
+            (btn_north, vec![btn_tl], vec![Key::KEY_F5]),
+            (btn_south, vec![btn_tr], vec![Key::KEY_F6]),
+        ],
+        vec![], vec![btn_tl, btn_tr],
+        vec![(btn_south, vec![btn_tr], vec![Key::KEY_F6])], // only BTN_TR is app-specific
+    );
+    let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string(), "firefox".to_string()], &GamingModeConfig::default());
+    assert!(!avail_mod_has_app_combos(&state, "BTN_TL"),
+        "override has no BTN_TL combo → has_app_combos must be false");
+    assert!(avail_mod_has_app_combos(&state, "BTN_TR"),
+        "override has a BTN_TR combo → has_app_combos must be true");
 }
 
 // ── modifier_active ───────────────────────────────────────────────────────

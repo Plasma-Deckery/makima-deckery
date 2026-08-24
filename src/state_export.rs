@@ -344,19 +344,35 @@ pub fn build_state(
         .chain(config.bindings.movements.values().flat_map(|m| m.keys()))
         .filter(|c| !c.is_empty())
         .collect();
-    let mut available_modifiers: Vec<String> = config.mapped_modifiers.custom
+
+    // For each available modifier, check whether any qualifying combo originates
+    // from an app-specific override (config.override_bindings). If yes →
+    // has_app_combos: true in the emitted object, so the HUD can signal it.
+    // A combo qualifies for modifier m when it contains m and all currently
+    // held modifiers — shared predicate used by both the availability filter
+    // and the has_app_combos check so the logic can't drift out of sync.
+    let qualifies = |m: &Event, combo: &Vec<Event>| -> bool {
+        combo.contains(m) && active_input_mods.iter().all(|held| combo.contains(held))
+    };
+    let has_app_combos = |m: &Event| -> bool {
+        match &config.override_bindings {
+            None => false,
+            Some(ov) => {
+                ov.remap.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
+                    || ov.commands.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
+                    || ov.movements.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
+            }
+        }
+    };
+
+    let available_modifiers: serde_json::Map<String, serde_json::Value> = config.mapped_modifiers.custom
         .iter()
         .filter(|m| !active_input_mods.contains(m))
-        .filter(|m| {
-            all_combos.iter().any(|combo| {
-                combo.contains(m)
-                    && active_input_mods.iter().all(|held| combo.contains(held))
-            })
-        })
-        .map(event_to_str)
+        .filter(|m| all_combos.iter().any(|combo| qualifies(m, combo)))
+        .map(|m| (event_to_str(m), serde_json::json!({
+            "has_app_combos": has_app_combos(m),
+        })))
         .collect();
-    available_modifiers.sort();
-    available_modifiers.dedup();
 
     // Determine active app name from config_stack (e.g., "org.mozilla.firefox" or "default")
     let active_app = if config_stack.len() > 1 {
