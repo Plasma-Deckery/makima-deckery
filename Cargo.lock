@@ -284,6 +284,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "deckery-controller"
+version = "0.1.0"
+dependencies = [
+ "evdev",
+ "libc",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "zbus",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -628,6 +640,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "makima-deckery"
 version = "0.3.0"
 dependencies = [
+ "deckery-controller",
  "evdev",
  "fork",
  "libc",

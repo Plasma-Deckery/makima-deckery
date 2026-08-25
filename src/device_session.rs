@@ -16,8 +16,9 @@
 use crate::config::TrackpadConfig;
 use crate::gesture_pad::{self, GesturePadConfig};
 use crate::kde_input_defaults::{self, GestureKdeConfig, PadKdeConfig};
-use crate::mt_trackpad::{self, HapticChain, MovementHaptic, MtTrackpadConfig};
-use crate::pad_hidraw::{self, HapticCommand, HapticPad, PadFrame};
+use crate::mt_trackpad::{self, MovementHaptic, MtTrackpadConfig};
+use deckery_controller::HapticChain;
+use deckery_controller::{ClickPressureConfig, ClickPressureHandle, HapticPad, HapticRequest, PadFrame};
 use crate::trackpad::PadState;
 use crate::trackpad_router::{self, GestureEvent, SinglePadFrame, StateWrite};
 use crate::virtual_devices::VirtualDevices;
@@ -26,7 +27,7 @@ use tokio::sync::{mpsc, Mutex};
 
 pub struct TrackpadSession {
     pad_rx:      Option<mpsc::Receiver<PadFrame>>,
-    haptic_tx:   Option<mpsc::Sender<HapticCommand>>,
+    haptic_tx:   Option<mpsc::Sender<HapticRequest>>,
     left_tx:     Option<mpsc::Sender<SinglePadFrame>>,
     left_rx:     Option<mpsc::Receiver<SinglePadFrame>>,
     right_tx:    Option<mpsc::Sender<SinglePadFrame>>,
@@ -43,17 +44,31 @@ pub struct TrackpadSession {
     right_movement_pulse: Option<MovementHaptic>,
 
     gesture_pad_config: GesturePadConfig,
+
+    /// Keeps the click-pressure watch channel alive for the session lifetime,
+    /// allowing future dynamic updates (e.g. gaming-mode pressure changes).
+    /// `None` if no hidraw sibling was found for this device.
+    _click_pressure: Option<ClickPressureHandle>,
 }
 
 impl TrackpadSession {
     /// Wires up the full trackpad stack for one device session:
     /// writes KDE libinput defaults, creates virtual MT uinput nodes,
-    /// connects hidraw, parses handler configs, and builds the routing
-    /// channels. Call this before `run` and before anything reads the pad.
+    /// and builds the routing channels. Call this before `run`.
+    ///
+    /// `pad_rx` and `haptic_tx` come from `ControllerSession` — the controller
+    /// already owns the hidraw fd and tasks. No hidraw path is opened here.
+    ///
+    /// `click_pressure` is the `ClickPressureHandle` from `ControllerSession`.
+    /// If the user configured click-pressure thresholds in the trackpad config,
+    /// they are pushed immediately via `handle.set()`. The handle is then stored
+    /// for the session lifetime so future dynamic updates remain possible.
     pub async fn setup(
         trackpad: &TrackpadConfig,
         virt_dev: &Arc<Mutex<VirtualDevices>>,
-        device_path: &std::path::Path,
+        pad_rx: Option<mpsc::Receiver<PadFrame>>,
+        haptic_tx: Option<mpsc::Sender<HapticRequest>>,
+        click_pressure: Option<ClickPressureHandle>,
     ) -> Self {
         // Validate modes early so the warning appears before any device work.
         for (side, mode) in [("left", &trackpad.left.mode), ("right", &trackpad.right.mode)] {
@@ -84,19 +99,6 @@ impl TrackpadSession {
             }
         }
 
-        let (pad_rx, haptic_tx) = match pad_hidraw::spawn(device_path) {
-            Some((rx, tx)) => {
-                (Some(rx), Some(tx))
-            }
-            None => {
-                println!(
-                    "makima: no hidraw sibling found for {:?}, trackpad position/touch will not be available",
-                    device_path
-                );
-                (None, None)
-            }
-        };
-
         // Each handler self-parses its own config slice — Core only knows
         // mode and click_pressure; everything else is handler-owned.
         let left_mt  = MtTrackpadConfig::from_toml_value(&trackpad.left.handler_config);
@@ -122,6 +124,21 @@ impl TrackpadSession {
             (None, None)
         };
 
+        // Push user-configured click-pressure thresholds to the firmware.
+        // Only sent if at least one side has an explicit value in the config;
+        // if neither side is configured, the firmware default stands and we
+        // avoid sending an unnecessary HID feature report.
+        if let Some(ref handle) = click_pressure {
+            let left  = trackpad.left.click_pressure;
+            let right = trackpad.right.click_pressure;
+            if left.is_some() || right.is_some() {
+                handle.set(Some(ClickPressureConfig {
+                    left:  left.unwrap_or(0xFFFF),
+                    right: right.unwrap_or(0xFFFF),
+                }));
+            }
+        }
+
         Self {
             pad_rx,
             haptic_tx,
@@ -138,14 +155,8 @@ impl TrackpadSession {
             right_release_chain:  right_mt.release_chain(),
             right_movement_pulse: right_mt.movement_pulse(),
             gesture_pad_config,
+            _click_pressure: click_pressure,
         }
-    }
-
-    /// Returns a clone of the haptic command sender, if one was established.
-    /// `None` when no hidraw sibling was found (trackpad position not available).
-    /// Used by `EventReader` to fire haptics on Gaming Mode toggle.
-    pub fn haptic_tx(&self) -> Option<mpsc::Sender<HapticCommand>> {
-        self.haptic_tx.clone()
     }
 
     /// Runs the trackpad router and all per-handler tasks until the session

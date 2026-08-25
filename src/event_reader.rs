@@ -2,7 +2,7 @@ use crate::active_client::*;
 use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::device_session::TrackpadSession;
 use crate::mt_trackpad;
-use crate::pad_hidraw::{HapticCommand, HapticPad};
+use deckery_controller::{HapticPad, HapticRequest, LizardModeHandle};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::trackpad::PadState;
@@ -10,7 +10,8 @@ use crate::trackpad_router;
 use crate::udev_monitor::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
-use evdev::{AbsoluteAxisType, EventStream, EventType, InputEvent, Key, RelativeAxisType};
+use deckery_controller::ControllerEvent;
+use evdev::{AbsoluteAxisType, EventType, InputEvent, Key, RelativeAxisType};
 use fork::{fork, setsid, Fork};
 use std::{
     collections::HashMap,
@@ -24,7 +25,6 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::net::UnixListener;
-use tokio_stream::StreamExt;
 
 struct Stick {
     function: String,
@@ -57,7 +57,15 @@ struct Settings {
 
 pub struct EventReader {
     config: Vec<Config>,
-    stream: Arc<Mutex<EventStream>>,
+    /// Receiver for controller events from the reconnecting reader task.
+    /// `ControllerEvent::Input` carries normal evdev events; `Reconnected`
+    /// signals a transparent reconnect (EventReader must release held keys).
+    event_rx: Mutex<mpsc::Receiver<ControllerEvent>>,
+    /// Whether the connected device is a graphics tablet (BTN_TOOL_PEN).
+    /// Queried once at open time and carried here to avoid re-querying on reconnect.
+    is_tablet: bool,
+    /// Maximum absolute axis value across all axes, queried once at open time.
+    max_abs_wheel: i32,
     virt_dev: Arc<Mutex<VirtualDevices>>,
     lstick_position: Arc<Mutex<Vec<i32>>>,
     rstick_position: Arc<Mutex<Vec<i32>>>,
@@ -87,7 +95,6 @@ pub struct EventReader {
     /// when a mid-hold modifier change (e.g. R1) switched the resolution to a combo.
     emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>>,
     device_is_connected: Arc<Mutex<bool>>,
-    device_error_notify: Arc<Notify>,
     active_layout: Arc<Mutex<u16>>,
     current_config: Arc<Mutex<Config>>,
     environment: Environment,
@@ -99,19 +106,21 @@ pub struct EventReader {
     rpad: PadState,
     /// True while a combined gesture session is active.
     gesture_session: Arc<Mutex<bool>>,
-    /// Path of the evdev device this reader is attached to — used to locate the
-    /// corresponding hidraw sibling via sysfs at startup.
-    device_path: std::path::PathBuf,
+    /// Unified hidraw write channel from the controller session.
+    /// Used to fire haptics on Gaming Mode toggle. Cloned into TrackpadSession.
+    haptic_tx: Option<mpsc::Sender<HapticRequest>>,
+    /// Setter handle for Lizard Mode config. Kept here for its lifetime —
+    /// dropping it signals the hidraw writer to exit. Call `lizard_mode.set(cfg)`
+    /// to update suppression settings live without a session reinit.
+    /// `None` for non-Steam-Deck devices (no hidraw writer to signal).
+    _lizard_mode: Option<LizardModeHandle>,
     /// Gaming Mode trigger configuration (from `[gaming_mode]` in the base config).
     /// Stored here so `convert_event` can check it without locking anything.
     gaming_mode_config: GamingModeConfig,
     /// Timestamp of the last Gaming Mode trigger button press.
     /// Used to detect a double-click within `gaming_mode_config.double_click_ms`.
     gaming_mode_trigger_ts: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Haptic command channel, wired from `TrackpadSession` after setup.
-    /// `None` when the hidraw sibling was not found (trackpad position unavailable).
-    haptic_tx: Arc<Mutex<Option<mpsc::Sender<HapticCommand>>>>,
-    /// Sender half of the unified Gaming Mode channel.  Cloned into the IPC
+    /// Sender half of the unified Gaming Mode channel. Cloned into the IPC
     /// handler so external commands (`gaming_mode enable/disable`) go through
     /// the same `gaming_mode_set_loop` as steam auto-detection.
     gaming_mode_tx: mpsc::Sender<bool>,
@@ -122,14 +131,16 @@ impl EventReader {
     pub fn new(
         config: Vec<Config>,
         virt_dev: Arc<Mutex<VirtualDevices>>,
-        stream: Arc<Mutex<EventStream>>,
+        event_rx: mpsc::Receiver<ControllerEvent>,
+        is_tablet: bool,
+        max_abs_wheel: i32,
+        haptic_tx: Option<mpsc::Sender<HapticRequest>>,
+        lizard_mode: Option<LizardModeHandle>,
         modifiers: Arc<Mutex<Vec<Event>>>,
         modifier_was_activated: Arc<Mutex<bool>>,
         environment: Environment,
-        device_error_notify: Arc<Notify>,
         active_client: Arc<Mutex<Client>>,
         window_changed: Arc<Notify>,
-        device_path: std::path::PathBuf,
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
     ) -> Self {
@@ -415,7 +426,9 @@ impl EventReader {
 
         Self {
             config,
-            stream,
+            event_rx: Mutex::new(event_rx),
+            is_tablet,
+            max_abs_wheel,
             virt_dev,
             lstick_position,
             rstick_position,
@@ -434,7 +447,6 @@ impl EventReader {
             held_keys,
             emitted_outputs,
             device_is_connected,
-            device_error_notify,
             active_layout,
             current_config,
             environment,
@@ -445,21 +457,18 @@ impl EventReader {
             lpad: PadState::new(true),
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
-            device_path,
+            haptic_tx,
+            _lizard_mode: lizard_mode,
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
-            haptic_tx: Arc::new(Mutex::new(None)),
             gaming_mode_tx,
         }
     }
 
-    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>) {
+    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>, session: Option<TrackpadSession>) {
         let name = &self.config.iter().find(|&x| x.associations == Associations::default()).unwrap().name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
-        let session = TrackpadSession::setup(&self.trackpad, &self.virt_dev, &self.device_path).await;
-        // Wire the haptic channel so Gaming Mode toggle can fire haptic feedback.
-        *self.haptic_tx.lock().await = session.haptic_tx();
         self.write_state().await;
         self.start_control_socket().await;
 
@@ -472,7 +481,11 @@ impl EventReader {
             self.window_changed_loop(),
             self.gaming_mode_set_loop(gaming_rx),
             self.state_write_loop(state_rx),
-            session.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()),
+            async {
+                if let Some(s) = session {
+                    s.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()).await;
+                }
+            },
         );
     }
 
@@ -502,8 +515,7 @@ impl EventReader {
             println!("makima: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
             let chain = if new_state { &self.gaming_mode_config.haptic_on }
                         else        { &self.gaming_mode_config.haptic_off };
-            let tx = self.haptic_tx.lock().await.clone();
-            mt_trackpad::fire_chain(&tx, HapticPad::Both, chain).await;
+            mt_trackpad::fire_chain(&self.haptic_tx, HapticPad::Both, chain).await;
         }
         let label = if new_state { "Gaming Mode On" } else { "Gaming Mode Off" };
         *self.last_action.lock().await = Some(crate::state_export::LastAction {
@@ -540,46 +552,43 @@ impl EventReader {
             mut triggers_values,
             mut abs_wheel_position,
         ) = ((0, 0), (0, 0), (0, 0), (0, 0), 0);
-        let mut stream = self.stream.lock().await;
+        let mut rx = self.event_rx.lock().await;
         let mut pen_events: Vec<InputEvent> = Vec::new();
-        let is_tablet: bool = stream
-            .device()
-            .supported_keys()
-            .unwrap_or(&evdev::AttributeSet::new())
-            .contains(Key::BTN_TOOL_PEN);
-        let mut max_abs_wheel = 0;
-        if let Ok(abs_state) = stream.device().get_abs_state() {
-            for state in abs_state {
-                if state.maximum > max_abs_wheel {
-                    max_abs_wheel = state.maximum;
-                }
-            }
-        }
-        let mut had_device_error = false;
+        // is_tablet and max_abs_wheel were queried once at device open time
+        // (SteamDeckController::start_event_task) and don't change across reconnects.
+        let is_tablet = self.is_tablet;
+        let max_abs_wheel = self.max_abs_wheel;
         // Dirty flags for stick axes — set whenever ABS_X/Y or ABS_RX/RY arrive.
         let mut lstick_dirty = false;
         let mut rstick_dirty = false;
         // Dirty flag for IMU axes (ABS_HAT2X/Y).
         let mut imu_dirty = false;
         // Rate-limit state.json writes from stick/gyro movement to ~60 Hz.
-        // (Trackpad state.json writes are handled by trackpad_router, driven by hidraw
-        // frames — see pad_hidraw.rs.)
+        // (Trackpad state.json writes are handled by trackpad_router, driven by hidraw frames.)
         let mut last_stick_state_write = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_millis(17))
             .unwrap_or(std::time::Instant::now());
         loop {
-            let event = match stream.next().await {
-                Some(Ok(e)) => e,
-                Some(Err(e)) => {
-                    println!(
-                        "[makima] Device read error on \"{}\": {} — signaling reconnect.",
-                        self.current_config.lock().await.name,
-                        e
-                    );
-                    had_device_error = true;
+            let event = match rx.recv().await {
+                Some(ControllerEvent::Input(e)) => e,
+                Some(ControllerEvent::Reconnected) => {
+                    // Device briefly disappeared (suspend/resume). Release all held
+                    // output keys so the compositor doesn't see stuck modifiers.
+                    self.release_all_held().await;
+                    continue;
+                }
+                Some(ControllerEvent::ReleaseAll) => {
+                    // Another process is about to grab the device exclusively.
+                    // Release all held output keys immediately to avoid stuck keys
+                    // while the grab is active.
+                    self.release_all_held().await;
+                    continue;
+                }
+                None => {
+                    // Channel closed: the reconnecting task gave up (device genuinely
+                    // gone, device_error_notify already fired by that task).
                     break;
                 }
-                None => break,
             };
             match (
                 event.event_type(),
@@ -600,11 +609,11 @@ impl EventReader {
                         pen_events.push(event)
                     }
                     // Left trackpad physical click (BTN_THUMB) is read directly
-                    // from hidraw by trackpad_router instead (see pad_hidraw.rs —
-                    // click lives in the same byte as touch, so it comes in
-                    // atomically with position/touch there). Swallow it here so
-                    // it doesn't fall through to emit_default_event and leak
-                    // onto the generic key device.
+                    // from hidraw by trackpad_router instead — click lives in
+                    // the same hidraw byte as touch, so it arrives atomically
+                    // with position/touch. Swallow it here so it doesn't fall
+                    // through to emit_default_event and leak onto the generic
+                    // key device.
                     Key::BTN_THUMB if self.trackpad.left.mode == "mt-trackpad" => {}
                     // Right trackpad physical click (BTN_THUMB2) — same as above.
                     Key::BTN_THUMB2 if self.trackpad.right.mode == "mt-trackpad" => {}
@@ -664,8 +673,8 @@ impl EventReader {
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
                 (_, _, AbsoluteAxisType::ABS_HAT0X, _) => {
                     // Trackpad position/touch now comes from hidraw (trackpad_router) in
-                    // MtTrackpad mode — see pad_hidraw.rs. This handler only remains
-                    // for the D-pad hat-switch case on non-Steam-Deck controllers.
+                    // MtTrackpad mode. This handler only remains for the D-pad
+                    // hat-switch case on non-Steam-Deck controllers.
                     if self.trackpad.left.mode != "mt-trackpad" {
                         match event.value() {
                             -1 => {
@@ -708,8 +717,8 @@ impl EventReader {
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT0Y, _) => {
                     // Trackpad position/touch now comes from hidraw (trackpad_router) in
-                    // MtTrackpad mode — see pad_hidraw.rs. This handler only remains
-                    // for the D-pad hat-switch case on non-Steam-Deck controllers.
+                    // MtTrackpad mode. This handler only remains for the D-pad
+                    // hat-switch case on non-Steam-Deck controllers.
                     if self.trackpad.left.mode != "mt-trackpad" {
                         match event.value() {
                             -1 => {
@@ -751,8 +760,8 @@ impl EventReader {
                     }
                 }
                 // RPAD position (ABS_HAT1X/Y) is read directly from hidraw by trackpad_router
-                // instead (see pad_hidraw.rs) — swallow these here so they don't fall
-                // through to emit_default_event and leak onto the generic ABS device.
+                // instead — swallow these here so they don't fall through to
+                // emit_default_event and leak onto the generic ABS device.
                 (_, _, AbsoluteAxisType::ABS_HAT1X | AbsoluteAxisType::ABS_HAT1Y, _) => {}
                 // IMU (gyroscope/accelerometer): ABS_HAT2X/Y, range 0..32767.
                 // Stored for state export; not forwarded.
@@ -1241,9 +1250,9 @@ impl EventReader {
                 }
                 (EventType::SYNCHRONIZATION, _, _, _) => {
                     // Trackpad handling (position, touch, gestures, its own state.json
-                    // writes) has moved entirely to trackpad_router, driven by hidraw frames —
-                    // see pad_hidraw.rs. This SYN handler now only rate-limits
-                    // state.json writes triggered by stick/gyro movement.
+                    // writes) has moved entirely to trackpad_router, driven by hidraw
+                    // frames. This SYN handler now only rate-limits state.json writes
+                    // triggered by stick/gyro movement.
                     let stick_changed = lstick_dirty || rstick_dirty || imu_dirty;
                     if lstick_dirty { lstick_dirty = false; }
                     if rstick_dirty { rstick_dirty = false; }
@@ -1256,9 +1265,8 @@ impl EventReader {
                 _ => self.emit_default_event(event).await,
             }
         }
-        if had_device_error {
-            self.device_error_notify.notify_one();
-        }
+        // device_error_notify is fired by the reconnecting reader task (in
+        // steam_deck_controller) when it gives up — no need to fire it here.
         let mut device_is_connected = self.device_is_connected.lock().await;
         *device_is_connected = false;
 
@@ -1266,6 +1274,30 @@ impl EventReader {
             "Disconnected device \"{}\".\n",
             self.current_config.lock().await.name
         );
+    }
+
+    /// Release all currently held output keys and clear modifier/held-key state.
+    ///
+    /// Called on `ControllerEvent::Reconnected` after a suspend/resume cycle.
+    /// Emits key-up events for all keys tracked in `emitted_outputs` (the
+    /// actual output keys that got stuck) and clears `modifiers` and `held_keys`
+    /// so combo and HUD state don't carry stale data across the reconnect.
+    async fn release_all_held(&self) {
+        let mut vd = self.virt_dev.lock().await;
+        // Release all tracked emitted output keys.
+        let mut eo = self.emitted_outputs.lock().await;
+        for (_input_ev, output_keys) in eo.drain() {
+            for key in output_keys {
+                let _ = vd.keys.emit(&[InputEvent::new_now(EventType::KEY, key.code(), 0)]);
+            }
+        }
+        drop(eo);
+        // Release modifier output keys (e.g. Shift held via L4).
+        // `modifiers` tracks input events but those that map to output keys will
+        // already be in `emitted_outputs`; we clear modifiers to reset combo state.
+        self.modifiers.lock().await.clear();
+        // Clear HUD held-key state.
+        self.held_keys.lock().await.clear();
     }
 
     /// Bridges `trackpad_router::run`'s state-write *requests* to the actual

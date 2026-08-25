@@ -3,11 +3,12 @@ use evdev::{EventType, InputEvent, Key};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Per-pad state shared between the pad hidraw reader (`pad_hidraw.rs`,
-/// writes position/touching) and the rest of makima (reads them for state
-/// export, click forwarding, etc). Position and touch state are always
-/// written together as one atomic frame by `EventReader::pad_loop` — see
-/// `pad_hidraw.rs` for why that atomicity matters.
+/// Per-pad state shared between the pad hidraw reader
+/// (`steam_deck_controller/hidraw.rs`, writes position/touching) and the rest
+/// of makima (reads them for state export, click forwarding, etc). Position
+/// and touch state are always written together as one atomic frame by the
+/// trackpad router — atomicity matters so readers never see a stale position
+/// paired with an updated touch flag.
 pub struct PadState {
     is_left: bool,
     pub position: Arc<Mutex<(i32, i32)>>,
@@ -69,11 +70,10 @@ impl PadState {
 /// Emit a combined two-finger gesture event to the gesture pad device.
 /// `l_touching` / `r_touching` must come from hidraw hardware state.
 /// Pass both `false` to force a clean lift on both slots (gesture exit).
-/// `click` is the combined click state (`pad_hidraw::combined_click` — a
-/// physical click on either half of the pad while a gesture session is
-/// active reads as one click on this device) — `None` leaves BTN_LEFT
-/// untouched, e.g. for the initial "both pads just started touching" frame
-/// where a stale click value doesn't matter yet.
+/// `click` is the combined click state — a physical click on either half of
+/// the pad while a gesture session is active reads as one click on this
+/// device. `None` leaves BTN_LEFT untouched, e.g. for the initial "both pads
+/// just started touching" frame where a stale click value doesn't matter yet.
 pub async fn emit_gesture_event(
     virt_dev: &Arc<Mutex<VirtualDevices>>,
     lx: i32,
