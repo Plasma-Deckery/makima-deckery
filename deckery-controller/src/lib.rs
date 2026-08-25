@@ -36,10 +36,12 @@
 //! let session = controller.start(false, Arc::new(Notify::new()), None);
 //! ```
 
+pub mod grab_coordinator;
 pub mod haptic;
 pub mod hidraw;
 pub mod lizard_mode;
 pub mod resume_watcher;
+pub mod yield_protocol;
 
 // Re-export the types that consumers need so they import from here,
 // not from the internal submodule. This is the stable public API surface.
@@ -172,6 +174,10 @@ pub enum ControllerEvent {
     /// The device briefly disappeared and has just come back (suspend/resume).
     /// The consumer must release all held output keys to avoid stuck modifiers.
     Reconnected,
+    /// Another process is about to grab the device exclusively.
+    /// The consumer must release all held output keys immediately so they do
+    /// not remain stuck while the grab is active.
+    ReleaseAll,
 }
 
 // ── ControllerSession ────────────────────────────────────────────────────────
@@ -215,23 +221,33 @@ pub struct ControllerSession {
 /// Owns the device paths (evdev + hidraw) discovered at construction time.
 /// Call `start()` to spawn all internal tasks and receive a `ControllerSession`.
 pub struct SteamDeckController {
-    pub evdev_path: PathBuf,
+    pub evdev_path:  PathBuf,
     /// Raw controller hidraw path. `None` on non-Steam Deck hardware or if
     /// sysfs traversal failed.
     pub hidraw_path: Option<PathBuf>,
+    /// If `true`, this session subscribes to `GrabPending` D-Bus signals and
+    /// forwards them as `ControllerEvent::ReleaseAll`. Set for consumers that
+    /// do not hold the grab themselves (e.g. makima) so they can flush held
+    /// output keys before the grabbing session acquires `EVIOCGRAB`.
+    pub yieldable:   bool,
 }
 
 impl SteamDeckController {
     /// Construct from a known evdev device path.
     ///
+    /// `yieldable`: set `true` for makima (no grab, should yield on request),
+    /// `false` for the auth daemon (holds the grab, is the requester).
+    ///
     /// Immediately discovers the hidraw sibling via sysfs — a synchronous read
     /// that completes in microseconds.
-    pub fn from_evdev(evdev_path: &Path) -> Self {
+    pub fn from_evdev(evdev_path: &Path, yieldable: bool) -> Self {
         let hidraw_path = find_controller_hidraw_for_evdev(evdev_path);
-        Self { evdev_path: evdev_path.to_path_buf(), hidraw_path }
+        Self { evdev_path: evdev_path.to_path_buf(), hidraw_path, yieldable }
     }
 
     /// Find the Steam Deck controller by known device names (standalone path).
+    ///
+    /// `yieldable`: see `from_evdev`.
     ///
     /// Scans `/dev/input/event*` for a device whose name matches one of the
     /// entries in `KNOWN_DEVICE_NAMES`. Returns `None` if no match is found
@@ -240,64 +256,75 @@ impl SteamDeckController {
     /// For makima: use `from_evdev` instead — the udev_monitor already has the
     /// path via config-file-name matching. `find()` is for callers without
     /// makima infrastructure (`deckery-auth`, standalone tools).
-    pub fn find() -> Option<Self> {
+    pub fn find(yieldable: bool) -> Option<Self> {
         for (path, device) in evdev::enumerate() {
             if let Some(name) = device.name() {
                 if is_known_device_name(name) {
-                    return Some(Self::from_evdev(&path));
+                    return Some(Self::from_evdev(&path, yieldable));
                 }
             }
         }
         None
     }
 
-    /// Consume the controller and spawn all internal tasks. Returns a
-    /// `ControllerSession` with the caller-facing channel ends, or `None` if
-    /// the device cannot be opened (permission denied, path not found, device
-    /// disappeared mid-scan).
+    /// Consume the controller and spawn all internal tasks. Returns the
+    /// `ControllerSession` with caller-facing channel ends, or an `io::Error`
+    /// if the device cannot be opened.
     ///
-    /// Takes `self` by value — the `SteamDeckController` is not needed after
-    /// the session is created; consuming it makes this explicit in the type
-    /// system.
+    /// When `grab=true`, the yield protocol runs first: emits `GrabPending` on
+    /// the system D-Bus so yieldable sessions flush held keys, then retries
+    /// `EVIOCGRAB` until success or timeout.
+    /// When `grab=false`, the device is opened without exclusive access.
     ///
     /// Spawns on success:
     /// - reconnecting evdev reader (suspend-transparent `ControllerEvent` stream)
+    /// - if `yieldable`: D-Bus listener for `GrabPending` → `ControllerEvent::ReleaseAll`
     /// - hidraw reader → `pad_rx`
     /// - hidraw writer (serialises haptics + Lizard Mode heartbeat onto one fd)
-    ///
-    /// Spawns the resume watcher internally — no external `Notify` needed.
-    /// The watcher fires on logind `PrepareForSleep(false)` and triggers a
-    /// proactive evdev reconnect before the first post-suspend event arrives.
-    pub fn start(
+    pub async fn start(
         self,
         grab: bool,
         device_error_notify: Arc<Notify>,
         initial_lizard_cfg: Option<LizardModeSuppression>,
-    ) -> Option<ControllerSession> {
-        // ── evdev + suspend/resume ──
-        let stream = match Self::open_event_stream_inner(&self.evdev_path, grab) {
-            Ok(s) => {
-                if grab {
-                    println!("deckery-controller: grabbed {:?} (exclusive evdev access)", self.evdev_path);
-                } else {
-                    println!("deckery-controller: opened {:?} (no grab)", self.evdev_path);
-                }
-                s
-            }
-            Err(e) => {
-                eprintln!(
-                    "deckery-controller: cannot open {:?}: {} — skipping device",
-                    self.evdev_path, e
-                );
-                return None;
-            }
+    ) -> std::io::Result<ControllerSession> {
+        let stream = if grab {
+            let s = yield_protocol::open_grabbed(&self.evdev_path).await?;
+            println!("deckery-controller: grabbed {:?} (exclusive evdev access)", self.evdev_path);
+            s
+        } else {
+            let s = Self::open_event_stream_inner(&self.evdev_path)?;
+            println!("deckery-controller: opened {:?} (no grab)", self.evdev_path);
+            s
         };
-        // The resume watcher is tightly coupled to the reconnecting reader task.
+        Ok(self.spawn_tasks(stream, grab, device_error_notify, initial_lizard_cfg))
+    }
+
+    // ── Private helpers ──────────────────────────────────────────────────────
+
+    /// Spawn all background tasks for a session whose evdev stream is already open.
+    ///
+    /// Called by both `start()` (after opening the device) and `start_from_stream()`
+    /// (after the caller opened it via the yield protocol).
+    fn spawn_tasks(
+        self,
+        stream: EventStream,
+        grab: bool,
+        device_error_notify: Arc<Notify>,
+        initial_lizard_cfg: Option<LizardModeSuppression>,
+    ) -> ControllerSession {
         let resume_notify = Arc::new(Notify::new());
         tokio::spawn(resume_watcher::start_resume_watcher(resume_notify.clone()));
 
         let (event_tx, event_rx) = mpsc::channel(64);
         let path = self.evdev_path.clone();
+
+        if self.yieldable {
+            grab_coordinator::spawn_grab_listener(
+                path.to_string_lossy().into_owned(),
+                event_tx.clone(),
+            );
+        }
+
         tokio::spawn(reconnecting_reader_task(
             stream,
             path,
@@ -307,7 +334,6 @@ impl SteamDeckController {
             device_error_notify,
         ));
 
-        // ── hidraw + Lizard Mode + Click Pressure ──
         let (lizard_tx,         lizard_rx)         = watch::channel(initial_lizard_cfg);
         let (click_pressure_tx, click_pressure_rx) = watch::channel::<Option<ClickPressureConfig>>(None);
         let (pad_rx, haptic_tx, click_pressure) = match &self.hidraw_path {
@@ -316,7 +342,6 @@ impl SteamDeckController {
                 (Some(rx), Some(tx), Some(ClickPressureHandle(click_pressure_tx)))
             }
             None => {
-                // No hidraw — drop both receivers; handles become no-ops.
                 drop(lizard_rx);
                 drop(click_pressure_rx);
                 drop(click_pressure_tx);
@@ -328,23 +353,17 @@ impl SteamDeckController {
             }
         };
 
-        Some(ControllerSession {
+        ControllerSession {
             event_rx,
             pad_rx,
             haptic_tx,
             lizard_mode: LizardModeHandle(lizard_tx),
             click_pressure,
-        })
+        }
     }
 
-    // ── Private helpers ──────────────────────────────────────────────────────
-
-    fn open_event_stream_inner(evdev_path: &Path, grab: bool) -> std::io::Result<EventStream> {
-        let mut device = Device::open(evdev_path)?;
-        if grab {
-            device.grab()?;
-        }
-        device.into_event_stream()
+    fn open_event_stream_inner(evdev_path: &Path) -> std::io::Result<EventStream> {
+        Device::open(evdev_path)?.into_event_stream()
     }
 }
 
@@ -508,7 +527,7 @@ mod tests {
 
     #[test]
     fn steam_deck_controller_from_nonexistent_evdev_has_no_hidraw() {
-        let ctrl = SteamDeckController::from_evdev(Path::new("/dev/input/event99999"));
+        let ctrl = SteamDeckController::from_evdev(Path::new("/dev/input/event99999"), false);
         assert_eq!(ctrl.evdev_path, PathBuf::from("/dev/input/event99999"));
         assert!(ctrl.hidraw_path.is_none());
     }
@@ -523,6 +542,6 @@ mod tests {
     fn find_does_not_panic() {
         // find() scans live evdev nodes — result is hardware-dependent.
         // This test only verifies it doesn't panic and returns a consistent type.
-        let _result: Option<SteamDeckController> = SteamDeckController::find();
+        let _result: Option<SteamDeckController> = SteamDeckController::find(false);
     }
 }
