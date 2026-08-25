@@ -403,14 +403,17 @@ pub async fn launch_tasks(
             let (event_rx, pad_rx, haptic_tx, lizard_mode, click_pressure) = if is_steam_deck {
                 // Full Steam Deck path — hidraw reader/writer + Lizard Mode heartbeat
                 // are all spawned inside controller.start().
-                let controller = SteamDeckController::from_evdev(Path::new(&event_device));
+                let controller = SteamDeckController::from_evdev(Path::new(&event_device), /*yieldable=*/ true);
                 let session = match controller.start(
                     grab,
                     device_error_notify.clone(),
                     lizard_cfg.clone(),
-                ) {
-                    Some(s) => s,
-                    None => continue, // device disappeared between scan and open
+                ).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("makima: cannot open {:?}: {} — skipping device", event_device, e);
+                        continue;
+                    }
                 };
                 (session.event_rx, session.pad_rx, session.haptic_tx, Some(session.lizard_mode), session.click_pressure)
             } else {

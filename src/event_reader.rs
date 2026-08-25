@@ -577,6 +577,13 @@ impl EventReader {
                     self.release_all_held().await;
                     continue;
                 }
+                Some(ControllerEvent::ReleaseAll) => {
+                    // Another process is about to grab the device exclusively.
+                    // Release all held output keys immediately to avoid stuck keys
+                    // while the grab is active.
+                    self.release_all_held().await;
+                    continue;
+                }
                 None => {
                     // Channel closed: the reconnecting task gave up (device genuinely
                     // gone, device_error_notify already fired by that task).
