@@ -5,6 +5,7 @@ use crate::mt_trackpad;
 use deckery_controller::{HapticPad, HapticRequest, LizardModeHandle};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
+use crate::state_writer::{StateWriterHandle, StateCommand};
 use crate::trackpad::PadState;
 use crate::trackpad_router;
 use crate::udev_monitor::{Client, Environment, Server};
@@ -124,6 +125,9 @@ pub struct EventReader {
     /// handler so external commands (`gaming_mode enable/disable`) go through
     /// the same `gaming_mode_set_loop` as steam auto-detection.
     gaming_mode_tx: mpsc::Sender<bool>,
+    /// Channel to the central state writer task. All state.json writes go
+    /// through this sender — EventReader never touches the file directly.
+    state_tx: StateWriterHandle,
 }
 
 
@@ -143,6 +147,7 @@ impl EventReader {
         window_changed: Arc<Notify>,
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
+        state_tx: StateWriterHandle,
     ) -> Self {
         let mut position_vector: Vec<i32> = Vec::new();
         for i in [0, 0] {
@@ -462,6 +467,7 @@ impl EventReader {
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
             gaming_mode_tx,
+            state_tx,
         }
     }
 
@@ -2101,7 +2107,15 @@ impl EventReader {
             "x": crate::analog::normalize(imu_raw.0),
             "y": crate::analog::normalize(imu_raw.1),
         });
-        crate::state_export::write_state(&config, &modifiers, layout, paused, gaming_mode, &held_keys, &last_action, &config_stack, &self.gaming_mode_config, trackpads, sticks, imu, analog_state_export).await;
+        let mut event_state = crate::state_export::build_state(
+            &config, &modifiers, layout, paused, gaming_mode,
+            &held_keys, &last_action, &config_stack, &self.gaming_mode_config,
+        );
+        event_state["trackpads"] = trackpads;
+        event_state["sticks"]    = sticks;
+        event_state["imu"]       = imu;
+        event_state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
+        let _ = self.state_tx.try_send(StateCommand::SetEventState(Some(event_state)));
     }
 
     /// Record the actual emitted key output for the HUD last-event display.

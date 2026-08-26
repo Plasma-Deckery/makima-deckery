@@ -11,6 +11,7 @@ use std::{env, path::{Path, PathBuf}, process::Command, sync::Arc};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use crate::kwin_watcher;
+use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle, Severity};
 use tokio_stream::StreamExt;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -89,7 +90,7 @@ fn lizard_cfg_from_config(config_files: &[Config]) -> Option<LizardModeSuppressi
     LizardModeSuppression::from_setting(setting)
 }
 
-pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: String, mut tasks: Vec<JoinHandle<()>>, gaming_mode: Arc<Mutex<bool>>) {
+pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: String, mut tasks: Vec<JoinHandle<()>>, gaming_mode: Arc<Mutex<bool>>, state_tx: StateWriterHandle) {
     let environment = set_environment();
     let device_error_notify = Arc::new(Notify::new());
     let active_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::Default));
@@ -111,7 +112,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
     // Declared `mut` so the config-reload arm can recompute it from fresh config.
     let mut lizard_cfg = lizard_cfg_from_config(&config_files);
 
-    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), lizard_cfg.clone(), gaming_mode.clone()).await;
+    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), lizard_cfg.clone(), gaming_mode.clone(), state_tx.clone()).await;
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -179,7 +180,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                             task.abort();
                         }
                         tasks.clear();
-                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), lizard_cfg.clone(), gaming_mode.clone()).await;
+                        (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), lizard_cfg.clone(), gaming_mode.clone(), state_tx.clone()).await;
                     }
                 }
             }
@@ -193,7 +194,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), lizard_cfg.clone(), gaming_mode.clone()).await;
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), lizard_cfg.clone(), gaming_mode.clone(), state_tx.clone()).await;
             }
             Some(_) = config_rx.recv() => {
                 // Debounce: drain any queued events, then wait briefly for the
@@ -210,7 +211,7 @@ pub async fn start_monitoring_udev(mut config_files: Vec<Config>, config_dir: St
                     task.abort();
                 }
                 tasks.clear();
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), lizard_cfg.clone(), gaming_mode.clone()).await;
+                (prev_virt_dev, prev_modifiers) = launch_tasks(&config_files, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), lizard_cfg.clone(), gaming_mode.clone(), state_tx.clone()).await;
             }
         }
     }
@@ -253,6 +254,7 @@ pub async fn launch_tasks(
     window_changed: Arc<Notify>,
     lizard_cfg: Option<LizardModeSuppression>,
     gaming_mode: Arc<Mutex<bool>>,
+    state_tx: StateWriterHandle,
 ) -> (Option<Arc<Mutex<VirtualDevices>>>, Arc<Mutex<Vec<Event>>>) {
     // Unified Gaming Mode channel: steam detection and IPC both send here.
     // The EventReader's gaming_mode_set_loop is the sole consumer.
@@ -475,16 +477,36 @@ pub async fn launch_tasks(
                 window_changed.clone(),
                 gaming_mode.clone(),
                 gaming_mode_tx.clone(),
+                state_tx.clone(),
             );
             tasks.push(tokio::spawn(start_reader(reader, gaming_rx, session)));
             devices_found += 1
         }
     }
-    if devices_found == 0 && !user_has_access {
-        println!("No matching devices found.\nNote: make sure that your user has access to event devices.\n");
-    } else if devices_found == 0 && user_has_access {
-        println!("No matching devices found.\nNote: double-check that your device and its associated config file have the same name, as reported by 'evtest'.\n");
+
+    // Lifecycle: scan complete — transition to "ready" regardless of result.
+    // Error slot: set when no device found, clear when at least one is active.
+    let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Ready));
+    if devices_found == 0 {
+        if !user_has_access {
+            println!("No matching devices found.\nNote: make sure that your user has access to event devices.\n");
+            let _ = state_tx.try_send(StateCommand::SetError {
+                id:       "no_device".to_string(),
+                message:  "No matching device found — user may lack event device access".to_string(),
+                severity: Severity::Error,
+            });
+        } else {
+            println!("No matching devices found.\nNote: double-check that your device and its associated config file have the same name, as reported by 'evtest'.\n");
+            let _ = state_tx.try_send(StateCommand::SetError {
+                id:       "no_device".to_string(),
+                message:  "No matching device found — check device name matches config file name".to_string(),
+                severity: Severity::Error,
+            });
+        }
+    } else {
+        let _ = state_tx.try_send(StateCommand::ClearError { id: "no_device".to_string() });
     }
+
     (virt_dev_holder, modifiers)
 }
 

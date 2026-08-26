@@ -11,6 +11,7 @@ mod mt_trackpad;
 mod resolver;
 mod scroll_pad;
 mod state_export;
+mod state_writer;
 mod trackball;
 mod trackpad;
 mod trackpad_router;
@@ -107,7 +108,8 @@ async fn main() {
     };
     let config_files = load_config_files(&config_dir);
     eprintln!("deckery: config loaded, +{}ms since startup", startup_ms());
+    let state_tx = state_writer::spawn_state_writer();
     let tasks: Vec<JoinHandle<()>> = Vec::new();
     let gaming_mode: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    start_monitoring_udev(config_files, config_dir, tasks, gaming_mode).await;
+    start_monitoring_udev(config_files, config_dir, tasks, gaming_mode, state_tx).await;
 }
