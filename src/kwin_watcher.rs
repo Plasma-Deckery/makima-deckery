@@ -98,7 +98,7 @@ pub async fn start_kwin_watcher(
     notify: Arc<Notify>,
 ) {
     if let Err(e) = std::fs::write(SCRIPT_PATH, KWIN_SCRIPT) {
-        eprintln!("makima: kwin_watcher: failed to write script: {e}");
+        eprintln!("deckery: kwin_watcher: failed to write script: {e}");
         return;
     }
 
@@ -116,12 +116,12 @@ pub async fn start_kwin_watcher(
         Ok(builder) => match builder.build().await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("makima: kwin_watcher: D-Bus connection failed: {e}");
+                eprintln!("deckery: kwin_watcher: D-Bus connection failed: {e}");
                 return;
             }
         },
         Err(e) => {
-            eprintln!("makima: kwin_watcher: D-Bus setup failed: {e}");
+            eprintln!("deckery: kwin_watcher: D-Bus setup failed: {e}");
             return;
         }
     };
@@ -140,7 +140,7 @@ pub async fn start_kwin_watcher(
         match scripting.load_script(SCRIPT_PATH, PLUGIN_NAME).await {
             Ok(id) => {
                 println!(
-                    "makima: kwin_watcher: script loaded (id {id}), window-activation events enabled. +{}ms since startup",
+                    "deckery: kwin_watcher: script loaded (id {id}), window-activation events enabled. +{}ms since startup",
                     crate::startup_ms()
                 );
                 let _ = scripting.start().await;

@@ -438,7 +438,7 @@ pub async fn write_state(
                 let _ = std::fs::rename(tmp_path, final_path);
             }
         }
-        Err(e) => eprintln!("makima: state export failed: {}", e),
+        Err(e) => eprintln!("deckery: state export failed: {}", e),
     }
 }
 

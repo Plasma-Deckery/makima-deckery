@@ -37,6 +37,21 @@ pub fn startup_ms() -> u128 {
     START.get().map(|s| s.elapsed().as_millis()).unwrap_or(0)
 }
 
+fn wait_for_config_dir(path: &str) {
+    if std::path::Path::new(path).is_dir() {
+        return;
+    }
+    eprintln!("deckery: config dir {:?} not found — waiting (tray may still be seeding)", path);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if std::path::Path::new(path).is_dir() {
+            eprintln!("deckery: config dir {:?} appeared, continuing startup", path);
+            return;
+        }
+        eprintln!("deckery: still waiting for config dir {:?}", path);
+    }
+}
+
 pub fn load_config_files(config_dir: &str) -> Vec<Config> {
     let dir = match std::fs::read_dir(config_dir) {
         Ok(d) => d,
@@ -67,13 +82,12 @@ async fn main() {
         default_hook(info);
         std::process::exit(1);
     }));
-    let config_dir = match env::var("MAKIMA_CONFIG") {
+    // DECKERY_CONFIG is the canonical env var; MAKIMA_CONFIG is the legacy name
+    // kept for backwards compatibility with hand-edited service overrides.
+    let config_dir = match env::var("DECKERY_CONFIG").or_else(|_| env::var("MAKIMA_CONFIG")) {
         Ok(path) => {
-            println!("\nMAKIMA_CONFIG set to {:?}.\n", path);
-            if !std::path::Path::new(&path).is_dir() {
-                println!("Directory not found, exiting Makima.");
-                std::process::exit(0);
-            }
+            eprintln!("deckery: config dir: {:?}", path);
+            wait_for_config_dir(&path);
             path
         }
         Err(_) => {
@@ -85,35 +99,14 @@ async fn main() {
                 Ok(user_home) => user_home,
                 _ => "/root".to_string(),
             };
-            let user_config_path = format!("{}/.config/makima", user_home);
-            // System-wide fallback: used when installed via RPM without per-user config.
-            // The deckery RPM meta-package installs default configs here.
-            let system_config_path = "/usr/share/makima-deckery/configs";
-            if std::path::Path::new(&user_config_path).is_dir() {
-                println!(
-                    "\nMAKIMA_CONFIG environment variable is not set, using {:?}.\n",
-                    user_config_path
-                );
-                user_config_path
-            } else if std::path::Path::new(system_config_path).is_dir() {
-                println!(
-                    "\nMAKIMA_CONFIG environment variable is not set. \
-                     No user config found at {:?}, falling back to system default at {:?}.\n",
-                    user_config_path, system_config_path
-                );
-                system_config_path.to_string()
-            } else {
-                println!(
-                    "\nMAKIMA_CONFIG environment variable is not set. \
-                     No config found at {:?} or {:?}, exiting.\n",
-                    user_config_path, system_config_path
-                );
-                std::process::exit(0);
-            }
+            let path = format!("{}/.config/deckery", user_home);
+            eprintln!("deckery: DECKERY_CONFIG not set, using {:?}", path);
+            wait_for_config_dir(&path);
+            path
         }
     };
     let config_files = load_config_files(&config_dir);
-    println!("makima: config loaded, +{}ms since startup", startup_ms());
+    eprintln!("deckery: config loaded, +{}ms since startup", startup_ms());
     let tasks: Vec<JoinHandle<()>> = Vec::new();
     let gaming_mode: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     start_monitoring_udev(config_files, config_dir, tasks, gaming_mode).await;

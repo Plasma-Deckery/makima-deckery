@@ -1,5 +1,5 @@
 #SAMPLE CONFIG FILE FOR PLAYSTATION 2 CONTROLLERS
-#Put this in ~/.config/makima and rename it to the exact name of the device as shown by the 'evtest' command, including spaces and capitalization. Omit "/" if present.
+#Put this in ~/.config/deckery and rename it to the exact name of the device as shown by the 'evtest' command, including spaces and capitalization. Omit "/" if present.
 #You can find all the available keycodes in /usr/include/linux/input-event-codes.h
 #If you're not sure which keycode corresponds to which key, you can run 'evtest', select your device and press the corresponding key/button.
 #Relative and absolute axis events are hard coded, for example use RSTICK_UP, RSTICK_DOWN etc to rebind your analog stick.

@@ -512,7 +512,7 @@ impl EventReader {
     async fn set_gaming_mode(&self, new_state: bool, paused: bool) {
         if !paused {
             *self.gaming_mode.lock().await = new_state;
-            println!("makima: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
+            println!("deckery: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
             let chain = if new_state { &self.gaming_mode_config.haptic_on }
                         else        { &self.gaming_mode_config.haptic_off };
             mt_trackpad::fire_chain(&self.haptic_tx, HapticPad::Both, chain).await;
@@ -537,14 +537,14 @@ impl EventReader {
     async fn gaming_mode_set_loop(&self, mut rx: mpsc::Receiver<bool>) {
         while let Some(new_state) = rx.recv().await {
             if new_state != *self.gaming_mode.lock().await {
-                println!("makima: Gaming Mode trigger — channel, new_state={}", new_state);
+                println!("deckery: Gaming Mode trigger — channel, new_state={}", new_state);
                 self.set_gaming_mode(new_state, false).await;
             }
         }
     }
 
     pub async fn event_loop(&self) {
-        println!("makima: event_loop: started.");
+        println!("deckery: event_loop: started.");
         let (
             mut dpad_values,
             mut lstick_values,
@@ -1394,7 +1394,7 @@ impl EventReader {
                     *ts = None;
                     drop(ts);
                     let new_state = !*self.gaming_mode.lock().await;
-                    println!("makima: Gaming Mode trigger — double-click (paused={})", paused);
+                    println!("deckery: Gaming Mode trigger — double-click (paused={})", paused);
                     self.set_gaming_mode(new_state, paused).await;
                     return;
                 } else {
@@ -1949,21 +1949,21 @@ impl EventReader {
         let config = match tokio::time::timeout(TIMEOUT, self.current_config.lock()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
-                eprintln!("makima: write_state: current_config lock timed out — possible deadlock");
+                eprintln!("deckery: write_state: current_config lock timed out — possible deadlock");
                 return;
             }
         };
         let modifiers = match tokio::time::timeout(TIMEOUT, self.modifiers.lock()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
-                eprintln!("makima: write_state: modifiers lock timed out — possible deadlock");
+                eprintln!("deckery: write_state: modifiers lock timed out — possible deadlock");
                 return;
             }
         };
         let layout = match tokio::time::timeout(TIMEOUT, self.active_layout.lock()).await {
             Ok(guard) => *guard,
             Err(_) => {
-                eprintln!("makima: write_state: active_layout lock timed out — possible deadlock");
+                eprintln!("deckery: write_state: active_layout lock timed out — possible deadlock");
                 return;
             }
         };
@@ -1971,28 +1971,28 @@ impl EventReader {
         let paused = match tokio::time::timeout(TIMEOUT, self.paused.lock()).await {
             Ok(guard) => *guard,
             Err(_) => {
-                eprintln!("makima: write_state: paused lock timed out — possible deadlock");
+                eprintln!("deckery: write_state: paused lock timed out — possible deadlock");
                 return;
             }
         };
         let gaming_mode = match tokio::time::timeout(TIMEOUT, self.gaming_mode.lock()).await {
             Ok(guard) => *guard,
             Err(_) => {
-                eprintln!("makima: write_state: gaming_mode lock timed out — possible deadlock");
+                eprintln!("deckery: write_state: gaming_mode lock timed out — possible deadlock");
                 return;
             }
         };
         let last_action = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
-                eprintln!("makima: write_state: last_action lock timed out — possible deadlock");
+                eprintln!("deckery: write_state: last_action lock timed out — possible deadlock");
                 return;
             }
         };
         let held_keys = match tokio::time::timeout(TIMEOUT, self.held_keys.lock()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
-                eprintln!("makima: write_state: held_keys lock timed out — possible deadlock");
+                eprintln!("deckery: write_state: held_keys lock timed out — possible deadlock");
                 return;
             }
         };
@@ -2164,7 +2164,7 @@ impl EventReader {
             let listener = match UnixListener::bind("/tmp/makima-control.sock") {
                 Ok(listener) => listener,
                 Err(e) => {
-                    eprintln!("makima: control socket bind failed: {}", e);
+                    eprintln!("deckery: control socket bind failed: {}", e);
                     return;
                 }
             };
@@ -2194,7 +2194,7 @@ impl EventReader {
                                     // gaming_mode_set_loop applies the change,
                                     // fires haptics, and writes state.
                                     let new_state = cmd == "gaming_mode enable";
-                                    println!("makima: Gaming Mode trigger — IPC command: {}", cmd);
+                                    println!("deckery: Gaming Mode trigger — IPC command: {}", cmd);
                                     let _ = gaming_mode_tx_ipc.send(new_state).await;
                                     return; // state write handled by gaming_mode_set_loop
                                 }

@@ -166,7 +166,7 @@ pub async fn run_single(
         if first_frame {
             first_frame = false;
             println!(
-                "makima: first trackpad event written to virtual device. +{}ms since startup",
+                "deckery: first trackpad event written to virtual device. +{}ms since startup",
                 crate::startup_ms()
             );
         }

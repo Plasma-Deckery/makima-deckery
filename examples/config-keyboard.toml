@@ -1,5 +1,5 @@
 #SAMPLE CONFIG FILE FOR A GENERIC KEYBOARD
-#Put this in ~/.config/makima and rename it to the exact name of the device as shown by the 'evtest' command, including spaces and capitalization. Omit "/" if present.
+#Put this in ~/.config/deckery and rename it to the exact name of the device as shown by the 'evtest' command, including spaces and capitalization. Omit "/" if present.
 #You can find the available keycodes in /usr/include/linux/input-event-codes.h
 #If you're not sure which keycode corresponds to which key, you can run 'evtest', select your device and press the corresponding key/button.
 

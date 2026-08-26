@@ -55,14 +55,14 @@ fn spawn_event_reader(
     let stream = match try_open_event_stream(&path, grab) {
         Ok(s) => {
             if grab {
-                println!("makima: grabbed {:?} (exclusive evdev access)", path);
+                println!("deckery: grabbed {:?} (exclusive evdev access)", path);
             } else {
-                println!("makima: opened {:?} (no grab)", path);
+                println!("deckery: opened {:?} (no grab)", path);
             }
             s
         }
         Err(e) => {
-            eprintln!("makima: cannot open {:?}: {} — skipping device", path, e);
+            eprintln!("deckery: cannot open {:?}: {} — skipping device", path, e);
             return None;
         }
     };
@@ -411,7 +411,7 @@ pub async fn launch_tasks(
                 ).await {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("makima: cannot open {:?}: {} — skipping device", event_device, e);
+                        eprintln!("deckery: cannot open {:?}: {} — skipping device", event_device, e);
                         continue;
                     }
                 };
