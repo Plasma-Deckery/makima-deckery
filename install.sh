@@ -1,10 +1,6 @@
 #!/bin/bash
 # install.sh — one-time setup + initial build for makima-deckery.
 # For subsequent code changes, use redeploy.sh instead.
-#
-# Prerequisites (manual, one-time):
-#   sudo usermod -aG input $USER   # grants access to /dev/input/* and /dev/uinput
-#   (log out and back in for the group to take effect)
 
 set -e
 REPO="$(dirname "$(readlink -f "$0")")"
@@ -12,11 +8,30 @@ BUILD_PACKAGES="rust pkgconf gcc systemd-libs rpm-tools make copr-cli"
 
 echo "Repo: $REPO"
 
-# ── 1. Distrobox container + packages ────────────────────────────────────────
+# ── 1. udev rule ─────────────────────────────────────────────────────────────
+#
+# Grants the active login session access to /dev/uinput via TAG+="uaccess"
+# (logind-scoped, narrower than adding the user to the input group).
+# Idempotent: sudo is only called when the installed rule differs from the
+# source, so updates never prompt for a password.
+
+_UDEV_SRC="$REPO/udev/50-makima.rules"
+_UDEV_DST="/etc/udev/rules.d/50-makima.rules"
+
+if ! diff -q "$_UDEV_SRC" "$_UDEV_DST" 2>/dev/null; then
+    echo "Installing udev rule (requires sudo once)..."
+    sudo install -Dm644 "$_UDEV_SRC" "$_UDEV_DST"
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+else
+    echo "udev rule already up to date — no sudo needed"
+fi
+
+# ── 2. Distrobox container + packages ────────────────────────────────────────
 distrobox create --name deckery --image archlinux:latest || true
 distrobox enter deckery -- sudo pacman -S --needed --noconfirm $BUILD_PACKAGES
 
-# ── 2. Systemd user services (no sudo) ───────────────────────────────────────
+# ── 3. Systemd user services (no sudo) ───────────────────────────────────────
 SERVICE_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SERVICE_DIR"
 for svc in makima.service; do
@@ -53,5 +68,5 @@ if [ -f "$OLD_BIN" ]; then
     rm -f "$OLD_BIN"
 fi
 
-# ── 3. Build + deploy ────────────────────────────────────────────────────────
+# ── 4. Build + deploy ────────────────────────────────────────────────────────
 bash "$REPO/redeploy.sh"
