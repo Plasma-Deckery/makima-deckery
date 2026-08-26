@@ -21,8 +21,10 @@ _UDEV_DST="/etc/udev/rules.d/50-makima.rules"
 if ! diff -q "$_UDEV_SRC" "$_UDEV_DST" 2>/dev/null; then
     echo "Installing udev rule (requires sudo once)..."
     sudo install -Dm644 "$_UDEV_SRC" "$_UDEV_DST"
+    sudo modprobe uinput 2>/dev/null || true
     sudo udevadm control --reload-rules
-    sudo udevadm trigger
+    sudo udevadm trigger --subsystem-match=misc
+    sudo udevadm settle
 else
     echo "udev rule already up to date — no sudo needed"
 fi
