@@ -11,7 +11,7 @@ use std::{env, path::{Path, PathBuf}, process::Command, sync::Arc};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use crate::kwin_watcher;
-use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle, Severity};
+use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle};
 use tokio_stream::StreamExt;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -493,14 +493,14 @@ pub async fn launch_tasks(
             let _ = state_tx.try_send(StateCommand::SetError {
                 id:       "no_device".to_string(),
                 message:  "No matching device found — user may lack event device access".to_string(),
-                severity: Severity::Error,
+                severity: "error",
             });
         } else {
             println!("No matching devices found.\nNote: double-check that your device and its associated config file have the same name, as reported by 'evtest'.\n");
             let _ = state_tx.try_send(StateCommand::SetError {
                 id:       "no_device".to_string(),
                 message:  "No matching device found — check device name matches config file name".to_string(),
-                severity: Severity::Error,
+                severity: "error",
             });
         }
     } else {
@@ -642,6 +642,7 @@ mod tests {
         let window_changed = Arc::new(Notify::new());
 
         let gaming_mode = Arc::new(Mutex::new(false));
+        let (state_tx, _state_rx) = tokio::sync::mpsc::channel(8);
         let (virt_dev_opt, modifiers) = launch_tasks(
             &config_files,
             &mut tasks,
@@ -651,6 +652,7 @@ mod tests {
             window_changed,
             None, // no lizard cfg in test
             gaming_mode,
+            state_tx,
         ).await;
 
         if let Some(_) = virt_dev_opt {
