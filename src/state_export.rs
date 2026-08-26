@@ -1,11 +1,13 @@
 // ── Deckery State Export ──────────────────────────────────────────────────────
 //
-// Writes /tmp/makima-state.json atomically on every config or modifier change.
-// The file is consumed by the Deckery HUD overlay to display live button
-// mappings without re-implementing any of makima's lookup logic.
+// Provides `build_state()` — a pure function that assembles the full
+// state snapshot as a JSON value, consumed by the Deckery HUD overlay
+// to display live button mappings without re-implementing makima's lookup
+// logic.
 //
-// Called from EventReader::write_state() in event_reader.rs, which handles
-// all Arc/Mutex locking and passes plain values here.
+// Actual I/O (writing /tmp/makima-state.json) is handled exclusively by
+// `state_writer::flush()` via the `StateWriterHandle` channel.  Nothing in
+// this module touches the filesystem.
 
 use crate::config::{Event, GamingModeConfig};
 use crate::resolver::{resolve_binding, ResolvedBinding};
@@ -405,41 +407,6 @@ pub fn build_state(
         "modifier_active": modifier_active,
         "gaming_mode_trigger": gaming_mode_trigger,
     })
-}
-
-// ── Main export function ──────────────────────────────────────────────────────
-
-pub async fn write_state(
-    config: &Config,
-    modifiers: &[Event],
-    layout: u16,
-    paused: bool,
-    gaming_mode: bool,
-    held_keys: &[Event],
-    last_action: &Option<LastAction>,
-    config_stack: &[String],
-    gaming_mode_config: &GamingModeConfig,
-    trackpads: serde_json::Value,
-    sticks: serde_json::Value,
-    imu: serde_json::Value,
-    analog_state_export: bool,
-) {
-    let mut state = build_state(config, modifiers, layout, paused, gaming_mode, held_keys, last_action, config_stack, gaming_mode_config);
-    state["trackpads"] = trackpads;
-    state["sticks"] = sticks;
-    state["imu"] = imu;
-    state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
-
-    let tmp_path = "/tmp/makima-state.json.tmp";
-    let final_path = "/tmp/makima-state.json";
-    match serde_json::to_string_pretty(&state) {
-        Ok(json) => {
-            if std::fs::write(tmp_path, json).is_ok() {
-                let _ = std::fs::rename(tmp_path, final_path);
-            }
-        }
-        Err(e) => eprintln!("deckery: state export failed: {}", e),
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

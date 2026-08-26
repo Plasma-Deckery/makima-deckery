@@ -2115,7 +2115,15 @@ impl EventReader {
         event_state["sticks"]    = sticks;
         event_state["imu"]       = imu;
         event_state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
-        let _ = self.state_tx.try_send(StateCommand::SetEventState(Some(event_state)));
+        if analog_triggered {
+            // Analog events arrive at ~60 Hz; drop the update silently when the
+            // channel is full rather than blocking the event loop.
+            let _ = self.state_tx.try_send(StateCommand::SetEventState(Some(event_state)));
+        } else {
+            // Button / modifier / pause events must never be dropped — wait for
+            // the writer task to drain its queue before proceeding.
+            let _ = self.state_tx.send(StateCommand::SetEventState(Some(event_state))).await;
+        }
     }
 
     /// Record the actual emitted key output for the HUD last-event display.
@@ -2173,6 +2181,7 @@ impl EventReader {
         let gaming_mode_config   = self.gaming_mode_config.clone();
         // paused state still needs an immediate write (no channel for it yet).
         let gaming_mode_for_write = self.gaming_mode.clone();
+        let state_tx_ipc         = self.state_tx.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file("/tmp/makima-control.sock");
             let listener = match UnixListener::bind("/tmp/makima-control.sock") {
@@ -2194,6 +2203,7 @@ impl EventReader {
                 let analog_state_export  = analog_state_export.clone();
                 let gaming_mode_config   = gaming_mode_config.clone();
                 let gaming_mode_for_write = gaming_mode_for_write.clone();
+                let state_tx_ipc         = state_tx_ipc.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream.into_std().unwrap());
                     let mut line = String::new();
@@ -2251,13 +2261,17 @@ impl EventReader {
                                         .to_string();
                                     vec![base_name, app_part]
                                 };
-                                crate::state_export::write_state(
+                                let mut event_state = crate::state_export::build_state(
                                     &config, &mods, layout, is_paused, is_gaming, &hk, &la, &stack,
                                     &gaming_mode_config,
-                                    serde_json::Value::Null,
-                                    serde_json::Value::Null,
-                                    serde_json::Value::Null,
-                                    false,
+                                );
+                                event_state["trackpads"] = serde_json::Value::Null;
+                                event_state["sticks"]    = serde_json::Value::Null;
+                                event_state["imu"]       = serde_json::Value::Null;
+                                event_state["context"]["analog_state_export"] = serde_json::Value::Bool(false);
+                                // pause/resume is a discrete event — must not be dropped.
+                                let _ = state_tx_ipc.send(
+                                    StateCommand::SetEventState(Some(event_state))
                                 ).await;
                             }
                             "analog-state-export on" | "analog-state-export off" => {
