@@ -232,14 +232,17 @@ pub struct SteamDeckController {
     /// Raw controller hidraw path. `None` on non-Steam Deck hardware or if
     /// sysfs traversal failed.
     pub hidraw_path: Option<PathBuf>,
-    /// If `true` **and** `grab=true`: this session is willing to release its
-    /// `EVIOCGRAB` when another session needs to grab. The library spawns a
-    /// D-Bus listener that emits `ControllerEvent::ReleaseAll` on `GrabPending`
-    /// and will re-grab on `GrabReleased` (stub — not yet implemented).
+    /// If `true`, the library spawns a D-Bus listener for `GrabPending` and
+    /// emits `ControllerEvent::ReleaseAll` so the consumer can flush held
+    /// virtual output keys before another process acquires `EVIOCGRAB`.
     ///
-    /// If `grab=false`: this flag has no effect. The evdev stream pauses
-    /// automatically while another process holds `EVIOCGRAB` and resumes on
-    /// its own — no D-Bus coordination needed.
+    /// For `grab=true` yieldable sessions: additionally releases `EVIOCGRAB`
+    /// on `GrabPending` and re-grabs on `GrabReleased` (stub — not yet
+    /// implemented; no `grab=true+yieldable` caller exists today).
+    ///
+    /// For `grab=false` yieldable sessions (e.g. makima): only the key-flush
+    /// (`ReleaseAll`) matters — the evdev stream pauses/resumes automatically,
+    /// no EVIOCGRAB coordination needed.
     pub yieldable:   bool,
 }
 
@@ -335,10 +338,14 @@ impl SteamDeckController {
         let (event_tx, event_rx) = mpsc::channel(64);
         let path = self.evdev_path.clone();
 
-        // Only grab=true sessions can yield their EVIOCGRAB to another grabber.
-        // grab=false sessions need no listener — the evdev stream simply pauses
-        // while another process holds the grab and resumes automatically after.
-        if self.yieldable && grab {
+        // All yieldable sessions listen for GrabPending so they can flush held
+        // output keys via ControllerEvent::ReleaseAll before another process
+        // acquires EVIOCGRAB — avoiding stuck virtual keys during the grab.
+        //
+        // grab=true yieldable sessions additionally need to release EVIOCGRAB
+        // on GrabPending and re-grab on GrabReleased (stub — not yet implemented;
+        // there is no grab=true+yieldable caller today).
+        if self.yieldable {
             grab_coordinator::spawn_grab_listener(
                 path.to_string_lossy().into_owned(),
                 event_tx.clone(),
