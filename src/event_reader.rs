@@ -2115,6 +2115,7 @@ impl EventReader {
         event_state["sticks"]    = sticks;
         event_state["imu"]       = imu;
         event_state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
+        event_state["configs"]   = crate::state_export::build_configs_json(&self.config, &config.name);
         if analog_triggered {
             // Analog events arrive at ~60 Hz; drop the update silently when the
             // channel is full rather than blocking the event loop.
@@ -2269,6 +2270,7 @@ impl EventReader {
                                 event_state["sticks"]    = serde_json::Value::Null;
                                 event_state["imu"]       = serde_json::Value::Null;
                                 event_state["context"]["analog_state_export"] = serde_json::Value::Bool(false);
+                                event_state["configs"]   = crate::state_export::build_configs_json(&all_configs, &config.name);
                                 // pause/resume is a discrete event — must not be dropped.
                                 let _ = state_tx_ipc.send(
                                     StateCommand::SetEventState(Some(event_state))
@@ -2276,6 +2278,60 @@ impl EventReader {
                             }
                             "analog-state-export on" | "analog-state-export off" => {
                                 *analog_state_export.lock().await = cmd == "analog-state-export on";
+                            }
+                            _ if cmd.starts_with("config activate ") => {
+                                let name = cmd.trim_start_matches("config activate ").trim();
+                                let found = all_configs.iter().find(|c| c.name == name).cloned();
+                                if let Some(new_config) = found {
+                                    *current_config.lock().await = new_config.clone();
+                                    eprintln!("deckery: IPC config activate: switched to {:?}", new_config.name);
+                                    // Build and send state with new config.
+                                    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+                                    let is_paused = match tokio::time::timeout(TIMEOUT, paused.lock()).await {
+                                        Ok(g) => *g, Err(_) => return,
+                                    };
+                                    let is_gaming = *gaming_mode_for_write.lock().await;
+                                    let mods = match tokio::time::timeout(TIMEOUT, modifiers.lock()).await {
+                                        Ok(g) => g.clone(), Err(_) => return,
+                                    };
+                                    let layout = match tokio::time::timeout(TIMEOUT, active_layout.lock()).await {
+                                        Ok(g) => *g, Err(_) => return,
+                                    };
+                                    let la = match tokio::time::timeout(TIMEOUT, last_action.lock()).await {
+                                        Ok(g) => g.clone(), Err(_) => return,
+                                    };
+                                    let hk = match tokio::time::timeout(TIMEOUT, held_keys.lock()).await {
+                                        Ok(g) => g.clone(), Err(_) => return,
+                                    };
+                                    let base_name = all_configs
+                                        .iter()
+                                        .find(|x| x.associations == Associations::default())
+                                        .map(|x| x.name.clone())
+                                        .unwrap_or_default();
+                                    let stack = if new_config.name == base_name {
+                                        vec![base_name.clone()]
+                                    } else {
+                                        let app_part = new_config.name
+                                            .strip_prefix(&format!("{}::", base_name))
+                                            .unwrap_or(&new_config.name)
+                                            .to_string();
+                                        vec![base_name, app_part]
+                                    };
+                                    let mut event_state = crate::state_export::build_state(
+                                        &new_config, &mods, layout, is_paused, is_gaming,
+                                        &hk, &la, &stack, &gaming_mode_config,
+                                    );
+                                    event_state["trackpads"] = serde_json::Value::Null;
+                                    event_state["sticks"]    = serde_json::Value::Null;
+                                    event_state["imu"]       = serde_json::Value::Null;
+                                    event_state["context"]["analog_state_export"] = serde_json::Value::Bool(false);
+                                    event_state["configs"]   = crate::state_export::build_configs_json(&all_configs, &new_config.name);
+                                    let _ = state_tx_ipc.send(
+                                        StateCommand::SetEventState(Some(event_state))
+                                    ).await;
+                                } else {
+                                    eprintln!("deckery: IPC config activate: no config named {:?}", name);
+                                }
                             }
                             _ => {}
                         }
