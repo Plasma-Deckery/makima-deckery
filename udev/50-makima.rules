@@ -1,1 +1,3 @@
 SUBSYSTEM=="misc", KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="input", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1205", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1205", TAG+="uaccess"
