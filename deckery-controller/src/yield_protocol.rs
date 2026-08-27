@@ -37,8 +37,12 @@ const GRAB_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// Returns the grabbed [`EventStream`]. The caller is responsible for emitting
 /// `GrabReleased` (via [`signal_grab_released`]) when the grab is relinquished.
 pub async fn open_grabbed(path: &Path) -> io::Result<EventStream> {
-    grab_coordinator::emit_grab_pending(
-        path.to_str().unwrap_or(""),
+    // Notify yieldable sessions (e.g. makima) that we are about to grab.
+    // Best-effort: if D-Bus is unavailable or slow we proceed anyway after
+    // a short deadline — the EVIOCGRAB retry loop below handles the race.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        grab_coordinator::emit_grab_pending(path.to_str().unwrap_or("")),
     ).await;
 
     let deadline = tokio::time::Instant::now() + GRAB_TIMEOUT;
