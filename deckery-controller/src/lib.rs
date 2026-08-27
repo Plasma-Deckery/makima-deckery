@@ -232,18 +232,23 @@ pub struct SteamDeckController {
     /// Raw controller hidraw path. `None` on non-Steam Deck hardware or if
     /// sysfs traversal failed.
     pub hidraw_path: Option<PathBuf>,
-    /// If `true`, this session subscribes to `GrabPending` D-Bus signals and
-    /// forwards them as `ControllerEvent::ReleaseAll`. Set for consumers that
-    /// do not hold the grab themselves (e.g. makima) so they can flush held
-    /// output keys before the grabbing session acquires `EVIOCGRAB`.
+    /// If `true` **and** `grab=true`: this session is willing to release its
+    /// `EVIOCGRAB` when another session needs to grab. The library spawns a
+    /// D-Bus listener that emits `ControllerEvent::ReleaseAll` on `GrabPending`
+    /// and will re-grab on `GrabReleased` (stub — not yet implemented).
+    ///
+    /// If `grab=false`: this flag has no effect. The evdev stream pauses
+    /// automatically while another process holds `EVIOCGRAB` and resumes on
+    /// its own — no D-Bus coordination needed.
     pub yieldable:   bool,
 }
 
 impl SteamDeckController {
     /// Construct from a known evdev device path.
     ///
-    /// `yieldable`: set `true` for makima (no grab, should yield on request),
-    /// `false` for the auth daemon (holds the grab, is the requester).
+    /// `yieldable`: set `true` if this session should participate in the
+    /// cooperative grab protocol (willing to release `EVIOCGRAB` on request).
+    /// Only has an effect when combined with `grab=true` — see field doc.
     ///
     /// Immediately discovers the hidraw sibling via sysfs — a synchronous read
     /// that completes in microseconds.
@@ -278,14 +283,17 @@ impl SteamDeckController {
     /// `ControllerSession` with caller-facing channel ends, or an `io::Error`
     /// if the device cannot be opened.
     ///
-    /// When `grab=true`, the yield protocol runs first: emits `GrabPending` on
-    /// the system D-Bus so yieldable sessions flush held keys, then retries
-    /// `EVIOCGRAB` until success or timeout.
-    /// When `grab=false`, the device is opened without exclusive access.
+    /// When `grab=true`, the yield protocol runs first: establishes one D-Bus
+    /// connection, emits `GrabPending` so any `grab=true && yieldable=true`
+    /// session releases its `EVIOCGRAB`, then retries until success or timeout.
+    /// Returns a `GrabbedHandle` in `session.grab_handle` — dropping it emits
+    /// `GrabReleased` on the same connection.
+    /// When `grab=false`, the device is opened without exclusive access; the
+    /// evdev stream pauses automatically if another process holds `EVIOCGRAB`.
     ///
     /// Spawns on success:
     /// - reconnecting evdev reader (suspend-transparent `ControllerEvent` stream)
-    /// - if `yieldable`: D-Bus listener for `GrabPending` → `ControllerEvent::ReleaseAll`
+    /// - if `yieldable && grab`: D-Bus listener for `GrabPending` / `GrabReleased`
     /// - hidraw reader → `pad_rx`
     /// - hidraw writer (serialises haptics + Lizard Mode heartbeat onto one fd)
     pub async fn start(
