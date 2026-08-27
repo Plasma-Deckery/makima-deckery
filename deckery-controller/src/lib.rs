@@ -48,6 +48,7 @@ pub mod yield_protocol;
 pub use haptic::{HapticChain, HapticChainStep, HapticPad, HapticPulse, HapticRequest};
 pub use hidraw::PadFrame;
 pub use lizard_mode::LizardModeSuppression;
+pub use yield_protocol::GrabbedHandle;
 
 // ── Internal startup timing ───────────────────────────────────────────────────
 
@@ -212,6 +213,12 @@ pub struct ControllerSession {
     /// lifetime (allowing future dynamic updates) and calls `set()` once with
     /// the user-configured values.
     pub click_pressure: Option<ClickPressureHandle>,
+
+    /// RAII guard that emits `GrabReleased` on drop via the pre-established
+    /// D-Bus connection. `None` when the session was opened without grab.
+    /// Keep alive for the full grab session lifetime — dropping it releases
+    /// the cooperative grab lock on the D-Bus.
+    pub grab_handle: Option<GrabbedHandle>,
 }
 
 // ── SteamDeckController ──────────────────────────────────────────────────────
@@ -287,16 +294,18 @@ impl SteamDeckController {
         device_error_notify: Arc<Notify>,
         initial_lizard_cfg: Option<LizardModeSuppression>,
     ) -> std::io::Result<ControllerSession> {
-        let stream = if grab {
-            let s = yield_protocol::open_grabbed(&self.evdev_path).await?;
+        let (stream, grab_handle) = if grab {
+            let (s, h) = yield_protocol::open_grabbed(&self.evdev_path).await?;
             println!("deckery-controller: grabbed {:?} (exclusive evdev access)", self.evdev_path);
-            s
+            (s, Some(h))
         } else {
             let s = Self::open_event_stream_inner(&self.evdev_path)?;
             println!("deckery-controller: opened {:?} (no grab)", self.evdev_path);
-            s
+            (s, None)
         };
-        Ok(self.spawn_tasks(stream, grab, device_error_notify, initial_lizard_cfg))
+        let mut session = self.spawn_tasks(stream, grab, device_error_notify, initial_lizard_cfg);
+        session.grab_handle = grab_handle;
+        Ok(session)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
@@ -318,7 +327,10 @@ impl SteamDeckController {
         let (event_tx, event_rx) = mpsc::channel(64);
         let path = self.evdev_path.clone();
 
-        if self.yieldable {
+        // Only grab=true sessions can yield their EVIOCGRAB to another grabber.
+        // grab=false sessions need no listener — the evdev stream simply pauses
+        // while another process holds the grab and resumes automatically after.
+        if self.yieldable && grab {
             grab_coordinator::spawn_grab_listener(
                 path.to_string_lossy().into_owned(),
                 event_tx.clone(),
@@ -359,6 +371,7 @@ impl SteamDeckController {
             haptic_tx,
             lizard_mode: LizardModeHandle(lizard_tx),
             click_pressure,
+            grab_handle: None, // filled in by start() after open_grabbed
         }
     }
 

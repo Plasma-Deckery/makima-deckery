@@ -3,19 +3,23 @@
 // Protocol for acquiring an exclusive evdev grab without blocking other
 // deckery-controller consumers indefinitely:
 //
-//  1. Emit `GrabPending` signal (system D-Bus) so yieldable sessions flush
-//     their held output keys and release their own grab if they hold one.
-//  2. Retry EVIOCGRAB in a tight loop until success or timeout.
-//  3. Emit `GrabReleased` signal when the grab is relinquished so yieldable
-//     sessions can re-grab.
+//  1. Establish one D-Bus connection for the entire grab session.
+//  2. Emit `GrabPending` — all yieldable sessions flush held output keys;
+//     sessions that hold EVIOCGRAB release it.
+//  3. Retry EVIOCGRAB until success or timeout.
+//  4. Return a `GrabbedHandle` that holds the connection.
+//     Dropping it emits `GrabReleased` on the same connection — no new
+//     handshake, no new auth round-trip.
 //
-// Callers use `open_grabbed` to acquire and get back a `GrabbedStream` RAII
-// guard. Dropping the guard releases the evdev grab and emits `GrabReleased`.
+// The connection is established once so signal emission is a single round-trip
+// on an already-authenticated socket, taking microseconds rather than the
+// full connect+handshake overhead of a fresh connection.
 
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 use evdev::EventStream;
+use zbus::Connection;
 
 use crate::grab_coordinator;
 
@@ -25,47 +29,93 @@ const GRAB_TIMEOUT: Duration = Duration::from_secs(5);
 /// Interval between EVIOCGRAB attempts.
 const GRAB_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+// ── GrabbedHandle ─────────────────────────────────────────────────────────────
+
+/// RAII guard for an active evdev grab acquired via the yield protocol.
+///
+/// Holds the D-Bus connection that was used to emit `GrabPending` so
+/// `GrabReleased` can be sent on the **same** connection when the guard is
+/// dropped — no new D-Bus handshake required.
+///
+/// Obtained from [`open_grabbed`]. The evdev [`EventStream`] is returned
+/// separately (it lives in the reconnecting reader task); this guard only
+/// owns the D-Bus side of the session.
+pub struct GrabbedHandle {
+    /// Pre-established connection; `None` if D-Bus was unavailable at grab time.
+    conn: Option<Connection>,
+    path: String,
+}
+
+impl Drop for GrabbedHandle {
+    /// Emit `GrabReleased` on the pre-established connection.
+    ///
+    /// Uses `tokio::runtime::Handle::try_current()` so a missing runtime
+    /// (e.g. during process shutdown or in sync tests) is handled gracefully
+    /// rather than panicking.
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else { return };
+        let path = self.path.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    grab_coordinator::emit_signal_on(&conn, "GrabReleased", &path).await;
+                });
+            }
+            Err(_) => {
+                eprintln!(
+                    "deckery-controller: GrabbedHandle dropped outside Tokio runtime \
+                     — GrabReleased not emitted for {:?}",
+                    path
+                );
+            }
+        }
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Acquire an exclusive evdev grab using the yield protocol.
 ///
-/// 1. Tries `EVIOCGRAB` immediately.
-/// 2. On the first `EBUSY` — and only then — emits `GrabPending` so any
-///    session that holds the grab knows to yield it.
-/// 3. Keeps retrying every [`GRAB_RETRY_INTERVAL`] until success or
+/// 1. Establishes one D-Bus connection for the session.
+/// 2. Emits `GrabPending` immediately on that connection — all yieldable
+///    sessions receive it regardless of whether they hold EVIOCGRAB.
+/// 3. Retries `EVIOCGRAB` every [`GRAB_RETRY_INTERVAL`] until success or
 ///    [`GRAB_TIMEOUT`] is reached.
 ///
-/// `GrabPending` is intentionally deferred to the first failure: if no other
-/// session holds the grab the device is available immediately and D-Bus is
-/// never contacted. The 500 ms cap on the notification is a safeguard for
-/// slow D-Bus connections; the retry loop continues regardless.
+/// Returns `(stream, handle)` on success. `handle` is a [`GrabbedHandle`]
+/// that emits `GrabReleased` (on the same connection) when dropped.
+/// Store it for the lifetime of the grab; dropping it signals release.
 ///
-/// Returns the grabbed [`EventStream`]. The caller is responsible for emitting
-/// `GrabReleased` (via [`signal_grab_released`]) when the grab is relinquished.
-pub async fn open_grabbed(path: &Path) -> io::Result<EventStream> {
-    let deadline = tokio::time::Instant::now() + GRAB_TIMEOUT;
-    let mut pending_emitted = false;
+/// If D-Bus is unavailable, the grab proceeds without notification and
+/// `handle.conn` is `None` — `Drop` is a no-op in that case.
+pub async fn open_grabbed(path: &Path) -> io::Result<(EventStream, GrabbedHandle)> {
+    let path_str = path.to_str().unwrap_or("");
 
+    // ── 1. Establish D-Bus connection once for this grab session ──────────────
+    let conn = grab_coordinator::connect().await.ok();
+
+    // ── 2. Notify yieldable grab=true sessions upfront ───────────────────────
+    // Sessions with grab=true and yieldable=true must release their EVIOCGRAB
+    // before we can acquire it. grab=false sessions need no notification —
+    // their evdev stream pauses automatically while another process holds
+    // EVIOCGRAB and resumes on its own after release.
+    if let Some(ref c) = conn {
+        grab_coordinator::emit_signal_on(c, "GrabPending", path_str).await;
+    }
+
+    // ── 3. Retry EVIOCGRAB until success or timeout ───────────────────────────
+    let deadline = tokio::time::Instant::now() + GRAB_TIMEOUT;
     loop {
         match crate::try_open_event_stream(path, /*grab=*/ true) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                let handle = GrabbedHandle { conn, path: path_str.to_string() };
+                return Ok((stream, handle));
+            }
             Err(e) if is_busy(&e) => {
-                // First EBUSY: now we know someone holds the grab.
-                // Emit GrabPending once so they can yield.
-                if !pending_emitted {
-                    let _ = tokio::time::timeout(
-                        Duration::from_millis(500),
-                        grab_coordinator::emit_grab_pending(path.to_str().unwrap_or("")),
-                    ).await;
-                    pending_emitted = true;
-                }
                 if tokio::time::Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        format!(
-                            "could not grab {:?} within {:?}: {e}",
-                            path, GRAB_TIMEOUT
-                        ),
+                        format!("could not grab {:?} within {:?}: {e}", path, GRAB_TIMEOUT),
                     ));
                 }
                 tokio::time::sleep(GRAB_RETRY_INTERVAL).await;
@@ -73,14 +123,6 @@ pub async fn open_grabbed(path: &Path) -> io::Result<EventStream> {
             Err(e) => return Err(e),
         }
     }
-}
-
-/// Emit `GrabReleased` on the system bus.
-///
-/// Call this when the grab acquired via [`open_grabbed`] is relinquished so
-/// yieldable sessions know they can re-grab the device.
-pub async fn signal_grab_released(path: String) {
-    grab_coordinator::emit_grab_released(path).await;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -25,38 +25,29 @@ const DBUS_INTERFACE: &str = "org.Deckery.Controller1";
 // In production use the system bus; in tests use the session bus so no root
 // access is required and any CI environment with a running dbus-daemon works.
 #[cfg(not(test))]
-async fn connect() -> zbus::Result<Connection> { Connection::system().await }
+pub(crate) async fn connect() -> zbus::Result<Connection> { Connection::system().await }
 #[cfg(test)]
-async fn connect() -> zbus::Result<Connection> { Connection::session().await }
+pub(crate) async fn connect() -> zbus::Result<Connection> { Connection::session().await }
 
 // ── Emitter ───────────────────────────────────────────────────────────────────
 
-/// Emit `GrabPending` on the bus for the given device path.
-pub async fn emit_grab_pending(device_path: &str) {
-    emit_signal("GrabPending", device_path).await;
-}
-
-/// Emit `GrabReleased` on the bus for the given device path.
-pub async fn emit_grab_released(device_path: String) {
-    emit_signal("GrabReleased", &device_path).await;
-}
-
-async fn emit_signal(member: &str, device_path: &str) {
-    let result: zbus::Result<()> = async {
-        let conn = connect().await?;
-        conn.emit_signal(
-            None::<&str>,
-            DBUS_PATH,
-            DBUS_INTERFACE,
-            member,
-            &(device_path,),
-        ).await
-    }.await;
-
+/// Emit a signal on an **already-established** connection.
+///
+/// The connection is established once per grab session (in `open_grabbed`) and
+/// reused here for zero-overhead signal emission — no handshake, no auth.
+pub(crate) async fn emit_signal_on(conn: &Connection, member: &str, device_path: &str) {
+    let result = conn.emit_signal(
+        None::<&str>,
+        DBUS_PATH,
+        DBUS_INTERFACE,
+        member,
+        &(device_path,),
+    ).await;
     if let Err(e) = result {
         eprintln!("deckery-controller: grab_coordinator: {member} failed: {e}");
     }
 }
+
 
 // ── Listener (yieldable sessions) ─────────────────────────────────────────────
 
@@ -130,6 +121,11 @@ mod tests {
     const DEV_RELEASED:  &str = "/dev/input/event-test-released";
     const DEV_UNRELATED: &str = "/dev/input/event-test-unrelated";
     const DEV_EXIT:      &str = "/dev/input/event-test-exit";
+
+    async fn emit_signal(member: &str, device_path: &str) {
+        let conn = connect().await.expect("D-Bus session bus unavailable in test");
+        emit_signal_on(&conn, member, device_path).await;
+    }
 
     async fn subscribe_then_emit(device: &str, signal: &str) -> Option<ControllerEvent> {
         let (tx, mut rx) = mpsc::channel(4);
