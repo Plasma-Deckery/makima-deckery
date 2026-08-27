@@ -407,6 +407,16 @@ impl RawConfig {
     }
 }
 
+/// A loaded config file together with its runtime enabled/disabled flag.
+/// The `enabled` flag can be toggled via IPC without touching the file.
+/// Disabled entries are invisible to `update_config()` and therefore never
+/// become the active config.
+#[derive(Debug, Clone)]
+pub struct ConfigEntry {
+    pub config:  Config,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub name: String,

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use tokio::sync::mpsc;
+use crate::config::ConfigEntry;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -44,6 +45,8 @@ pub enum StateCommand {
     SetError { id: String, message: String, severity: &'static str },
     /// Clear a previously reported error.
     ClearError { id: String },
+    /// Full snapshot of the config registry — sent whenever the registry changes.
+    SetLoadedConfigs(Vec<ConfigEntry>),
 }
 
 // ── Spawner ───────────────────────────────────────────────────────────────────
@@ -56,22 +59,23 @@ pub fn spawn_state_writer() -> StateWriterHandle {
         let mut lifecycle   = AppLifecycle::Starting;
         let mut errors: HashMap<String, ErrorEntry> = HashMap::new();
         let mut event_state: Option<serde_json::Value> = None;
+        let mut configs: Vec<ConfigEntry> = Vec::new();
 
         // Write the initial "starting" state before any command arrives so the
         // tray sees a non-stale file the moment makima boots.
-        flush(&lifecycle, &errors, &event_state);
+        flush(&lifecycle, &errors, &event_state, &configs);
 
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                StateCommand::SetLifecycle(lc)       => { lifecycle    = lc; }
-                StateCommand::SetEventState(es)       => { event_state  = es; }
+                StateCommand::SetLifecycle(lc)          => { lifecycle    = lc; }
+                StateCommand::SetEventState(es)          => { event_state  = es; }
+                StateCommand::SetLoadedConfigs(c)        => { configs      = c; }
                 StateCommand::SetError { id, message, severity } => {
                     errors.insert(id, ErrorEntry { message, severity });
                 }
-
-                StateCommand::ClearError { id }      => { errors.remove(&id); }
+                StateCommand::ClearError { id }         => { errors.remove(&id); }
             }
-            flush(&lifecycle, &errors, &event_state);
+            flush(&lifecycle, &errors, &event_state, &configs);
         }
     });
     tx
@@ -85,6 +89,7 @@ pub(crate) fn build_json(
     lifecycle:   &AppLifecycle,
     errors:      &HashMap<String, ErrorEntry>,
     event_state: &Option<serde_json::Value>,
+    configs:     &[ConfigEntry],
 ) -> String {
     let lifecycle_str = match lifecycle {
         AppLifecycle::Starting => "starting",
@@ -98,9 +103,15 @@ pub(crate) fn build_json(
         })
         .collect();
 
+    let configs_json: Vec<serde_json::Value> = configs
+        .iter()
+        .map(|e| serde_json::json!({ "name": e.config.name, "enabled": e.enabled }))
+        .collect();
+
     let mut state = serde_json::json!({
         "lifecycle": lifecycle_str,
         "errors":    errors_json,
+        "configs":   configs_json,
     });
 
     // Merge the event-reader snapshot fields at the top level (context,
@@ -119,8 +130,9 @@ fn flush(
     lifecycle:   &AppLifecycle,
     errors:      &HashMap<String, ErrorEntry>,
     event_state: &Option<serde_json::Value>,
+    configs:     &[ConfigEntry],
 ) {
-    let json  = build_json(lifecycle, errors, event_state);
+    let json  = build_json(lifecycle, errors, event_state, configs);
     let tmp   = "/tmp/makima-state.json.tmp";
     let final_ = "/tmp/makima-state.json";
     if !json.is_empty() && std::fs::write(tmp, &json).is_ok() {

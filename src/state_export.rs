@@ -63,19 +63,6 @@ fn modifier_sort_key(key: &str) -> (u8, String) {
     (rank, key.to_owned())
 }
 
-// ── Configs snapshot ──────────────────────────────────────────────────────────
-
-/// Build the `configs` JSON array: all loaded configs with an `active` flag.
-/// Pure — no I/O.
-pub fn build_configs_json(all_configs: &[Config], active_name: &str) -> serde_json::Value {
-    serde_json::Value::Array(
-        all_configs.iter().map(|c| serde_json::json!({
-            "name":   c.name,
-            "active": c.name == active_name,
-        })).collect(),
-    )
-}
-
 // ── Pure state builder ────────────────────────────────────────────────────────
 
 /// Build the full state snapshot as a JSON value.

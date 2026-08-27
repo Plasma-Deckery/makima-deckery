@@ -18,7 +18,7 @@ fn match_class(class: String, config: &[Config]) -> Client {
     }
 }
 
-pub async fn get_active_window(environment: &Environment, config: &Vec<Config>) -> Client {
+pub async fn get_active_window(environment: &Environment, config: &[Config]) -> Client {
     match &environment.server {
         Server::Connected(server) => {
             let server_str = server.as_str();

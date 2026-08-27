@@ -1,5 +1,5 @@
 use crate::active_client::*;
-use crate::config::{parse_modifiers, Associations, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
+use crate::config::{parse_modifiers, Associations, Axis, ConfigEntry, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::device_session::TrackpadSession;
 use crate::mt_trackpad;
 use deckery_controller::{HapticPad, HapticRequest, LizardModeHandle};
@@ -57,7 +57,7 @@ struct Settings {
 }
 
 pub struct EventReader {
-    config: Vec<Config>,
+    config_entries: Arc<Mutex<HashMap<String, ConfigEntry>>>,
     /// Receiver for controller events from the reconnecting reader task.
     /// `ControllerEvent::Input` carries normal evdev events; `Reconnected`
     /// signals a transparent reconnect (EventReader must release held keys).
@@ -134,6 +134,7 @@ pub struct EventReader {
 impl EventReader {
     pub fn new(
         config: Vec<Config>,
+        config_entries: Arc<Mutex<HashMap<String, ConfigEntry>>>,
         virt_dev: Arc<Mutex<VirtualDevices>>,
         event_rx: mpsc::Receiver<ControllerEvent>,
         is_tablet: bool,
@@ -430,7 +431,7 @@ impl EventReader {
             .unwrap_or_default();
 
         Self {
-            config,
+            config_entries,
             event_rx: Mutex::new(event_rx),
             is_tablet,
             max_abs_wheel,
@@ -472,7 +473,12 @@ impl EventReader {
     }
 
     pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>, session: Option<TrackpadSession>) {
-        let name = &self.config.iter().find(|&x| x.associations == Associations::default()).unwrap().name;
+        let name = self.config_entries.lock().await
+            .values()
+            .find(|e| e.config.associations == Associations::default())
+            .map(|e| e.config.name.clone())
+            .unwrap_or_default();
+        let name = &name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
         self.write_state().await;
@@ -1839,12 +1845,18 @@ impl EventReader {
         released_keys
     }
 
+    /// Snapshot of enabled configs from the registry — no lock held after this returns.
+    async fn enabled_configs(&self) -> Vec<Config> {
+        self.config_entries.lock().await
+            .values()
+            .filter(|e| e.enabled)
+            .map(|e| e.config.clone())
+            .collect()
+    }
+
     async fn change_active_layout(&self) {
+        let enabled = self.enabled_configs().await;
         let mut active_layout = self.active_layout.lock().await;
-        // For KDE: use the event-driven active_client (same source as update_config).
-        // For all other compositors: fall back to get_active_window().
-        // Never call get_active_window() on KDE — it spawns `systemd-run … kdotool`
-        // which blocks the tokio thread for several seconds.
         let active_class_owned: String = match &self.environment.server {
             Server::Connected(s) if s == "KDE" => {
                 match &*self.active_client.lock().await {
@@ -1852,7 +1864,7 @@ impl EventReader {
                     Client::Default => String::new(),
                 }
             }
-            _ => match get_active_window(&self.environment, &self.config).await {
+            _ => match get_active_window(&self.environment, &enabled).await {
                 Client::Class(c, _, _) => c,
                 Client::Default => String::new(),
             },
@@ -1864,7 +1876,7 @@ impl EventReader {
             } else {
                 *active_layout += 1
             };
-            if self.config.iter().any(|x| {
+            if enabled.iter().any(|x| {
                 x.associations.layout == *active_layout && match &x.associations.client {
                     Client::Class(c, _, _) => c == active_class,
                     Client::Default => active_class.is_empty(),
@@ -1885,11 +1897,7 @@ impl EventReader {
     fn update_config(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let active_layout = *self.active_layout.lock().await;
-            // For KDE: window class is maintained event-driven by kwin_watcher.
-            // For all other compositors: call get_active_window() on every button-press.
-            // In both cases we extract only the class string — caption and pid are not
-            // stored in config associations, so there is no point constructing a full
-            // Client / Associations value and comparing with PartialEq.
+            let enabled = self.enabled_configs().await;
             let active_class: String = match &self.environment.server {
                 Server::Connected(s) if s == "KDE" => {
                     match &*self.active_client.lock().await {
@@ -1897,34 +1905,26 @@ impl EventReader {
                         Client::Default => String::new(),
                     }
                 }
-                _ => match get_active_window(&self.environment, &self.config).await {
+                _ => match get_active_window(&self.environment, &enabled).await {
                     Client::Class(c, _, _) => c,
                     Client::Default => String::new(),
                 },
             };
-            // Primary lookup: exact match for (layout, class).
-            // Fallback: default config for this layout (no class association) — used
-            // when the focused window has no specific config entry.  Only if that
-            // also doesn't exist do we change the active layout.
-            // NOTE: The old code produced Client::Default for unknown classes and
-            // matched the base config via Associations PartialEq.  Replicating that
-            // behaviour here without constructing any Client / Associations objects.
-            let found = self.config.iter().find(|&x| {
+            let found = enabled.iter().find(|x| {
                 x.associations.layout == active_layout
                     && match &x.associations.client {
                         Client::Class(c, _, _) => c == &active_class,
                         Client::Default => active_class.is_empty(),
                     }
             }).or_else(|| {
-                // Fallback: layout matches, association is Default (base config).
-                self.config.iter().find(|&x| {
+                enabled.iter().find(|x| {
                     x.associations.layout == active_layout
                         && matches!(&x.associations.client, Client::Default)
                 })
-            });
+            }).cloned();
             match found {
                 Some(config) => {
-                    *self.current_config.lock().await = config.clone();
+                    *self.current_config.lock().await = config;
                 }
                 None => {
                     self.change_active_layout().await;
@@ -2002,10 +2002,10 @@ impl EventReader {
                 return;
             }
         };
-        let base_name = self.config
-            .iter()
-            .find(|x| x.associations == Associations::default())
-            .map(|x| x.name.clone())
+        let base_name = self.config_entries.lock().await
+            .values()
+            .find(|e| e.config.associations == Associations::default())
+            .map(|e| e.config.name.clone())
             .unwrap_or_default();
         let config_stack = if config.name == base_name {
             vec![base_name.clone()]
@@ -2115,7 +2115,6 @@ impl EventReader {
         event_state["sticks"]    = sticks;
         event_state["imu"]       = imu;
         event_state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
-        event_state["configs"]   = crate::state_export::build_configs_json(&self.config, &config.name);
         if analog_triggered {
             // Analog events arrive at ~60 Hz; drop the update silently when the
             // channel is full rather than blocking the event loop.
@@ -2177,12 +2176,11 @@ impl EventReader {
         let modifiers            = self.modifiers.clone();
         let active_layout        = self.active_layout.clone();
         let held_keys            = self.held_keys.clone();
-        let all_configs          = self.config.clone();
         let analog_state_export  = self.analog_state_export.clone();
         let gaming_mode_config   = self.gaming_mode_config.clone();
-        // paused state still needs an immediate write (no channel for it yet).
         let gaming_mode_for_write = self.gaming_mode.clone();
         let state_tx_ipc         = self.state_tx.clone();
+        let config_entries_ipc   = self.config_entries.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file("/tmp/makima-control.sock");
             let listener = match UnixListener::bind("/tmp/makima-control.sock") {
@@ -2200,7 +2198,7 @@ impl EventReader {
                 let modifiers            = modifiers.clone();
                 let active_layout        = active_layout.clone();
                 let held_keys            = held_keys.clone();
-                let all_configs          = all_configs.clone();
+                let config_entries_ipc   = config_entries_ipc.clone();
                 let analog_state_export  = analog_state_export.clone();
                 let gaming_mode_config   = gaming_mode_config.clone();
                 let gaming_mode_for_write = gaming_mode_for_write.clone();
@@ -2248,11 +2246,13 @@ impl EventReader {
                                     TIMEOUT, held_keys.lock()).await {
                                     Ok(g) => g.clone(), Err(_) => return,
                                 };
-                                let base_name = all_configs
-                                    .iter()
-                                    .find(|x| x.associations == Associations::default())
-                                    .map(|x| x.name.clone())
-                                    .unwrap_or_default();
+                                let base_name = {
+                                    let entries = config_entries_ipc.lock().await;
+                                    entries.values()
+                                        .find(|e| e.config.associations == Associations::default())
+                                        .map(|e| e.config.name.clone())
+                                        .unwrap_or_default()
+                                };
                                 let stack = if config.name == base_name {
                                     vec![base_name.clone()]
                                 } else {
@@ -2270,7 +2270,6 @@ impl EventReader {
                                 event_state["sticks"]    = serde_json::Value::Null;
                                 event_state["imu"]       = serde_json::Value::Null;
                                 event_state["context"]["analog_state_export"] = serde_json::Value::Bool(false);
-                                event_state["configs"]   = crate::state_export::build_configs_json(&all_configs, &config.name);
                                 // pause/resume is a discrete event — must not be dropped.
                                 let _ = state_tx_ipc.send(
                                     StateCommand::SetEventState(Some(event_state))
@@ -2281,7 +2280,12 @@ impl EventReader {
                             }
                             _ if cmd.starts_with("config activate ") => {
                                 let name = cmd.trim_start_matches("config activate ").trim();
-                                let found = all_configs.iter().find(|c| c.name == name).cloned();
+                                let found = {
+                                    let entries = config_entries_ipc.lock().await;
+                                    entries.values()
+                                        .find(|e| e.config.name == name)
+                                        .map(|e| e.config.clone())
+                                };
                                 if let Some(new_config) = found {
                                     *current_config.lock().await = new_config.clone();
                                     eprintln!("deckery: IPC config activate: switched to {:?}", new_config.name);
@@ -2303,11 +2307,13 @@ impl EventReader {
                                     let hk = match tokio::time::timeout(TIMEOUT, held_keys.lock()).await {
                                         Ok(g) => g.clone(), Err(_) => return,
                                     };
-                                    let base_name = all_configs
-                                        .iter()
-                                        .find(|x| x.associations == Associations::default())
-                                        .map(|x| x.name.clone())
-                                        .unwrap_or_default();
+                                    let base_name = {
+                                        let entries = config_entries_ipc.lock().await;
+                                        entries.values()
+                                            .find(|e| e.config.associations == Associations::default())
+                                            .map(|e| e.config.name.clone())
+                                            .unwrap_or_default()
+                                    };
                                     let stack = if new_config.name == base_name {
                                         vec![base_name.clone()]
                                     } else {
@@ -2325,13 +2331,36 @@ impl EventReader {
                                     event_state["sticks"]    = serde_json::Value::Null;
                                     event_state["imu"]       = serde_json::Value::Null;
                                     event_state["context"]["analog_state_export"] = serde_json::Value::Bool(false);
-                                    event_state["configs"]   = crate::state_export::build_configs_json(&all_configs, &new_config.name);
                                     let _ = state_tx_ipc.send(
                                         StateCommand::SetEventState(Some(event_state))
                                     ).await;
                                 } else {
                                     eprintln!("deckery: IPC config activate: no config named {:?}", name);
                                 }
+                            }
+                            _ if cmd.starts_with("config enable ") || cmd.starts_with("config disable ") => {
+                                let enabling = cmd.starts_with("config enable ");
+                                let name = if enabling {
+                                    cmd.trim_start_matches("config enable ").trim()
+                                } else {
+                                    cmd.trim_start_matches("config disable ").trim()
+                                };
+                                // Lock, mutate, snapshot — then release the lock before await.
+                                let snapshot = {
+                                    let mut entries = config_entries_ipc.lock().await;
+                                    if let Some(entry) = entries.get_mut(name) {
+                                        entry.enabled = enabling;
+                                        eprintln!("deckery: IPC config {}: {:?}",
+                                            if enabling { "enable" } else { "disable" }, name);
+                                    } else {
+                                        eprintln!("deckery: IPC config enable/disable: no config named {:?}", name);
+                                        return;
+                                    }
+                                    entries.values().cloned().collect::<Vec<_>>()
+                                }; // lock dropped here — safe to await
+                                let _ = state_tx_ipc.send(
+                                    StateCommand::SetLoadedConfigs(snapshot)
+                                ).await;
                             }
                             _ => {}
                         }

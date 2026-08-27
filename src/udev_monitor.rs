@@ -1,4 +1,4 @@
-use crate::config::{Associations, Event};
+use crate::config::{Associations, ConfigEntry, Event};
 use crate::device_session::TrackpadSession;
 use crate::event_reader::EventReader;
 use deckery_controller::{
@@ -7,7 +7,7 @@ use deckery_controller::{
 };
 use crate::virtual_devices::VirtualDevices;
 use crate::Config;
-use std::{env, path::{Path, PathBuf}, process::Command, sync::Arc};
+use std::{collections::HashMap, env, path::{Path, PathBuf}, process::Command, sync::Arc};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use crate::kwin_watcher;
@@ -457,6 +457,25 @@ pub async fn launch_tasks(
                 None
             };
 
+            // Build the config registry: every config in the list starts enabled.
+            // Keyed by config name so IPC commands can look up by name in O(1).
+            let config_entries: Arc<Mutex<HashMap<String, ConfigEntry>>> = {
+                let map: std::collections::HashMap<String, ConfigEntry> = config_list
+                    .iter()
+                    .map(|c| (c.name.clone(), ConfigEntry { config: c.clone(), enabled: true }))
+                    .collect();
+                Arc::new(Mutex::new(map))
+            };
+            // Notify the state writer of the initial config snapshot so the tray
+            // can display all available configs before any IPC command is sent.
+            {
+                let snapshot: Vec<ConfigEntry> = config_list
+                    .iter()
+                    .map(|c| ConfigEntry { config: c.clone(), enabled: true })
+                    .collect();
+                let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(snapshot));
+            }
+
             // First reader takes the real rx; subsequent readers get a dead one.
             let gaming_rx = gaming_mode_rx_opt.take().unwrap_or_else(|| {
                 let (_, dead_rx) = mpsc::channel(1);
@@ -464,6 +483,7 @@ pub async fn launch_tasks(
             });
             let reader = EventReader::new(
                 config_list.clone(),
+                config_entries,
                 virt_dev,
                 event_rx,
                 is_tablet,
