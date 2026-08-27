@@ -250,8 +250,8 @@ impl SteamDeckController {
     /// Construct from a known evdev device path.
     ///
     /// `yieldable`: set `true` if this session should participate in the
-    /// cooperative grab protocol (willing to release `EVIOCGRAB` on request).
-    /// Only has an effect when combined with `grab=true` — see field doc.
+    /// cooperative grab protocol. See field doc for exact behaviour per
+    /// `grab` value.
     ///
     /// Immediately discovers the hidraw sibling via sysfs — a synchronous read
     /// that completes in microseconds.
@@ -296,7 +296,7 @@ impl SteamDeckController {
     ///
     /// Spawns on success:
     /// - reconnecting evdev reader (suspend-transparent `ControllerEvent` stream)
-    /// - if `yieldable && grab`: D-Bus listener for `GrabPending` / `GrabReleased`
+    /// - if `yieldable`: D-Bus listener for `GrabPending` → `ControllerEvent::ReleaseAll`
     /// - hidraw reader → `pad_rx`
     /// - hidraw writer (serialises haptics + Lizard Mode heartbeat onto one fd)
     pub async fn start(
@@ -323,8 +323,7 @@ impl SteamDeckController {
 
     /// Spawn all background tasks for a session whose evdev stream is already open.
     ///
-    /// Called by both `start()` (after opening the device) and `start_from_stream()`
-    /// (after the caller opened it via the yield protocol).
+    /// Called by `start()` after the device is opened (grabbed or not).
     fn spawn_tasks(
         self,
         stream: EventStream,

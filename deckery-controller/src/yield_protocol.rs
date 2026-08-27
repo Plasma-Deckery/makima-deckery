@@ -280,32 +280,21 @@ mod tests {
         assert!(matches!(received, Ok(true)), "GrabReleased not received after handle drop");
     }
 
-    // ── Test 3: Timeout when nobody releases ─────────────────────────────────
+    // ── Test 3: Non-EBUSY errors propagate immediately ───────────────────────
 
-    /// open_grabbed_with returns TimedOut when the grab stays busy.
+    /// Errors other than EBUSY/WouldBlock abort the retry loop immediately —
+    /// there is no point waiting for a yield if the device is outright
+    /// inaccessible (permission denied, not found, etc.).
     #[tokio::test]
-    async fn times_out_when_grab_stays_busy() {
-        // Override timeout for speed.
-        // We can't easily override the constant, so use a closure that always
-        // returns EBUSY and check we get TimedOut within reasonable time.
-        // (GRAB_TIMEOUT = 5s is too slow for a test; we use a separate helper
-        //  that accepts a deadline — or just accept the 5s and skip this test
-        //  in CI by marking it as slow. For now we test the error kind only
-        //  via a single EBUSY that never clears, with a very short wall-clock
-        //  window and rely on the deadline check.)
-
-        // Simpler approach: just verify the error kind when the grab
-        // immediately returns a non-busy error — the non-busy path exits fast.
+    async fn non_busy_error_propagates_without_retry() {
         let result = open_grabbed_with(
             Path::new(DEV_TIMEOUT),
             |_| Err::<(), _>(io::Error::new(io::ErrorKind::PermissionDenied, "no permission")),
         ).await;
 
-        assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().kind(),
             io::ErrorKind::PermissionDenied,
-            "non-EBUSY errors must propagate immediately without retry"
         );
     }
 
