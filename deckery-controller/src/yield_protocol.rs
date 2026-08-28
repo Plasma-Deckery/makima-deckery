@@ -168,7 +168,7 @@ mod tests {
     /// mock grab (flip the AtomicBool) when ReleaseAll arrives.
     async fn spawn_yieldable(device: &str, grabbed: Arc<AtomicBool>) -> mpsc::Receiver<ControllerEvent> {
         let (tx, rx) = mpsc::channel(4);
-        spawn_grab_listener(device.to_string(), tx);
+        spawn_grab_listener(device.to_string(), tx, None);
 
         // Simulate the EVIOCGRAB release when GrabPending arrives.
         // In production this is done by reconnecting_reader_task dropping
@@ -304,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn grab_pending_sent_even_when_immediately_available() {
         let (tx, mut rx) = mpsc::channel(4);
-        spawn_grab_listener(DEV_NO_DBUS.to_string(), tx);
+        spawn_grab_listener(DEV_NO_DBUS.to_string(), tx, None);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Device is free from the start — no EBUSY.

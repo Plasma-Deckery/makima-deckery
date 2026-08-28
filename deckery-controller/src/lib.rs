@@ -136,6 +136,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio_stream::StreamExt;
+use libc;
 
 /// How long to keep trying to reopen an evdev device after a stream error
 /// before concluding the device is genuinely gone.
@@ -237,8 +238,8 @@ pub struct SteamDeckController {
     /// virtual output keys before another process acquires `EVIOCGRAB`.
     ///
     /// For `grab=true` yieldable sessions: additionally releases `EVIOCGRAB`
-    /// on `GrabPending` and re-grabs on `GrabReleased` (stub — not yet
-    /// implemented; no `grab=true+yieldable` caller exists today).
+    /// on `GrabPending` (so the requester can acquire it) and re-acquires on
+    /// `GrabReleased` with the same retry/timeout logic as suspend/resume.
     ///
     /// For `grab=false` yieldable sessions (e.g. makima): only the key-flush
     /// (`ReleaseAll`) matters — the evdev stream pauses/resumes automatically,
@@ -341,15 +342,25 @@ impl SteamDeckController {
         // output keys via ControllerEvent::ReleaseAll before another process
         // acquires EVIOCGRAB — avoiding stuck virtual keys during the grab.
         //
-        // grab=true yieldable sessions additionally need to release EVIOCGRAB
-        // on GrabPending and re-grab on GrabReleased (stub — not yet implemented;
-        // there is no grab=true+yieldable caller today).
-        if self.yieldable {
+        // grab=true yieldable sessions additionally release EVIOCGRAB on
+        // GrabPending and re-grab on GrabReleased, coordinated via a dedicated
+        // channel between spawn_grab_listener and reconnecting_reader_task.
+        let yield_rx = if self.yieldable {
+            let (yield_tx, yield_rx) = if grab {
+                let (tx, rx) = mpsc::channel(4);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             grab_coordinator::spawn_grab_listener(
                 path.to_string_lossy().into_owned(),
                 event_tx.clone(),
+                yield_tx,
             );
-        }
+            yield_rx
+        } else {
+            None
+        };
 
         tokio::spawn(reconnecting_reader_task(
             stream,
@@ -358,6 +369,7 @@ impl SteamDeckController {
             resume_notify,
             event_tx,
             device_error_notify,
+            yield_rx,
         ));
 
         let (lizard_tx,         lizard_rx)         = watch::channel(initial_lizard_cfg);
@@ -396,12 +408,36 @@ impl SteamDeckController {
 
 // ── Reconnecting reader task ─────────────────────────────────────────────────
 
+/// Resolves to the next `YieldEvent` if `yield_rx` is `Some`, otherwise
+/// returns a future that never resolves — effectively disabling the yield arm
+/// in `tokio::select!` when the session is not `grab=true && yieldable=true`.
+async fn yield_rx_recv(
+    yield_rx: &mut Option<mpsc::Receiver<grab_coordinator::YieldEvent>>,
+) -> Option<grab_coordinator::YieldEvent> {
+    match yield_rx {
+        Some(rx) => rx.recv().await,
+        None     => std::future::pending().await,
+    }
+}
+
+/// Returns `true` if `e` represents a busy/locked device (EBUSY or WouldBlock).
+fn is_grab_busy(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+        || e.raw_os_error() == Some(libc::EBUSY)
+}
+
 /// Reads events from `stream` and forwards them to `tx`, transparently
 /// reconnecting on suspend/resume.
 ///
 /// On `resume_notify` or stream error, waits for the device to reappear at
 /// `path` (polling every `RECONNECT_POLL_INTERVAL`). Once back, sends
 /// `ControllerEvent::Reconnected` so the consumer can release held keys.
+///
+/// If `yield_rx` is `Some` (session is `grab=true && yieldable=true`):
+/// - On `YieldEvent::Release` (triggered by `GrabPending`): drops the stream,
+///   releasing `EVIOCGRAB`, then waits for `YieldEvent::Regrab`.
+/// - On `YieldEvent::Regrab` (triggered by `GrabReleased`): re-acquires
+///   `EVIOCGRAB` with the same retry loop as normal reconnect.
 ///
 /// If the device does not return within `RECONNECT_TIMEOUT`, fires
 /// `device_error_notify` (triggering a full reinit) and exits — dropping `tx`
@@ -413,10 +449,16 @@ pub async fn reconnecting_reader_task(
     resume_notify: Arc<Notify>,
     tx: mpsc::Sender<ControllerEvent>,
     device_error_notify: Arc<Notify>,
+    mut yield_rx: Option<mpsc::Receiver<grab_coordinator::YieldEvent>>,
 ) {
+    use grab_coordinator::YieldEvent;
+
+    // Reason the inner read loop broke out.
+    enum BreakReason { StreamError, Resume, Yield }
+
     loop {
-        // ── Read phase: forward events until stream dies or resume fires ──────
-        let was_proactive = loop {
+        // ── Read phase: forward events until stream dies, resume fires, or yield ──
+        let break_reason = loop {
             tokio::select! {
                 event = stream.next() => {
                     match event {
@@ -427,17 +469,32 @@ pub async fn reconnecting_reader_task(
                         }
                         Some(Err(e)) => {
                             println!("deckery-controller: stream error on {:?}: {} — reconnecting", path, e);
-                            break false;
+                            break BreakReason::StreamError;
                         }
                         None => {
                             println!("deckery-controller: stream ended on {:?} — reconnecting", path);
-                            break false;
+                            break BreakReason::StreamError;
                         }
                     }
                 }
                 _ = resume_notify.notified() => {
                     println!("deckery-controller: resume signal — proactive reconnect on {:?}", path);
-                    break true;
+                    break BreakReason::Resume;
+                }
+                yield_cmd = yield_rx_recv(&mut yield_rx) => {
+                    match yield_cmd {
+                        Some(YieldEvent::Release) => {
+                            println!(
+                                "deckery-controller: GrabPending — yielding EVIOCGRAB on {:?}",
+                                path
+                            );
+                            break BreakReason::Yield;
+                        }
+                        // Channel closed — disable this arm from now on.
+                        None => { yield_rx = None; }
+                        // Stale Regrab (shouldn't arrive here) — ignore.
+                        Some(YieldEvent::Regrab) => {}
+                    }
                 }
             }
         };
@@ -448,20 +505,68 @@ pub async fn reconnecting_reader_task(
         // attempts a new grab would fail with EBUSY, causing every reconnect
         // attempt to silently fail for the full RECONNECT_TIMEOUT before
         // triggering a spurious full reinit.
-        //
-        // After drop, `stream` is uninitialized — Rust allows re-assignment
-        // below because control flow either reaches `stream = s` (re-init) or
-        // exits via `return` (so `stream` is never used uninitialized).
         drop(stream);
+
+        // ── Yield path: wait for GrabReleased, then re-acquire EVIOCGRAB ─────
+        if matches!(break_reason, BreakReason::Yield) {
+            // Block until the requester signals that it has released the grab.
+            println!("deckery-controller: waiting for GrabReleased on {:?}", path);
+            loop {
+                match yield_rx_recv(&mut yield_rx).await {
+                    Some(YieldEvent::Regrab) => {
+                        println!("deckery-controller: GrabReleased — re-grabbing {:?}", path);
+                        break;
+                    }
+                    Some(YieldEvent::Release) => {} // stale duplicate — ignore
+                    None => return,                 // session ending
+                }
+            }
+
+            // Re-acquire with retry — same pattern as the normal reconnect loop.
+            let deadline = tokio::time::Instant::now() + RECONNECT_TIMEOUT;
+            stream = loop {
+                match try_open_event_stream(&path, true) {
+                    Ok(s) => {
+                        println!("deckery-controller: re-grabbed {:?} after yield", path);
+                        if tx.send(ControllerEvent::Reconnected).await.is_err() {
+                            return;
+                        }
+                        break s;
+                    }
+                    Err(e) if is_grab_busy(&e) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            eprintln!(
+                                "deckery-controller: could not re-grab {:?} within {:?} \
+                                 (last error: {}) — triggering reinit",
+                                path, RECONNECT_TIMEOUT, e
+                            );
+                            device_error_notify.notify_one();
+                            return;
+                        }
+                        tokio::time::sleep(RECONNECT_POLL_INTERVAL).await;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "deckery-controller: re-grab of {:?} failed: {} — triggering reinit",
+                            path, e
+                        );
+                        device_error_notify.notify_one();
+                        return;
+                    }
+                }
+            };
+            continue; // back to the read loop — no Reconnected sleep needed
+        }
+
+        // ── Normal reconnect path (suspend/resume or stream error) ────────────
 
         // Reactive reconnect: give the kernel a moment to complete the USB
         // reset and re-enumerate the device. Proactive: the device should
         // already be back — try immediately, polling handles any brief gap.
-        if !was_proactive {
+        if matches!(break_reason, BreakReason::StreamError) {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
-        // ── Reconnect phase: poll until device is back or timeout ─────────────
         let deadline = tokio::time::Instant::now() + RECONNECT_TIMEOUT;
         stream = loop {
             match try_open_event_stream(&path, grab) {
@@ -479,7 +584,8 @@ pub async fn reconnecting_reader_task(
                 Err(e) => {
                     if tokio::time::Instant::now() >= deadline {
                         eprintln!(
-                            "deckery-controller: {:?} did not return within {:?} (last error: {}) — triggering full reinit",
+                            "deckery-controller: {:?} did not return within {:?} \
+                             (last error: {}) — triggering full reinit",
                             path, RECONNECT_TIMEOUT, e
                         );
                         device_error_notify.notify_one();

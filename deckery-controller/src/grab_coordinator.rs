@@ -19,6 +19,19 @@ use zbus::message::Type as MsgType;
 
 use crate::ControllerEvent;
 
+// ── YieldEvent ────────────────────────────────────────────────────────────────
+
+/// Commands sent from the grab listener to the reconnecting reader task for
+/// sessions with `grab=true && yieldable=true`.
+///
+/// - `Release` — `GrabPending` received: drop `EventStream` to release `EVIOCGRAB`
+///   so the requester can acquire it.
+/// - `Regrab`  — `GrabReleased` received: re-acquire `EVIOCGRAB` and resume.
+pub enum YieldEvent {
+    Release,
+    Regrab,
+}
+
 const DBUS_PATH:      &str = "/org/Deckery/Controller1";
 const DBUS_INTERFACE: &str = "org.Deckery.Controller1";
 
@@ -52,13 +65,22 @@ pub(crate) async fn emit_signal_on(conn: &Connection, member: &str, device_path:
 // ── Listener (yieldable sessions) ─────────────────────────────────────────────
 
 /// Spawn a background task that listens for grab coordination signals for
-/// `device_path` and forwards them as `ControllerEvent`s.
+/// `device_path` and forwards them as `ControllerEvent`s and `YieldEvent`s.
 ///
-/// - `GrabPending` → `ControllerEvent::ReleaseAll` (flush held output keys)
-/// - `GrabReleased` — reserved for future re-grab logic; ignored for now
+/// - `GrabPending`  → `ControllerEvent::ReleaseAll` (all yieldable sessions flush
+///   held output keys) + `YieldEvent::Release` if `yield_tx` is `Some`
+///   (`grab=true` sessions additionally release `EVIOCGRAB`).
+/// - `GrabReleased` → `YieldEvent::Regrab` if `yield_tx` is `Some`
+///   (`grab=true` sessions re-acquire `EVIOCGRAB` and resume).
+///
+/// `yield_tx` is `Some` only for sessions with `grab=true && yieldable=true`.
 ///
 /// The task exits when `event_tx` is closed (session teardown).
-pub fn spawn_grab_listener(device_path: String, event_tx: mpsc::Sender<ControllerEvent>) {
+pub fn spawn_grab_listener(
+    device_path: String,
+    event_tx: mpsc::Sender<ControllerEvent>,
+    yield_tx: Option<mpsc::Sender<YieldEvent>>,
+) {
     tokio::spawn(async move {
         let conn = match connect().await {
             Ok(c) => c,
@@ -97,9 +119,19 @@ pub fn spawn_grab_listener(device_path: String, event_tx: mpsc::Sender<Controlle
                     if event_tx.send(ControllerEvent::ReleaseAll).await.is_err() {
                         break;
                     }
+                    if let Some(ref tx) = yield_tx {
+                        // Ignore send error — reader task may have already exited.
+                        let _ = tx.send(YieldEvent::Release).await;
+                    }
                 }
                 Some("GrabReleased") => {
-                    // Reserved: yieldable+grab sessions would re-grab here.
+                    if let Some(ref tx) = yield_tx {
+                        eprintln!(
+                            "deckery-controller: grab_coordinator: GrabReleased for {:?} — re-grabbing",
+                            device_path
+                        );
+                        let _ = tx.send(YieldEvent::Regrab).await;
+                    }
                 }
                 _ => {}
             }
@@ -129,7 +161,7 @@ mod tests {
 
     async fn subscribe_then_emit(device: &str, signal: &str) -> Option<ControllerEvent> {
         let (tx, mut rx) = mpsc::channel(4);
-        spawn_grab_listener(device.to_string(), tx);
+        spawn_grab_listener(device.to_string(), tx, None);
         // Give the listener task time to connect and subscribe before emitting.
         tokio::time::sleep(Duration::from_millis(50)).await;
         emit_signal(signal, device).await;
@@ -145,7 +177,7 @@ mod tests {
     #[tokio::test]
     async fn grab_pending_for_different_device_is_ignored() {
         let (tx, mut rx) = mpsc::channel(4);
-        spawn_grab_listener(DEV_FILTER.to_string(), tx);
+        spawn_grab_listener(DEV_FILTER.to_string(), tx, None);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Emit for an unrelated device path — the listener must not react.
@@ -165,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn listener_exits_when_channel_closes() {
         let (tx, rx) = mpsc::channel(4);
-        spawn_grab_listener(DEV_EXIT.to_string(), tx);
+        spawn_grab_listener(DEV_EXIT.to_string(), tx, None);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         drop(rx);

@@ -139,7 +139,7 @@ A session with `yieldable=true` has a background listener subscribed to `GrabPen
 
 For `grab=false` sessions (makima) this is the entire job: flush keys, continue. The evdev stream pauses automatically while `EVIOCGRAB` is held by another process and resumes on its own — no further coordination is needed.
 
-For `grab=true + yieldable=true` sessions the listener should additionally drop the `EventStream` to release `EVIOCGRAB`, wait for `GrabReleased`, then re-grab. This path is not yet implemented — see Limitations.
+For `grab=true + yieldable=true` sessions the listener additionally signals `reconnecting_reader_task` to drop the `EventStream` (releasing `EVIOCGRAB`), waits for `GrabReleased`, then re-grabs using the same retry loop as suspend/resume reconnect.
 
 ### The `yieldable` flag
 
@@ -150,7 +150,7 @@ The consuming binary's only protocol touchpoint is the `yieldable` flag passed t
 | `false` | `false` | No listener, no protocol involvement. |
 | `false` | `true` | Listener active: `GrabPending` → `ReleaseAll`. No EVIOCGRAB involvement. |
 | `true` | `false` | Requester: emits `GrabPending`/`GrabReleased`, never receives them. |
-| `true` | `true` | Full participation: `ReleaseAll` + EVIOCGRAB release on `GrabPending`, re-grab on `GrabReleased`. **Stub — not yet implemented.** |
+| `true` | `true` | Full participation: `ReleaseAll` + EVIOCGRAB release on `GrabPending`, re-grab on `GrabReleased`. |
 
 ### GrabbedHandle
 
@@ -185,13 +185,11 @@ The four tests cover: full handoff (yieldable releases on `GrabPending`, request
 
 ### What is not tested
 
-The actual EVIOCGRAB handoff between two real processes requires two evdev devices or uinput setup and is tested manually on the Steam Deck. The `grab=true + yieldable=true` EVIOCGRAB release/re-grab path has no test because it is not yet implemented. The D-Bus unavailable fallback (silent no-op when `connect()` fails) and the 5 s `GRAB_TIMEOUT` with persistent `EBUSY` are also not covered by automated tests.
+The actual EVIOCGRAB handoff between two real processes requires two evdev devices or uinput setup and is tested manually on the Steam Deck. The `grab=true + yieldable=true` EVIOCGRAB release/re-grab path is implemented but has no automated test (the two-process handoff needs real hardware). The D-Bus unavailable fallback (silent no-op when `connect()` fails) and the 5 s `GRAB_TIMEOUT` with persistent `EBUSY` are also not covered by automated tests.
 
 ---
 
 ## Limitations
-
-**`grab=true + yieldable=true` EVIOCGRAB release is not implemented.** The listener sends `ReleaseAll` but does not drop the `EventStream` or wait for `GrabReleased` to re-grab. There is currently no caller with this combination — deckery-auth uses `yieldable=false` and makima uses `grab=false`. When needed, the implementation requires two `Arc<Notify>` channels connecting the listener task to `reconnecting_reader_task`.
 
 **`EVIOCGRAB` only covers the evdev stream, not hidraw.** Grabbing `/dev/input/eventN` gives exclusive ownership of the evdev event stream. The hidraw node (`/dev/hidrawN`) is a completely separate kernel interface with no equivalent exclusive-lock mechanism. Any process that can open the hidraw node can read raw HID reports — which include the full button bitmask — even while an evdev grab is active. Access control for hidraw must be enforced at the udev/filesystem level, not through the grab protocol.
 
