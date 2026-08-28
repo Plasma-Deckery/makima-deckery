@@ -131,6 +131,8 @@ impl LizardModeHandle {
 }
 
 use evdev::{Device, EventStream, InputEvent};
+use futures_core::Stream;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -426,31 +428,58 @@ fn is_grab_busy(e: &std::io::Error) -> bool {
         || e.raw_os_error() == Some(libc::EBUSY)
 }
 
+/// Public shim — delegates to the generic inner implementation with the
+/// real `try_open_event_stream` as the reopen function.
+///
+/// See [`reconnecting_reader_task_with`] for the full documentation.
+pub async fn reconnecting_reader_task(
+    stream: EventStream,
+    path: PathBuf,
+    grab: bool,
+    resume_notify: Arc<Notify>,
+    tx: mpsc::Sender<ControllerEvent>,
+    device_error_notify: Arc<Notify>,
+    yield_rx: Option<mpsc::Receiver<grab_coordinator::YieldEvent>>,
+) {
+    reconnecting_reader_task_with(
+        stream, path, grab, resume_notify, tx, device_error_notify, yield_rx,
+        |p, g| try_open_event_stream(p, g),
+    ).await
+}
+
+/// Generic core of the reconnecting reader task — the stream-reopen operation
+/// is injected so it can be replaced with a mock in tests without needing real
+/// evdev hardware or a uinput device.
+///
 /// Reads events from `stream` and forwards them to `tx`, transparently
 /// reconnecting on suspend/resume.
 ///
-/// On `resume_notify` or stream error, waits for the device to reappear at
-/// `path` (polling every `RECONNECT_POLL_INTERVAL`). Once back, sends
+/// On `resume_notify` or stream error, calls `try_reopen(path, grab)` to get a
+/// new stream (polling every `RECONNECT_POLL_INTERVAL`). Once back, sends
 /// `ControllerEvent::Reconnected` so the consumer can release held keys.
 ///
 /// If `yield_rx` is `Some` (session is `grab=true && yieldable=true`):
 /// - On `YieldEvent::Release` (triggered by `GrabPending`): drops the stream,
 ///   releasing `EVIOCGRAB`, then waits for `YieldEvent::Regrab`.
-/// - On `YieldEvent::Regrab` (triggered by `GrabReleased`): re-acquires
-///   `EVIOCGRAB` with the same retry loop as normal reconnect.
+/// - On `YieldEvent::Regrab` (triggered by `GrabReleased`): re-acquires via
+///   `try_reopen(path, true)` with the same retry/timeout as normal reconnect.
 ///
-/// If the device does not return within `RECONNECT_TIMEOUT`, fires
-/// `device_error_notify` (triggering a full reinit) and exits — dropping `tx`
-/// closes the channel, causing the consumer to exit.
-pub async fn reconnecting_reader_task(
-    mut stream: EventStream,
+/// If `try_reopen` does not succeed within `RECONNECT_TIMEOUT`, fires
+/// `device_error_notify` and exits.
+pub(crate) async fn reconnecting_reader_task_with<S, F>(
+    mut stream: S,
     path: PathBuf,
     grab: bool,
     resume_notify: Arc<Notify>,
     tx: mpsc::Sender<ControllerEvent>,
     device_error_notify: Arc<Notify>,
     mut yield_rx: Option<mpsc::Receiver<grab_coordinator::YieldEvent>>,
-) {
+    try_reopen: F,
+)
+where
+    S: Stream<Item = io::Result<InputEvent>> + Unpin,
+    F: Fn(&Path, bool) -> io::Result<S>,
+{
     use grab_coordinator::YieldEvent;
 
     // Reason the inner read loop broke out.
@@ -501,10 +530,10 @@ pub async fn reconnecting_reader_task(
 
         // ── Drop old stream BEFORE reconnecting ────────────────────────────────
         // CRITICAL: the old EventStream holds an open evdev fd. If grab=true,
-        // that fd holds EVIOCGRAB. Keeping it alive while try_open_event_stream
-        // attempts a new grab would fail with EBUSY, causing every reconnect
-        // attempt to silently fail for the full RECONNECT_TIMEOUT before
-        // triggering a spurious full reinit.
+        // that fd holds EVIOCGRAB. Keeping it alive while try_reopen attempts a
+        // new grab would fail with EBUSY, causing every reconnect attempt to
+        // silently fail for the full RECONNECT_TIMEOUT before triggering a
+        // spurious full reinit.
         drop(stream);
 
         // ── Yield path: wait for GrabReleased, then re-acquire EVIOCGRAB ─────
@@ -525,7 +554,7 @@ pub async fn reconnecting_reader_task(
             // Re-acquire with retry — same pattern as the normal reconnect loop.
             let deadline = tokio::time::Instant::now() + RECONNECT_TIMEOUT;
             stream = loop {
-                match try_open_event_stream(&path, true) {
+                match try_reopen(&path, true) {
                     Ok(s) => {
                         println!("deckery-controller: re-grabbed {:?} after yield", path);
                         if tx.send(ControllerEvent::Reconnected).await.is_err() {
@@ -555,7 +584,7 @@ pub async fn reconnecting_reader_task(
                     }
                 }
             };
-            continue; // back to the read loop — no Reconnected sleep needed
+            continue; // back to the read loop
         }
 
         // ── Normal reconnect path (suspend/resume or stream error) ────────────
@@ -569,7 +598,7 @@ pub async fn reconnecting_reader_task(
 
         let deadline = tokio::time::Instant::now() + RECONNECT_TIMEOUT;
         stream = loop {
-            match try_open_event_stream(&path, grab) {
+            match try_reopen(&path, grab) {
                 Ok(s) => {
                     if grab {
                         println!("deckery-controller: reconnected to {:?} (grab re-acquired)", path);
@@ -676,5 +705,161 @@ mod tests {
         // find() scans live evdev nodes — result is hardware-dependent.
         // This test only verifies it doesn't panic and returns a consistent type.
         let _result: Option<SteamDeckController> = SteamDeckController::find(false);
+    }
+
+    // ── reconnecting_reader_task_with: yield path ────────────────────────────
+    //
+    // Uses a channel-backed mock stream (ReceiverStream) and a mock try_reopen
+    // closure instead of real evdev hardware. Verifies that YieldEvent::Release
+    // followed by YieldEvent::Regrab causes the task to call try_reopen and
+    // send ControllerEvent::Reconnected — without needing a uinput device.
+
+    use tokio_stream::wrappers::ReceiverStream;
+    use grab_coordinator::YieldEvent;
+    use tokio::time::{timeout, Duration};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// A mock stream backed by an mpsc channel.
+    /// Dropping the sender closes the stream (stream.next() returns None).
+    fn mock_stream() -> (
+        tokio::sync::mpsc::Sender<io::Result<InputEvent>>,
+        ReceiverStream<io::Result<InputEvent>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        (tx, ReceiverStream::new(rx))
+    }
+
+    #[tokio::test]
+    async fn yield_release_then_regrab_calls_try_reopen_and_sends_reconnected() {
+        let (_stream_tx, initial_stream) = mock_stream();
+
+        let resume_notify      = Arc::new(Notify::new());
+        let device_error_notify = Arc::new(Notify::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let (yield_tx, yield_rx)     = tokio::sync::mpsc::channel(4);
+
+        // Flag set when try_reopen is called — confirms the re-grab attempt.
+        let reopen_called = Arc::new(AtomicBool::new(false));
+        let reopen_called_clone = reopen_called.clone();
+
+        tokio::spawn(reconnecting_reader_task_with(
+            initial_stream,
+            PathBuf::from("/dev/input/event-mock-regrab"),
+            /*grab=*/ true,
+            resume_notify,
+            event_tx,
+            device_error_notify,
+            Some(yield_rx),
+            move |_path, _grab| {
+                reopen_called_clone.store(true, Ordering::SeqCst);
+                // Return a new mock stream that stays open.
+                let (_tx, rx) = tokio::sync::mpsc::channel::<io::Result<InputEvent>>(1);
+                Ok(ReceiverStream::new(rx))
+            },
+        ));
+
+        // Trigger the yield: tell the task to release EVIOCGRAB.
+        yield_tx.send(YieldEvent::Release).await.unwrap();
+
+        // After releasing, send Regrab: tell the task GrabReleased, time to re-grab.
+        // Brief sleep ensures the task has entered the wait-for-Regrab phase.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        yield_tx.send(YieldEvent::Regrab).await.unwrap();
+
+        // try_reopen must have been called.
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if reopen_called.load(Ordering::SeqCst) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("try_reopen not called after YieldEvent::Regrab");
+
+        // Reconnected must have been sent to the consumer.
+        let event = timeout(Duration::from_secs(2), event_rx.recv()).await
+            .expect("timeout waiting for Reconnected")
+            .expect("event_rx closed");
+        assert!(
+            matches!(event, ControllerEvent::Reconnected),
+            "expected Reconnected after re-grab, got something else",
+        );
+    }
+
+    #[tokio::test]
+    async fn yield_regrab_busy_then_succeeds_on_retry() {
+        let (_stream_tx, initial_stream) = mock_stream();
+
+        let resume_notify       = Arc::new(Notify::new());
+        let device_error_notify = Arc::new(Notify::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let (yield_tx, yield_rx)     = tokio::sync::mpsc::channel(4);
+
+        // First call returns EBUSY, second succeeds.
+        let attempt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let attempt_clone = attempt.clone();
+
+        tokio::spawn(reconnecting_reader_task_with(
+            initial_stream,
+            PathBuf::from("/dev/input/event-mock-busy"),
+            /*grab=*/ true,
+            resume_notify,
+            event_tx,
+            device_error_notify,
+            Some(yield_rx),
+            move |_path, _grab| {
+                let n = attempt_clone.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(io::Error::from_raw_os_error(libc::EBUSY))
+                } else {
+                    let (_tx, rx) = tokio::sync::mpsc::channel::<io::Result<InputEvent>>(1);
+                    Ok(ReceiverStream::new(rx))
+                }
+            },
+        ));
+
+        yield_tx.send(YieldEvent::Release).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        yield_tx.send(YieldEvent::Regrab).await.unwrap();
+
+        // Reconnected must arrive despite the initial EBUSY.
+        let event = timeout(Duration::from_secs(3), event_rx.recv()).await
+            .expect("timeout — EBUSY retry did not succeed")
+            .expect("event_rx closed");
+        assert!(matches!(event, ControllerEvent::Reconnected));
+        assert!(
+            attempt.load(Ordering::SeqCst) >= 2,
+            "expected at least two try_reopen calls (EBUSY + success)",
+        );
+    }
+
+    #[tokio::test]
+    async fn yield_regrab_non_busy_error_triggers_device_error_notify() {
+        let (_stream_tx, initial_stream) = mock_stream();
+
+        let resume_notify       = Arc::new(Notify::new());
+        let device_error_notify = Arc::new(Notify::new());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let (yield_tx, yield_rx)  = tokio::sync::mpsc::channel(4);
+
+        tokio::spawn(reconnecting_reader_task_with(
+            initial_stream,
+            PathBuf::from("/dev/input/event-mock-error"),
+            /*grab=*/ true,
+            resume_notify,
+            event_tx,
+            device_error_notify.clone(),
+            Some(yield_rx),
+            |_path, _grab| -> io::Result<ReceiverStream<io::Result<InputEvent>>> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "no permission"))
+            },
+        ));
+
+        yield_tx.send(YieldEvent::Release).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        yield_tx.send(YieldEvent::Regrab).await.unwrap();
+
+        // Non-EBUSY error must fire device_error_notify immediately.
+        timeout(Duration::from_secs(2), device_error_notify.notified()).await
+            .expect("device_error_notify not fired on non-EBUSY re-grab error");
     }
 }
