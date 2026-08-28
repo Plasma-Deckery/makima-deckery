@@ -429,30 +429,6 @@ pub(crate) fn is_grab_busy(e: &io::Error) -> bool {
         || e.raw_os_error() == Some(libc::EBUSY)
 }
 
-/// Public entry point for generic (non-Steam Deck) devices.
-///
-/// Delegates to the generic inner implementation with the real
-/// `try_open_event_stream` as the reopen function and no yield-protocol
-/// involvement (`yield_rx = None`).
-///
-/// Steam Deck sessions use [`SteamDeckController::start`] instead, which
-/// wires up the yield-protocol channel internally.
-///
-/// See [`reconnecting_reader_task_with`] for the full documentation.
-pub async fn reconnecting_reader_task(
-    stream: EventStream,
-    path: PathBuf,
-    grab: bool,
-    resume_notify: Arc<Notify>,
-    tx: mpsc::Sender<ControllerEvent>,
-    device_error_notify: Arc<Notify>,
-) {
-    reconnecting_reader_task_with(
-        stream, path, grab, resume_notify, tx, device_error_notify, None,
-        |p, g| try_open_event_stream(p, g),
-    ).await
-}
-
 /// Generic core of the reconnecting reader task — the stream-reopen operation
 /// is injected so it can be replaced with a mock in tests without needing real
 /// evdev hardware or a uinput device.
@@ -634,8 +610,8 @@ where
 }
 
 /// Try to open an evdev device and return an `EventStream`. Non-panicking —
-/// used in the reconnect poll loop and by consumers for generic devices.
-pub fn try_open_event_stream(path: &Path, grab: bool) -> std::io::Result<EventStream> {
+/// used in the reconnect poll loop inside `reconnecting_reader_task_with`.
+pub(crate) fn try_open_event_stream(path: &Path, grab: bool) -> std::io::Result<EventStream> {
     let mut device = Device::open(path)?;
     if grab { device.grab()?; }
     device.into_event_stream()

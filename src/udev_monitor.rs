@@ -47,33 +47,55 @@ pub struct Environment {
 ///
 /// Generic devices have no resume watcher (no logind integration needed) — they
 /// reconnect reactively on stream errors only.
+/// Open a generic (non-Steam Deck) evdev device and spawn a simple event
+/// reader task. On stream error, fires `device_error_notify` to trigger a
+/// full device reinit via the udev monitor loop — no reconnect logic needed.
 fn spawn_event_reader(
     path: PathBuf,
     grab: bool,
     device_error_notify: Arc<Notify>,
 ) -> Option<mpsc::Receiver<ControllerEvent>> {
-    use deckery_controller::{try_open_event_stream, reconnecting_reader_task};
-    let stream = match try_open_event_stream(&path, grab) {
-        Ok(s) => {
-            if grab {
-                println!("deckery: grabbed {:?} (exclusive evdev access)", path);
-            } else {
-                println!("deckery: opened {:?} (no grab)", path);
-            }
-            s
-        }
+    let mut device = match evdev::Device::open(&path) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("deckery: cannot open {:?}: {} — skipping device", path, e);
             return None;
         }
     };
-    // Generic devices don't have a resume watcher — use a dead Notify that is
-    // never fired. Reconnect happens reactively when the stream errors out.
-    let resume_notify = Arc::new(Notify::new());
+    if grab {
+        if let Err(e) = device.grab() {
+            eprintln!("deckery: cannot grab {:?}: {} — skipping device", path, e);
+            return None;
+        }
+        println!("deckery: grabbed {:?} (exclusive evdev access)", path);
+    } else {
+        println!("deckery: opened {:?} (no grab)", path);
+    }
+    let mut stream = match device.into_event_stream() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("deckery: cannot stream {:?}: {} — skipping device", path, e);
+            return None;
+        }
+    };
     let (event_tx, event_rx) = mpsc::channel(64);
-    tokio::spawn(reconnecting_reader_task(
-        stream, path, grab, resume_notify, event_tx, device_error_notify,
-    ));
+    tokio::spawn(async move {
+        loop {
+            match stream.next().await {
+                Some(Ok(event)) => {
+                    if event_tx.send(ControllerEvent::Input(event)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Err(e)) => {
+                    eprintln!("deckery: {:?} stream error: {} — triggering reinit", path, e);
+                    device_error_notify.notify_one();
+                    break;
+                }
+                None => break,
+            }
+        }
+    });
     Some(event_rx)
 }
 
