@@ -135,11 +135,17 @@ Signals:    GrabPending(device_path: str)
 
 ### Yieldable session flow
 
-A session with `yieldable=true` has a background listener subscribed to `GrabPending` for its device path. When the signal arrives, the listener forwards `ControllerEvent::ReleaseAll` to the consumer so it can flush held virtual output keys.
+A session with `yieldable=true` has a background listener subscribed to `GrabPending` and `GrabReleased` for its device path. When `GrabPending` arrives, the listener forwards `ControllerEvent::ReleaseAll` to the consumer so it can flush held virtual output keys.
 
 For `grab=false` sessions (makima) this is the entire job: flush keys, continue. The evdev stream pauses automatically while `EVIOCGRAB` is held by another process and resumes on its own — no further coordination is needed.
 
-For `grab=true + yieldable=true` sessions the listener additionally signals `reconnecting_reader_task` to drop the `EventStream` (releasing `EVIOCGRAB`), waits for `GrabReleased`, then re-grabs using the same retry loop as suspend/resume reconnect.
+For `grab=true + yieldable=true` sessions the listener additionally:
+1. Sends a `Release` command to `reconnecting_reader_task`, which drops the `EventStream` to release `EVIOCGRAB`.
+2. Waits for `GrabReleased` on D-Bus.
+3. Emits a new `GrabPending` before re-grabbing, so `grab=false+yieldable` sessions can flush any keys that arrived in the brief window where no process held the grab.
+4. Sends a `Regrab` command to `reconnecting_reader_task`, which calls `try_open_event_stream` in a retry loop (same timeout as suspend/resume reconnect) until it succeeds or times out.
+
+The listener suppresses the echo of its own re-grab `GrabPending` using a `skip_next_grab_pending` flag — see Limitations.
 
 ### The `yieldable` flag
 
@@ -173,19 +179,32 @@ struct MySession {
 
 Tests use the D-Bus **session bus** (`Connection::session()`) so no root access is required and any CI environment with a running `dbus-daemon` works. Each test uses a unique fake device path as a filter so tests can run in parallel on the same bus without interfering with each other's signals.
 
-The four tests cover: `GrabPending` delivers `ReleaseAll` to the subscriber, path filtering (signals for other devices are ignored), `GrabReleased` is silently ignored (stub), listener task exits when the consumer channel is closed.
+The four tests cover: `GrabPending` delivers `ReleaseAll` to the subscriber, path filtering (signals for other devices are ignored), `GrabReleased` is silently ignored when `yield_tx` is `None` (grab=false session), listener task exits when the consumer channel is closed.
 
-### yield_protocol — protocol integration (4 tests)
+### yield_protocol — protocol integration (6 tests)
 
 The grab operation is injected via `open_grabbed_with<S>`, which accepts a `try_grab: Fn(&Path) -> io::Result<S>` closure. This allows the EVIOCGRAB interaction to be replaced with a mock — no real evdev hardware required. Tests use `S = ()` and an `Arc<AtomicBool>` to simulate `EBUSY`/release.
 
-The `spawn_yieldable` helper subscribes two D-Bus listeners on the same signal for a given device path: one via `spawn_grab_listener` (delivers `ControllerEvent::ReleaseAll` to the test channel) and one raw `MessageStream` (flips the `AtomicBool` to simulate EVIOCGRAB release). Together they produce a genuine D-Bus roundtrip: `GrabPending` out → yieldable reacts → bool clears → requester loop succeeds → `drop(handle)` → `GrabReleased` on bus.
+The six tests cover:
+- Full handoff: yieldable session releases mock grab on `GrabPending`, requester acquires.
+- `GrabbedHandle::drop` emits `GrabReleased` verified via raw D-Bus subscription.
+- Non-EBUSY errors propagate immediately without entering the retry loop.
+- `GrabPending` is always emitted upfront even when the device is immediately available.
+- Multi-participant: a `grab=false+yieldable` observer receives `ReleaseAll` twice — once on the requester's initial `GrabPending`, once on the re-grab notification emitted after `GrabReleased`.
+- Echo suppression: the `skip_next_grab_pending` flag prevents the re-grab `GrabPending` from looping back as a spurious `Release` command.
 
-The four tests cover: full handoff (yieldable releases on `GrabPending`, requester acquires), `GrabbedHandle::drop` emits `GrabReleased` verified via raw D-Bus subscription, non-EBUSY errors propagate immediately without entering the retry loop, `GrabPending` is always emitted upfront even when the device is immediately available.
+### reconnecting_reader_task — yield path (3 tests)
+
+The stream-reopen operation is injected via `reconnecting_reader_task_with<S, F>`, which accepts a `try_reopen: Fn(&Path, bool) -> io::Result<S>` closure. Tests use `ReceiverStream<io::Result<InputEvent>>` as a channel-backed mock stream — no uinput device or real evdev hardware needed.
+
+The three tests cover:
+- `YieldEvent::Release` followed by `YieldEvent::Regrab` causes `try_reopen` to be called and `ControllerEvent::Reconnected` to be sent on the consumer channel.
+- EBUSY on the first `try_reopen` call is retried; success on the second call produces `Reconnected`.
+- A non-EBUSY error from `try_reopen` fires `device_error_notify` immediately without entering the retry loop.
 
 ### What is not tested
 
-The actual EVIOCGRAB handoff between two real processes requires two evdev devices or uinput setup and is tested manually on the Steam Deck. The `grab=true + yieldable=true` EVIOCGRAB release/re-grab path is implemented but has no automated test (the two-process handoff needs real hardware). The D-Bus unavailable fallback (silent no-op when `connect()` fails) and the 5 s `GRAB_TIMEOUT` with persistent `EBUSY` are also not covered by automated tests.
+The actual two-process EVIOCGRAB handoff requires two real evdev devices and is verified manually on the Steam Deck. The D-Bus unavailable fallback (silent no-op when `connect()` fails) and the 5 s `GRAB_TIMEOUT` with persistent `EBUSY` are not covered by automated tests.
 
 ---
 
@@ -198,3 +217,5 @@ The actual EVIOCGRAB handoff between two real processes requires two evdev devic
 **hidraw discovery is sysfs-dependent.** Non-standard kernel configurations, containers without `/sys`, or non-Steam Deck hardware result in `hidraw_path = None` and no trackpad, haptics, or Lizard Mode suppression.
 
 **`click_pressure` is not re-sent on USB reset.** The Steam Deck firmware retains click-pressure thresholds until a USB reset, so re-sending on reconnect is not necessary under normal conditions. If a USB reset does occur, the firmware reverts to its default threshold. The library does not currently re-send on reconnect.
+
+**Re-grab notification has a race window.** When a `grab=true+yieldable=true` session re-grabs after `GrabReleased`, it emits `GrabPending` to notify other yieldable sessions to flush any keys that arrived during the grab gap. The listener uses a `skip_next_grab_pending` flag to suppress the echo of that emission. If another requester emits `GrabPending` for the same device path in the window between the re-grab emission and its echo arriving at the listener, the flag silently consumes the requester's signal instead. The consequence is a missed key flush — the `grab=false+yieldable` session does not receive `ReleaseAll` for that round. This is not data corruption. A clean fix would require a dedicated signal (e.g. `RegrabPending`) distinct from `GrabPending`; the complexity is disproportionate given that no concurrent-requester scenario currently exists in practice.
