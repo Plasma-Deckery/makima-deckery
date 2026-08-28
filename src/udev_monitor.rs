@@ -72,7 +72,7 @@ fn spawn_event_reader(
     let resume_notify = Arc::new(Notify::new());
     let (event_tx, event_rx) = mpsc::channel(64);
     tokio::spawn(reconnecting_reader_task(
-        stream, path, grab, resume_notify, event_tx, device_error_notify, None,
+        stream, path, grab, resume_notify, event_tx, device_error_notify,
     ));
     Some(event_rx)
 }

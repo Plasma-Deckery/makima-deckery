@@ -364,7 +364,7 @@ impl SteamDeckController {
             None
         };
 
-        tokio::spawn(reconnecting_reader_task(
+        tokio::spawn(reconnecting_reader_task_with(
             stream,
             path,
             grab,
@@ -372,6 +372,7 @@ impl SteamDeckController {
             event_tx,
             device_error_notify,
             yield_rx,
+            |p, g| try_open_event_stream(p, g),
         ));
 
         let (lizard_tx,         lizard_rx)         = watch::channel(initial_lizard_cfg);
@@ -428,21 +429,26 @@ pub(crate) fn is_grab_busy(e: &io::Error) -> bool {
         || e.raw_os_error() == Some(libc::EBUSY)
 }
 
-/// Public shim — delegates to the generic inner implementation with the
-/// real `try_open_event_stream` as the reopen function.
+/// Public entry point for generic (non-Steam Deck) devices.
+///
+/// Delegates to the generic inner implementation with the real
+/// `try_open_event_stream` as the reopen function and no yield-protocol
+/// involvement (`yield_rx = None`).
+///
+/// Steam Deck sessions use [`SteamDeckController::start`] instead, which
+/// wires up the yield-protocol channel internally.
 ///
 /// See [`reconnecting_reader_task_with`] for the full documentation.
-pub(crate) async fn reconnecting_reader_task(
+pub async fn reconnecting_reader_task(
     stream: EventStream,
     path: PathBuf,
     grab: bool,
     resume_notify: Arc<Notify>,
     tx: mpsc::Sender<ControllerEvent>,
     device_error_notify: Arc<Notify>,
-    yield_rx: Option<mpsc::Receiver<grab_coordinator::YieldEvent>>,
 ) {
     reconnecting_reader_task_with(
-        stream, path, grab, resume_notify, tx, device_error_notify, yield_rx,
+        stream, path, grab, resume_notify, tx, device_error_notify, None,
         |p, g| try_open_event_stream(p, g),
     ).await
 }
