@@ -123,7 +123,7 @@ pub(crate) async fn open_grabbed_with<S>(
                 let handle = GrabbedHandle { conn, path: path_str.to_string() };
                 return Ok((stream, handle));
             }
-            Err(e) if is_busy(&e) => {
+            Err(e) if crate::is_grab_busy(&e) => {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -135,13 +135,6 @@ pub(crate) async fn open_grabbed_with<S>(
             Err(e) => return Err(e),
         }
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn is_busy(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::WouldBlock
-        || e.raw_os_error() == Some(libc::EBUSY)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -36,12 +36,12 @@
 //! let session = controller.start(false, Arc::new(Notify::new()), None);
 //! ```
 
-pub mod grab_coordinator;
-pub mod haptic;
-pub mod hidraw;
-pub mod lizard_mode;
-pub mod resume_watcher;
-pub mod yield_protocol;
+pub(crate) mod grab_coordinator;
+pub(crate) mod haptic;
+pub(crate) mod hidraw;
+pub(crate) mod lizard_mode;
+pub(crate) mod resume_watcher;
+pub(crate) mod yield_protocol;
 
 // Re-export the types that consumers need so they import from here,
 // not from the internal submodule. This is the stable public API surface.
@@ -423,8 +423,8 @@ async fn yield_rx_recv(
 }
 
 /// Returns `true` if `e` represents a busy/locked device (EBUSY or WouldBlock).
-fn is_grab_busy(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::WouldBlock
+pub(crate) fn is_grab_busy(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::WouldBlock
         || e.raw_os_error() == Some(libc::EBUSY)
 }
 
@@ -432,7 +432,7 @@ fn is_grab_busy(e: &std::io::Error) -> bool {
 /// real `try_open_event_stream` as the reopen function.
 ///
 /// See [`reconnecting_reader_task_with`] for the full documentation.
-pub async fn reconnecting_reader_task(
+pub(crate) async fn reconnecting_reader_task(
     stream: EventStream,
     path: PathBuf,
     grab: bool,

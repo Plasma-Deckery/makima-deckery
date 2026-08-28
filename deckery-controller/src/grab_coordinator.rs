@@ -27,7 +27,7 @@ use crate::ControllerEvent;
 /// - `Release` — `GrabPending` received: drop `EventStream` to release `EVIOCGRAB`
 ///   so the requester can acquire it.
 /// - `Regrab`  — `GrabReleased` received: re-acquire `EVIOCGRAB` and resume.
-pub enum YieldEvent {
+pub(crate) enum YieldEvent {
     Release,
     Regrab,
 }
@@ -76,7 +76,7 @@ pub(crate) async fn emit_signal_on(conn: &Connection, member: &str, device_path:
 /// `yield_tx` is `Some` only for sessions with `grab=true && yieldable=true`.
 ///
 /// The task exits when `event_tx` is closed (session teardown).
-pub fn spawn_grab_listener(
+pub(crate) fn spawn_grab_listener(
     device_path: String,
     event_tx: mpsc::Sender<ControllerEvent>,
     yield_tx: Option<mpsc::Sender<YieldEvent>>,
