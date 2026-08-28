@@ -407,16 +407,6 @@ impl RawConfig {
     }
 }
 
-/// A loaded config file together with its runtime enabled/disabled flag.
-/// The `enabled` flag can be toggled via IPC without touching the file.
-/// Disabled entries are invisible to `update_config()` and therefore never
-/// become the active config.
-#[derive(Debug, Clone)]
-pub struct ConfigEntry {
-    pub config:  Config,
-    pub enabled: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub name: String,
@@ -438,13 +428,35 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new_from_file(file: &str, file_name: String) -> Self {
-        let raw_config = RawConfig::new_from_file(file);
-        let raw_trackpad = raw_config.trackpad.clone();
+    /// Parse a config file, returning `Err(message)` instead of panicking on
+    /// read or TOML errors.  Associations are left at default — the caller
+    /// (ConfigRegistry::load) sets them from the filename.
+    pub fn try_from_file(file: &str, file_name: String) -> Result<Self, String> {
+        println!("Parsing config file:\n{:?}\n",
+            file.rsplit_once('/').map(|(_, f)| f).unwrap_or(file));
+        let content = std::fs::read_to_string(file)
+            .map_err(|e| format!("Cannot read {:?}: {}", file, e))?;
+        let raw: RawConfig = toml::from_str(&content)
+            .map_err(|e| format!("TOML error in {:?}: {}", file_name, e))?;
+        Ok(Self::from_raw(raw, file_name))
+    }
+
+    /// Merge `base` into `self` and return the result as a new Config.
+    /// `self` supplies the overrides; `base` fills everything not overridden.
+    /// The returned Config has `override_bindings` set to `self`'s raw bindings
+    /// so `state_export` can distinguish inherited from app-specific entries.
+    pub fn merged_with_base(&self, base: &Config) -> Self {
+        let mut result = self.clone();
+        result.merge_base(base);
+        result
+    }
+
+    /// Build a Config from an already-parsed RawConfig.
+    /// Associations are left at default — set them separately after construction.
+    fn from_raw(raw_config: RawConfig, file_name: String) -> Self {
+        let raw_trackpad    = raw_config.trackpad.clone();
         let raw_gaming_mode = raw_config.gaming_mode.clone();
         let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config);
-        let associations = Default::default();
-
         let trackpad = TrackpadConfig {
             left: parse_trackpad_side(raw_trackpad.left.as_ref()),
             right: parse_trackpad_side(raw_trackpad.right.as_ref()),
@@ -456,13 +468,10 @@ impl Config {
             gesture_handler_config: raw_trackpad.gestures
                 .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
         };
-
-        // Parse [gaming_mode] section; fall back to defaults when absent.
         let gaming_mode_config = GamingModeConfig::from_raw(raw_gaming_mode);
-
         Self {
             name: file_name,
-            associations,
+            associations: Default::default(),
             bindings,
             override_bindings: None,
             settings,
@@ -470,6 +479,11 @@ impl Config {
             trackpad,
             gaming_mode_config,
         }
+    }
+
+    pub fn new_from_file(file: &str, file_name: String) -> Self {
+        let raw_config = RawConfig::new_from_file(file);
+        Self::from_raw(raw_config, file_name)
     }
 
     pub fn new_empty(file_name: String) -> Self {

@@ -11,7 +11,7 @@
 
 use crate::config::{Event, GamingModeConfig};
 use crate::resolver::{resolve_binding, ResolvedBinding};
-use crate::Config;
+use crate::config::Config;
 use evdev::Key;
 use serde::Serialize;
 use serde_json;

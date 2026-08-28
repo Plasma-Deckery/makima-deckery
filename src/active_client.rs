@@ -1,5 +1,5 @@
 use crate::udev_monitor::{Client, Environment, Server};
-use crate::Config;
+use crate::config::Config;
 use serde_json;
 use std::process::{Command, Stdio};
 use swayipc_async::Connection;

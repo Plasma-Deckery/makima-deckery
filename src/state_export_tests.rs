@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{Bindings, Event, GamingModeConfig, MappedModifiers};
-use crate::Config;
+use crate::config::Config;
 use evdev::Key;
 use std::collections::{HashMap, HashSet};
 

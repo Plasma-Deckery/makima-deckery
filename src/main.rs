@@ -1,6 +1,7 @@
 mod active_client;
 mod analog;
 mod config;
+mod config_registry;
 mod device_session;
 mod event_reader;
 mod gesture_pad;
@@ -18,13 +19,14 @@ mod trackpad_router;
 mod udev_monitor;
 mod virtual_devices;
 
+use crate::config_registry::ConfigRegistry;
 use crate::udev_monitor::*;
-use config::Config;
 use std::env;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio;
-use tokio::sync::Mutex;
+use tokio::net::UnixListener;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 /// Process start time, set once at the top of `main()`. Used to log
@@ -53,23 +55,6 @@ fn wait_for_config_dir(path: &str) {
     }
 }
 
-pub fn load_config_files(config_dir: &str) -> Vec<Config> {
-    let dir = match std::fs::read_dir(config_dir) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    let mut config_files: Vec<Config> = Vec::new();
-    for file in dir {
-        let filename: String = file.as_ref().unwrap().file_name().into_string().unwrap();
-        if filename.ends_with(".toml") && !filename.starts_with(".") {
-            let name: String = filename.split(".toml").collect::<Vec<&str>>()[0].to_string();
-            let config_file: Config =
-                Config::new_from_file(file.unwrap().path().to_str().unwrap(), name);
-            config_files.push(config_file);
-        }
-    }
-    config_files
-}
 
 #[tokio::main]
 async fn main() {
@@ -106,10 +91,40 @@ async fn main() {
             path
         }
     };
-    let config_files = load_config_files(&config_dir);
+    let registry = ConfigRegistry::load(&config_dir);
     eprintln!("deckery: config loaded, +{}ms since startup", startup_ms());
     let state_tx = state_writer::spawn_state_writer();
+    // Publish initial config list so the tray sees all configs on startup,
+    // even before any device is connected.
+    let _ = state_tx.try_send(state_writer::StateCommand::SetLoadedConfigs(registry.snapshot()));
     let tasks: Vec<JoinHandle<()>> = Vec::new();
-    let gaming_mode: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    start_monitoring_udev(config_files, config_dir, tasks, gaming_mode, state_tx).await;
+    let gaming_mode: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
+
+    // IPC socket — bound once here, broadcast to all active EventReaders.
+    let (ipc_tx, _) = broadcast::channel::<String>(16);
+    {
+        let ipc_tx = ipc_tx.clone();
+        tokio::spawn(async move {
+            let _ = std::fs::remove_file("/tmp/makima-control.sock");
+            let listener = match UnixListener::bind("/tmp/makima-control.sock") {
+                Ok(l) => l,
+                Err(e) => { eprintln!("deckery: IPC socket bind failed: {}", e); return; }
+            };
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { continue };
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    reader.read_line(&mut line),
+                ).await;
+                if read.is_err() || read.unwrap().is_err() { continue; }
+                let cmd = line.trim().to_string();
+                if !cmd.is_empty() { let _ = ipc_tx.send(cmd); }
+            }
+        });
+    }
+
+    start_monitoring_udev(registry, config_dir, tasks, gaming_mode, state_tx, ipc_tx).await;
 }

@@ -1,5 +1,6 @@
 use crate::active_client::*;
-use crate::config::{parse_modifiers, Associations, Axis, ConfigEntry, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
+use crate::config::{parse_modifiers, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
+use crate::config_registry::ConfigRegistry;
 use crate::device_session::TrackpadSession;
 use crate::mt_trackpad;
 use deckery_controller::{HapticPad, HapticRequest, LizardModeHandle};
@@ -10,22 +11,20 @@ use crate::trackpad::PadState;
 use crate::trackpad_router;
 use crate::udev_monitor::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
-use crate::Config;
+use crate::config::Config;
 use deckery_controller::ControllerEvent;
 use evdev::{AbsoluteAxisType, EventType, InputEvent, Key, RelativeAxisType};
 use fork::{fork, setsid, Fork};
 use std::{
     collections::HashMap,
     future::Future,
-    io::{BufRead, BufReader},
     option::Option,
     pin::Pin,
     process::{Command, Stdio},
     str::FromStr,
     sync::Arc,
 };
-use tokio::sync::{mpsc, Mutex, Notify};
-use tokio::net::UnixListener;
+use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 struct Stick {
     function: String,
@@ -57,7 +56,8 @@ struct Settings {
 }
 
 pub struct EventReader {
-    config_entries: Arc<Mutex<HashMap<String, ConfigEntry>>>,
+    registry: Arc<ConfigRegistry>,
+    device_name: String,
     /// Receiver for controller events from the reconnecting reader task.
     /// `ControllerEvent::Input` carries normal evdev events; `Reconnected`
     /// signals a transparent reconnect (EventReader must release held keys).
@@ -133,8 +133,9 @@ pub struct EventReader {
 
 impl EventReader {
     pub fn new(
-        config: Vec<Config>,
-        config_entries: Arc<Mutex<HashMap<String, ConfigEntry>>>,
+        base_config: Config,
+        registry: Arc<ConfigRegistry>,
+        device_name: String,
         virt_dev: Arc<Mutex<VirtualDevices>>,
         event_rx: mpsc::Receiver<ControllerEvent>,
         is_tablet: bool,
@@ -169,47 +170,24 @@ impl EventReader {
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(
-            config
-                .iter()
-                .find(|&x| x.associations == Associations::default())
-                .unwrap()
-                .clone(),
-        ));
-        let lstick_function = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(base_config.clone()));
+
+        let lstick_function = base_config.settings
             .get("LSTICK")
             .unwrap_or(&"disabled".to_string())
             .to_string();
-        let lstick_sensitivity: u64 = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let lstick_sensitivity: u64 = base_config.settings
             .get("LSTICK_SENSITIVITY")
             .unwrap_or(&"0".to_string())
             .parse::<u64>()
             .expect("Invalid value for LSTICK_SENSITIVITY, please use an integer value >= 0");
-        let lstick_deadzone: i32 = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let lstick_deadzone: i32 = base_config.settings
             .get("LSTICK_DEADZONE")
             .unwrap_or(&"5".to_string())
             .parse::<i32>()
             .expect("Invalid value for LSTICK_DEADZONE, please use an integer between 0 and 128.");
-        let lstick_activation_modifiers: Vec<Event> = parse_modifiers(
-            &config
-                .iter()
-                .find(|&x| x.associations == Associations::default())
-                .unwrap()
-                .settings,
-            "LSTICK_ACTIVATION_MODIFIERS",
-        );
+        let lstick_activation_modifiers: Vec<Event> =
+            parse_modifiers(&base_config.settings, "LSTICK_ACTIVATION_MODIFIERS");
         let lstick = Stick {
             function: lstick_function,
             sensitivity: lstick_sensitivity,
@@ -217,40 +195,22 @@ impl EventReader {
             activation_modifiers: lstick_activation_modifiers,
         };
 
-        let rstick_function: String = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let rstick_function: String = base_config.settings
             .get("RSTICK")
             .unwrap_or(&"scroll".to_string())
             .to_string();
-        let rstick_sensitivity: u64 = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let rstick_sensitivity: u64 = base_config.settings
             .get("RSTICK_SENSITIVITY")
             .unwrap_or(&"0".to_string())
             .parse::<u64>()
             .expect("Invalid value for RSTICK_SENSITIVITY, please use an integer value >= 0");
-        let rstick_deadzone: i32 = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let rstick_deadzone: i32 = base_config.settings
             .get("RSTICK_DEADZONE")
             .unwrap_or(&"5".to_string())
             .parse::<i32>()
             .expect("Invalid value for RSTICK_DEADZONE, please use an integer between 0 and 128.");
-        let rstick_activation_modifiers: Vec<Event> = parse_modifiers(
-            &config
-                .iter()
-                .find(|&x| x.associations == Associations::default())
-                .unwrap()
-                .settings,
-            "RSTICK_ACTIVATION_MODIFIERS",
-        );
+        let rstick_activation_modifiers: Vec<Event> =
+            parse_modifiers(&base_config.settings, "RSTICK_ACTIVATION_MODIFIERS");
         let rstick = Stick {
             function: rstick_function,
             sensitivity: rstick_sensitivity,
@@ -258,91 +218,55 @@ impl EventReader {
             activation_modifiers: rstick_activation_modifiers,
         };
 
-        let axis_16_bit: bool = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let axis_16_bit: bool = base_config.settings
             .get("16_BIT_AXIS")
             .unwrap_or(&"false".to_string())
             .parse()
             .expect("16_BIT_AXIS can only be true or false.");
 
-        let stadia: bool = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let stadia: bool = base_config.settings
             .get("STADIA")
             .unwrap_or(&"false".to_string())
             .parse()
             .expect("STADIA can only be true or false.");
 
-        let chain_only: bool = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let chain_only: bool = base_config.settings
             .get("CHAIN_ONLY")
             .unwrap_or(&"true".to_string())
             .parse()
             .expect("CHAIN_ONLY can only be true or false.");
 
-        let invert_cursor_axis: bool = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let invert_cursor_axis: bool = base_config.settings
             .get("INVERT_CURSOR_AXIS")
             .unwrap_or(&"false".to_string())
             .parse()
             .expect("INVERT_CURSOR_AXIS can only be true or false.");
 
-        let invert_scroll_axis: bool = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let invert_scroll_axis: bool = base_config.settings
             .get("INVERT_SCROLL_AXIS")
             .unwrap_or(&"false".to_string())
             .parse()
             .expect("INVERT_SCROLL_AXIS can only be true or false.");
 
-        let cursor_speed: i32 = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let cursor_speed: i32 = base_config.settings
             .get("CURSOR_SPEED")
             .unwrap_or(&"0".to_string())
             .parse()
             .expect("Invalid value for CURSOR_SPEED, please use an integer value.");
 
-        let cursor_acceleration: f32 = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let cursor_acceleration: f32 = base_config.settings
             .get("CURSOR_ACCEL")
             .unwrap_or(&"1".to_string())
             .parse()
             .expect("Invalid value for CURSOR_ACCEL, please use an float value between 0 and 1.");
 
-        let scroll_speed: i32 = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let scroll_speed: i32 = base_config.settings
             .get("SCROLL_SPEED")
             .unwrap_or(&"0".to_string())
             .parse()
             .expect("Invalid value for SCROLL_SPEED, please use an integer value.");
 
-        let scroll_acceleration: f32 = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let scroll_acceleration: f32 = base_config.settings
             .get("SCROLL_ACCEL")
             .unwrap_or(&"1".to_string())
             .parse()
@@ -357,13 +281,7 @@ impl EventReader {
             speed: scroll_speed,
             acceleration: scroll_acceleration,
         };
-        let layout_switcher = if let Some(combination) = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
-            .get("LAYOUT_SWITCHER")
-        {
+        let layout_switcher = if let Some(combination) = base_config.settings.get("LAYOUT_SWITCHER") {
             if let Some(sequence) = combination.rsplit_once("-") {
                 let mut mods: Vec<Event> = sequence
                     .0
@@ -385,31 +303,21 @@ impl EventReader {
         } else {
             None
         };
-        let notify_layout_switch: bool = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let notify_layout_switch: bool = base_config.settings
             .get("NOTIFY_LAYOUT_SWITCH")
             .unwrap_or(&"false".to_string())
             .parse()
             .expect("NOTIFY_LAYOUT_SWITCH can only be true or false.");
 
-        let cursor_when_paused: bool = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap()
-            .settings
+        let cursor_when_paused: bool = base_config.settings
             .get("CURSOR_WHEN_PAUSED")
             .unwrap_or(&"true".to_string())
             .parse()
             .expect("CURSOR_WHEN_PAUSED can only be true or false.");
 
-        let base_cfg = config
-            .iter()
-            .find(|&x| x.associations == Associations::default())
-            .unwrap();
-        let trackpad = base_cfg.trackpad.clone();
+        let trackpad = base_config.trackpad.clone();
+        let gaming_mode_config = base_config.gaming_mode_config.clone();
+
         let settings = Settings {
             lstick,
             rstick,
@@ -424,14 +332,10 @@ impl EventReader {
             notify_layout_switch,
             cursor_when_paused,
         };
-        let gaming_mode_config = config
-            .iter()
-            .find(|c| c.associations == Associations::default())
-            .map(|c| c.gaming_mode_config.clone())
-            .unwrap_or_default();
 
         Self {
-            config_entries,
+            registry,
+            device_name,
             event_rx: Mutex::new(event_rx),
             is_tablet,
             max_abs_wheel,
@@ -472,17 +376,12 @@ impl EventReader {
         }
     }
 
-    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>, session: Option<TrackpadSession>) {
-        let name = self.config_entries.lock().await
-            .values()
-            .find(|e| e.config.associations == Associations::default())
-            .map(|e| e.config.name.clone())
-            .unwrap_or_default();
+    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>, ipc_rx: broadcast::Receiver<String>, session: Option<TrackpadSession>) {
+        let name = self.device_name.clone();
         let name = &name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
         self.write_state().await;
-        self.start_control_socket().await;
 
         tokio::join!(
             self.event_loop(),
@@ -493,6 +392,7 @@ impl EventReader {
             self.window_changed_loop(),
             self.gaming_mode_set_loop(gaming_rx),
             self.state_write_loop(state_rx),
+            self.ipc_command_loop(ipc_rx),
             async {
                 if let Some(s) = session {
                     s.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()).await;
@@ -1845,51 +1745,40 @@ impl EventReader {
         released_keys
     }
 
-    /// Snapshot of enabled configs from the registry — no lock held after this returns.
-    async fn enabled_configs(&self) -> Vec<Config> {
-        self.config_entries.lock().await
-            .values()
-            .filter(|e| e.enabled)
-            .map(|e| e.config.clone())
-            .collect()
-    }
-
     async fn change_active_layout(&self) {
-        let enabled = self.enabled_configs().await;
-        let mut active_layout = self.active_layout.lock().await;
-        let active_class_owned: String = match &self.environment.server {
-            Server::Connected(s) if s == "KDE" => {
-                match &*self.active_client.lock().await {
-                    Client::Class(c, _, _) => c.clone(),
-                    Client::Default => String::new(),
+        // Get the current client for layout matching.
+        let client: Client = match &self.environment.server {
+            Server::Connected(s) if s == "KDE" => self.active_client.lock().await.clone(),
+            _ => {
+                let known = self.registry.enabled_app_configs(&self.device_name);
+                get_active_window(&self.environment, &known).await
+            }
+        };
+        // Cycle active_layout until resolve() finds a valid config for this context.
+        // Lock, mutate, copy the new value, then drop the lock before any async work.
+        // Guard: if we complete a full cycle without a hit (base missing/disabled),
+        // break out rather than looping forever.
+        let layout_num = {
+            let mut active_layout = self.active_layout.lock().await;
+            let start = *active_layout;
+            loop {
+                *active_layout = if *active_layout == 3 { 0 } else { *active_layout + 1 };
+                if self.registry.resolve(&self.device_name, &client, *active_layout).is_some() {
+                    break;
+                }
+                if *active_layout == start {
+                    // Full cycle completed with no valid config — give up and stay put.
+                    eprintln!("deckery: change_active_layout: no valid layout found for {:?}", self.device_name);
+                    break;
                 }
             }
-            _ => match get_active_window(&self.environment, &enabled).await {
-                Client::Class(c, _, _) => c,
-                Client::Default => String::new(),
-            },
-        };
-        let active_class = active_class_owned.as_str();
-        loop {
-            if *active_layout == 3 {
-                *active_layout = 0
-            } else {
-                *active_layout += 1
-            };
-            if enabled.iter().any(|x| {
-                x.associations.layout == *active_layout && match &x.associations.client {
-                    Client::Class(c, _, _) => c == active_class,
-                    Client::Default => active_class.is_empty(),
-                }
-            }) {
-                break;
-            };
-        }
+            *active_layout
+        }; // lock released here — safe to await below
         if self.settings.notify_layout_switch {
-            let notify = vec![String::from(format!(
+            let notify = vec![format!(
                 "notify-send -t 500 'Makima' 'Switching to layout {}'",
-                *active_layout
-            ))];
+                layout_num
+            )];
             self.spawn_subprocess(&notify).await;
         }
     }
@@ -1897,40 +1786,21 @@ impl EventReader {
     fn update_config(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let active_layout = *self.active_layout.lock().await;
-            let enabled = self.enabled_configs().await;
-            let active_class: String = match &self.environment.server {
-                Server::Connected(s) if s == "KDE" => {
-                    match &*self.active_client.lock().await {
-                        Client::Class(c, _, _) => c.clone(),
-                        Client::Default => String::new(),
-                    }
+            let client: Client = match &self.environment.server {
+                Server::Connected(s) if s == "KDE" => self.active_client.lock().await.clone(),
+                _ => {
+                    let known = self.registry.enabled_app_configs(&self.device_name);
+                    get_active_window(&self.environment, &known).await
                 }
-                _ => match get_active_window(&self.environment, &enabled).await {
-                    Client::Class(c, _, _) => c,
-                    Client::Default => String::new(),
-                },
             };
-            let found = enabled.iter().find(|x| {
-                x.associations.layout == active_layout
-                    && match &x.associations.client {
-                        Client::Class(c, _, _) => c == &active_class,
-                        Client::Default => active_class.is_empty(),
-                    }
-            }).or_else(|| {
-                enabled.iter().find(|x| {
-                    x.associations.layout == active_layout
-                        && matches!(&x.associations.client, Client::Default)
-                })
-            }).cloned();
-            match found {
-                Some(config) => {
-                    *self.current_config.lock().await = config;
-                }
+            let resolved = self.registry.resolve(&self.device_name, &client, active_layout);
+            match resolved {
+                Some(config) => { *self.current_config.lock().await = config; }
                 None => {
                     self.change_active_layout().await;
                     self.update_config().await;
                 }
-            };
+            }
             self.write_state().await;
         })
     }
@@ -2002,11 +1872,7 @@ impl EventReader {
                 return;
             }
         };
-        let base_name = self.config_entries.lock().await
-            .values()
-            .find(|e| e.config.associations == Associations::default())
-            .map(|e| e.config.name.clone())
-            .unwrap_or_default();
+        let base_name = self.device_name.clone();
         let config_stack = if config.name == base_name {
             vec![base_name.clone()]
         } else {
@@ -2168,206 +2034,92 @@ impl EventReader {
         self.write_state().await;
     }
 
-    async fn start_control_socket(&self) {
-        let paused               = self.paused.clone();
-        let gaming_mode_tx_ipc   = self.gaming_mode_tx.clone();
-        let last_action          = self.last_action.clone();
-        let current_config       = self.current_config.clone();
-        let modifiers            = self.modifiers.clone();
-        let active_layout        = self.active_layout.clone();
-        let held_keys            = self.held_keys.clone();
-        let analog_state_export  = self.analog_state_export.clone();
-        let gaming_mode_config   = self.gaming_mode_config.clone();
-        let gaming_mode_for_write = self.gaming_mode.clone();
-        let state_tx_ipc         = self.state_tx.clone();
-        let config_entries_ipc   = self.config_entries.clone();
-        tokio::spawn(async move {
-            let _ = std::fs::remove_file("/tmp/makima-control.sock");
-            let listener = match UnixListener::bind("/tmp/makima-control.sock") {
-                Ok(listener) => listener,
-                Err(e) => {
-                    eprintln!("deckery: control socket bind failed: {}", e);
-                    return;
-                }
+    async fn ipc_command_loop(&self, mut rx: broadcast::Receiver<String>) {
+        loop {
+            let cmd = match rx.recv().await {
+                Ok(cmd) => cmd,
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
             };
-            while let Ok((stream, _addr)) = listener.accept().await {
-                let paused               = paused.clone();
-                let gaming_mode_tx_ipc   = gaming_mode_tx_ipc.clone();
-                let last_action          = last_action.clone();
-                let current_config       = current_config.clone();
-                let modifiers            = modifiers.clone();
-                let active_layout        = active_layout.clone();
-                let held_keys            = held_keys.clone();
-                let config_entries_ipc   = config_entries_ipc.clone();
-                let analog_state_export  = analog_state_export.clone();
-                let gaming_mode_config   = gaming_mode_config.clone();
-                let gaming_mode_for_write = gaming_mode_for_write.clone();
-                let state_tx_ipc         = state_tx_ipc.clone();
-                tokio::spawn(async move {
-                    let mut reader = BufReader::new(stream.into_std().unwrap());
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_ok() {
-                        let cmd = line.trim();
-                        match cmd {
-                            "pause" | "resume" | "gaming_mode enable" | "gaming_mode disable" => {
-                                if cmd == "pause" || cmd == "resume" {
-                                    *paused.lock().await = cmd == "pause";
-                                } else {
-                                    // Route through the unified Gaming Mode channel.
-                                    // gaming_mode_set_loop applies the change,
-                                    // fires haptics, and writes state.
-                                    let new_state = cmd == "gaming_mode enable";
-                                    println!("deckery: Gaming Mode trigger — IPC command: {}", cmd);
-                                    let _ = gaming_mode_tx_ipc.send(new_state).await;
-                                    return; // state write handled by gaming_mode_set_loop
-                                }
-                                // Write state for pause/resume immediately.
-                                let is_paused   = *paused.lock().await;
-                                let is_gaming   = *gaming_mode_for_write.lock().await;
-                                const TIMEOUT: std::time::Duration =
-                                    std::time::Duration::from_millis(200);
-                                let config = match tokio::time::timeout(
-                                    TIMEOUT, current_config.lock()).await {
-                                    Ok(g) => g.clone(), Err(_) => return,
-                                };
-                                let mods = match tokio::time::timeout(
-                                    TIMEOUT, modifiers.lock()).await {
-                                    Ok(g) => g.clone(), Err(_) => return,
-                                };
-                                let layout = match tokio::time::timeout(
-                                    TIMEOUT, active_layout.lock()).await {
-                                    Ok(g) => *g, Err(_) => return,
-                                };
-                                let la = match tokio::time::timeout(
-                                    TIMEOUT, last_action.lock()).await {
-                                    Ok(g) => g.clone(), Err(_) => return,
-                                };
-                                let hk = match tokio::time::timeout(
-                                    TIMEOUT, held_keys.lock()).await {
-                                    Ok(g) => g.clone(), Err(_) => return,
-                                };
-                                let base_name = {
-                                    let entries = config_entries_ipc.lock().await;
-                                    entries.values()
-                                        .find(|e| e.config.associations == Associations::default())
-                                        .map(|e| e.config.name.clone())
-                                        .unwrap_or_default()
-                                };
-                                let stack = if config.name == base_name {
-                                    vec![base_name.clone()]
-                                } else {
-                                    let app_part = config.name
-                                        .strip_prefix(&format!("{}::", base_name))
-                                        .unwrap_or(&config.name)
-                                        .to_string();
-                                    vec![base_name, app_part]
-                                };
-                                let mut event_state = crate::state_export::build_state(
-                                    &config, &mods, layout, is_paused, is_gaming, &hk, &la, &stack,
-                                    &gaming_mode_config,
-                                );
-                                event_state["trackpads"] = serde_json::Value::Null;
-                                event_state["sticks"]    = serde_json::Value::Null;
-                                event_state["imu"]       = serde_json::Value::Null;
-                                event_state["context"]["analog_state_export"] = serde_json::Value::Bool(false);
-                                // pause/resume is a discrete event — must not be dropped.
-                                let _ = state_tx_ipc.send(
-                                    StateCommand::SetEventState(Some(event_state))
-                                ).await;
-                            }
-                            "analog-state-export on" | "analog-state-export off" => {
-                                *analog_state_export.lock().await = cmd == "analog-state-export on";
-                            }
-                            _ if cmd.starts_with("config activate ") => {
-                                let name = cmd.trim_start_matches("config activate ").trim();
-                                let found = {
-                                    let entries = config_entries_ipc.lock().await;
-                                    entries.values()
-                                        .find(|e| e.config.name == name)
-                                        .map(|e| e.config.clone())
-                                };
-                                if let Some(new_config) = found {
-                                    *current_config.lock().await = new_config.clone();
-                                    eprintln!("deckery: IPC config activate: switched to {:?}", new_config.name);
-                                    // Build and send state with new config.
-                                    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
-                                    let is_paused = match tokio::time::timeout(TIMEOUT, paused.lock()).await {
-                                        Ok(g) => *g, Err(_) => return,
-                                    };
-                                    let is_gaming = *gaming_mode_for_write.lock().await;
-                                    let mods = match tokio::time::timeout(TIMEOUT, modifiers.lock()).await {
-                                        Ok(g) => g.clone(), Err(_) => return,
-                                    };
-                                    let layout = match tokio::time::timeout(TIMEOUT, active_layout.lock()).await {
-                                        Ok(g) => *g, Err(_) => return,
-                                    };
-                                    let la = match tokio::time::timeout(TIMEOUT, last_action.lock()).await {
-                                        Ok(g) => g.clone(), Err(_) => return,
-                                    };
-                                    let hk = match tokio::time::timeout(TIMEOUT, held_keys.lock()).await {
-                                        Ok(g) => g.clone(), Err(_) => return,
-                                    };
-                                    let base_name = {
-                                        let entries = config_entries_ipc.lock().await;
-                                        entries.values()
-                                            .find(|e| e.config.associations == Associations::default())
-                                            .map(|e| e.config.name.clone())
-                                            .unwrap_or_default()
-                                    };
-                                    let stack = if new_config.name == base_name {
-                                        vec![base_name.clone()]
-                                    } else {
-                                        let app_part = new_config.name
-                                            .strip_prefix(&format!("{}::", base_name))
-                                            .unwrap_or(&new_config.name)
-                                            .to_string();
-                                        vec![base_name, app_part]
-                                    };
-                                    let mut event_state = crate::state_export::build_state(
-                                        &new_config, &mods, layout, is_paused, is_gaming,
-                                        &hk, &la, &stack, &gaming_mode_config,
-                                    );
-                                    event_state["trackpads"] = serde_json::Value::Null;
-                                    event_state["sticks"]    = serde_json::Value::Null;
-                                    event_state["imu"]       = serde_json::Value::Null;
-                                    event_state["context"]["analog_state_export"] = serde_json::Value::Bool(false);
-                                    let _ = state_tx_ipc.send(
-                                        StateCommand::SetEventState(Some(event_state))
-                                    ).await;
-                                } else {
-                                    eprintln!("deckery: IPC config activate: no config named {:?}", name);
-                                }
-                            }
-                            _ if cmd.starts_with("config enable ") || cmd.starts_with("config disable ") => {
-                                let enabling = cmd.starts_with("config enable ");
-                                let name = if enabling {
-                                    cmd.trim_start_matches("config enable ").trim()
-                                } else {
-                                    cmd.trim_start_matches("config disable ").trim()
-                                };
-                                // Lock, mutate, snapshot — then release the lock before await.
-                                let snapshot = {
-                                    let mut entries = config_entries_ipc.lock().await;
-                                    if let Some(entry) = entries.get_mut(name) {
-                                        entry.enabled = enabling;
-                                        eprintln!("deckery: IPC config {}: {:?}",
-                                            if enabling { "enable" } else { "disable" }, name);
-                                    } else {
-                                        eprintln!("deckery: IPC config enable/disable: no config named {:?}", name);
-                                        return;
-                                    }
-                                    entries.values().cloned().collect::<Vec<_>>()
-                                }; // lock dropped here — safe to await
-                                let _ = state_tx_ipc.send(
-                                    StateCommand::SetLoadedConfigs(snapshot)
-                                ).await;
-                            }
-                            _ => {}
-                        }
+            let cmd = cmd.trim().to_string();
+            let cmd = cmd.as_str();
+            match cmd {
+                "pause" | "resume" | "gaming_mode enable" | "gaming_mode disable" => {
+                    if cmd == "pause" || cmd == "resume" {
+                        *self.paused.lock().await = cmd == "pause";
+                    } else {
+                        // Route through the unified Gaming Mode channel.
+                        // gaming_mode_set_loop applies the change,
+                        // fires haptics, and writes state.
+                        let new_state = cmd == "gaming_mode enable";
+                        println!("deckery: Gaming Mode trigger — IPC command: {}", cmd);
+                        let _ = self.gaming_mode_tx.send(new_state).await;
+                        continue; // state write handled by gaming_mode_set_loop
                     }
-                });
+                    // Write state for pause/resume immediately.
+                    let is_paused = *self.paused.lock().await;
+                    let is_gaming = *self.gaming_mode.lock().await;
+                    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+                    let config = match tokio::time::timeout(TIMEOUT, self.current_config.lock()).await {
+                        Ok(g) => g.clone(), Err(_) => continue,
+                    };
+                    let mods = match tokio::time::timeout(TIMEOUT, self.modifiers.lock()).await {
+                        Ok(g) => g.clone(), Err(_) => continue,
+                    };
+                    let layout = match tokio::time::timeout(TIMEOUT, self.active_layout.lock()).await {
+                        Ok(g) => *g, Err(_) => continue,
+                    };
+                    let la = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
+                        Ok(g) => g.clone(), Err(_) => continue,
+                    };
+                    let hk = match tokio::time::timeout(TIMEOUT, self.held_keys.lock()).await {
+                        Ok(g) => g.clone(), Err(_) => continue,
+                    };
+                    let base_name = self.device_name.clone();
+                    let stack = if config.name == base_name {
+                        vec![base_name.clone()]
+                    } else {
+                        let app_part = config.name
+                            .strip_prefix(&format!("{}::", base_name))
+                            .unwrap_or(&config.name)
+                            .to_string();
+                        vec![base_name, app_part]
+                    };
+                    let mut event_state = crate::state_export::build_state(
+                        &config, &mods, layout, is_paused, is_gaming,
+                        &hk, &la, &stack, &self.gaming_mode_config,
+                    );
+                    event_state["trackpads"] = serde_json::Value::Null;
+                    event_state["sticks"]    = serde_json::Value::Null;
+                    event_state["imu"]       = serde_json::Value::Null;
+                    event_state["context"]["analog_state_export"] = serde_json::Value::Bool(false);
+                    // pause/resume is a discrete event — must not be dropped.
+                    let _ = self.state_tx.send(StateCommand::SetEventState(Some(event_state))).await;
+                }
+                "analog-state-export on" | "analog-state-export off" => {
+                    *self.analog_state_export.lock().await = cmd == "analog-state-export on";
+                }
+                _ if cmd.starts_with("config enable ") || cmd.starts_with("config disable ") => {
+                    let enabling = cmd.starts_with("config enable ");
+                    let name = if enabling {
+                        cmd.trim_start_matches("config enable ").trim()
+                    } else {
+                        cmd.trim_start_matches("config disable ").trim()
+                    };
+                    // set_enabled and snapshot are synchronous (std::sync::Mutex) — no .await.
+                    if !self.registry.set_enabled(name, enabling) {
+                        eprintln!("deckery: IPC config enable/disable: no config named {:?}", name);
+                        continue;
+                    }
+                    eprintln!("deckery: IPC config {}: {:?}",
+                        if enabling { "enable" } else { "disable" }, name);
+                    let _ = self.state_tx.send(
+                        StateCommand::SetLoadedConfigs(self.registry.snapshot())
+                    ).await;
+                }
+                _ => {}
             }
-        });
+        }
     }
 
     pub async fn cursor_loop(&self) {

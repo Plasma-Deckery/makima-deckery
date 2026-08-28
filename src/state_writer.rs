@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use crate::config::ConfigEntry;
+use crate::config_registry::ConfigEntry;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -103,10 +103,20 @@ pub(crate) fn build_json(
         })
         .collect();
 
-    let configs_json: Vec<serde_json::Value> = configs
-        .iter()
-        .map(|e| serde_json::json!({ "name": e.config.name, "enabled": e.enabled }))
-        .collect();
+    let configs_json: Vec<serde_json::Value> = configs.iter().map(|e| {
+        let status = if e.errors.is_empty() { "ok" }
+            else if e.errors.iter().any(|err| err.severity == "error") { "error" }
+            else { "warning" };
+        serde_json::json!({
+            "name":    e.name,
+            "enabled": e.enabled,
+            "status":  status,
+            "errors":  e.errors.iter().map(|err| serde_json::json!({
+                "severity": err.severity,
+                "message":  err.message,
+            })).collect::<Vec<_>>(),
+        })
+    }).collect();
 
     let mut state = serde_json::json!({
         "lifecycle": lifecycle_str,

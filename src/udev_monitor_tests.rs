@@ -1,8 +1,9 @@
 use super::*;
+use crate::config_registry::ConfigRegistry;
 
 #[tokio::test]
 async fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
-    let config_files = Vec::new();
+    let registry = ConfigRegistry::empty();
     let mut tasks = Vec::new();
     let env = Environment {
         user: Ok("test".to_string()),
@@ -15,16 +16,17 @@ async fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
 
     let gaming_mode = Arc::new(Mutex::new(false));
     let (state_tx, _state_rx) = tokio::sync::mpsc::channel(8);
+    let (ipc_tx, _) = tokio::sync::broadcast::channel(1);
     let (virt_dev_opt, modifiers) = launch_tasks(
-        &config_files,
+        &registry,
         &mut tasks,
         env,
         error_notify,
         client,
         window_changed,
-        None, // no lizard cfg in test
         gaming_mode,
         state_tx,
+        &ipc_tx,
     ).await;
 
     if let Some(_) = virt_dev_opt {
@@ -33,14 +35,14 @@ async fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
     }
 }
 
-/// When no config files are loaded, launch_tasks must:
+/// When no configs are loaded, launch_tasks must:
 ///   1. transition lifecycle to Ready
 ///   2. set the "no_device" error slot
 /// These are the two state commands the tray relies on to show the red
 /// "no device" indicator instead of a false-positive green.
 #[tokio::test]
 async fn no_config_files_sends_lifecycle_ready_and_no_device_error() {
-    let config_files = Vec::new();
+    let registry = ConfigRegistry::empty();
     let mut tasks = Vec::new();
     let env = Environment {
         user: Ok("test".to_string()),
@@ -53,16 +55,17 @@ async fn no_config_files_sends_lifecycle_ready_and_no_device_error() {
     let gaming_mode = Arc::new(Mutex::new(false));
 
     let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(8);
+    let (ipc_tx, _) = tokio::sync::broadcast::channel(1);
     launch_tasks(
-        &config_files,
+        &registry,
         &mut tasks,
         env,
         error_notify,
         client,
         window_changed,
-        None,
         gaming_mode,
         state_tx,
+        &ipc_tx,
     ).await;
 
     // Drain all commands sent synchronously by launch_tasks.
