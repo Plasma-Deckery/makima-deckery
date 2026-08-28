@@ -104,6 +104,13 @@ pub fn spawn_grab_listener(
             }
         };
 
+        // When this session re-grabs after GrabReleased, it emits a new
+        // GrabPending to notify grab=false+yieldable sessions to flush their
+        // keys (brief event window between GrabReleased and re-grab).
+        // That signal comes back to this listener too — skip it once so it
+        // does not trigger a spurious YieldEvent::Release on the reader task.
+        let mut skip_next_grab_pending = false;
+
         while let Some(Ok(msg)) = stream.next().await {
             let member = msg.header().member().map(|m| m.to_string());
             let body = msg.body();
@@ -112,6 +119,11 @@ pub fn spawn_grab_listener(
 
             match member.as_deref() {
                 Some("GrabPending") => {
+                    if skip_next_grab_pending {
+                        // Our own re-grab notification echoed back — ignore it.
+                        skip_next_grab_pending = false;
+                        continue;
+                    }
                     eprintln!(
                         "deckery-controller: grab_coordinator: GrabPending for {:?} — ReleaseAll",
                         device_path
@@ -127,9 +139,13 @@ pub fn spawn_grab_listener(
                 Some("GrabReleased") => {
                     if let Some(ref tx) = yield_tx {
                         eprintln!(
-                            "deckery-controller: grab_coordinator: GrabReleased for {:?} — re-grabbing",
+                            "deckery-controller: grab_coordinator: GrabReleased for {:?} — notifying others, re-grabbing",
                             device_path
                         );
+                        // Emit GrabPending so grab=false+yieldable sessions flush
+                        // any keys that may have arrived in the grab gap.
+                        skip_next_grab_pending = true;
+                        emit_signal_on(&conn, "GrabPending", &device_path).await;
                         let _ = tx.send(YieldEvent::Regrab).await;
                     }
                 }

@@ -154,15 +154,17 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
-    use crate::grab_coordinator::{connect, spawn_grab_listener};
+    use crate::grab_coordinator::{connect, spawn_grab_listener, YieldEvent};
     use crate::ControllerEvent;
 
     // Unique device paths so parallel tests on the same session bus don't
     // interfere with each other through the path filter.
-    const DEV_HANDOFF:   &str = "/dev/input/event-yield-handoff";
-    const DEV_RELEASED:  &str = "/dev/input/event-yield-released";
-    const DEV_TIMEOUT:   &str = "/dev/input/event-yield-timeout";
-    const DEV_NO_DBUS:   &str = "/dev/input/event-yield-nodbus";
+    const DEV_HANDOFF:        &str = "/dev/input/event-yield-handoff";
+    const DEV_RELEASED:       &str = "/dev/input/event-yield-released";
+    const DEV_TIMEOUT:        &str = "/dev/input/event-yield-timeout";
+    const DEV_NO_DBUS:        &str = "/dev/input/event-yield-nodbus";
+    const DEV_REGRAB_NOTIFY:  &str = "/dev/input/event-yield-regrab-notify";
+    const DEV_REGRAB_NO_LOOP: &str = "/dev/input/event-yield-regrab-no-loop";
 
     /// Simulate a yieldable session: subscribe to GrabPending, release the
     /// mock grab (flip the AtomicBool) when ReleaseAll arrives.
@@ -296,6 +298,123 @@ mod tests {
             result.unwrap_err().kind(),
             io::ErrorKind::PermissionDenied,
         );
+    }
+
+    // ── Test 5: Re-grab notifies other yieldable sessions ────────────────────
+
+    /// Multi-participant: a grab=false+yieldable observer receives ReleaseAll
+    /// twice — once on the requester's initial GrabPending, and again when
+    /// the grab=true+yieldable session emits GrabPending before re-grabbing.
+    ///
+    /// Participants:
+    ///   - grab=false+yieldable (obs_rx): collects ReleaseAll events
+    ///   - grab=true+yieldable (yield_rx): releases mock grab on Release,
+    ///     acknowledges Regrab
+    ///   - requester: open_grabbed_with, then drops GrabbedHandle
+    #[tokio::test]
+    async fn regrab_notifies_other_yieldable_sessions() {
+        // grab=false+yieldable observer: only ReleaseAll events, no yield coordination.
+        let (obs_tx, mut obs_rx) = mpsc::channel(8);
+        spawn_grab_listener(DEV_REGRAB_NOTIFY.to_string(), obs_tx, None);
+
+        // grab=true+yieldable session: has yield coordination.
+        let (dummy_tx, _dummy_rx) = mpsc::channel(4);
+        let (yield_tx, mut yield_rx) = mpsc::channel(4);
+        spawn_grab_listener(DEV_REGRAB_NOTIFY.to_string(), dummy_tx, Some(yield_tx));
+
+        // Simulated EVIOCGRAB state: starts held (true = grabbed).
+        let grabbed = Arc::new(AtomicBool::new(true));
+        let grabbed_for_task = grabbed.clone();
+
+        // Drive the grab=true+yieldable session: Release → drop mock grab.
+        tokio::spawn(async move {
+            while let Some(cmd) = yield_rx.recv().await {
+                if matches!(cmd, YieldEvent::Release) {
+                    grabbed_for_task.store(false, Ordering::SeqCst);
+                }
+                // YieldEvent::Regrab: reconnecting_reader_task would re-grab here;
+                // in this test there is no reader task, so we just consume it.
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await; // listeners subscribe
+
+        // Requester acquires the grab (after yieldable releases).
+        let (_, handle) = open_grabbed_with(
+            Path::new(DEV_REGRAB_NOTIFY),
+            mock_grab(grabbed),
+        ).await.expect("requester should grab after yieldable releases");
+
+        // First ReleaseAll — from the requester's initial GrabPending.
+        let ev1 = timeout(Duration::from_secs(2), obs_rx.recv()).await
+            .expect("timeout waiting for first ReleaseAll")
+            .expect("channel closed");
+        assert!(matches!(ev1, ControllerEvent::ReleaseAll), "expected first ReleaseAll");
+
+        // Requester releases: GrabReleased → grab=true+yieldable listener
+        // emits GrabPending (re-grab notification) → observer gets ReleaseAll again.
+        drop(handle);
+
+        let ev2 = timeout(Duration::from_secs(2), obs_rx.recv()).await
+            .expect("timeout waiting for second ReleaseAll (re-grab notification)")
+            .expect("channel closed");
+        assert!(matches!(ev2, ControllerEvent::ReleaseAll), "expected second ReleaseAll on re-grab");
+    }
+
+    // ── Test 6: Re-grab GrabPending does not loop back as spurious Release ───
+
+    /// The grab=true+yieldable listener emits GrabPending before signalling
+    /// Regrab. That signal echoes back to the same listener on the D-Bus.
+    /// The listener must skip it — it must NOT forward a spurious
+    /// YieldEvent::Release to the reader task after the Regrab.
+    #[tokio::test]
+    async fn regrab_grab_pending_does_not_trigger_spurious_release() {
+        let (dummy_tx, _dummy_rx) = mpsc::channel(4);
+        let (yield_tx, mut yield_rx) = mpsc::channel(8);
+        spawn_grab_listener(DEV_REGRAB_NO_LOOP.to_string(), dummy_tx, Some(yield_tx));
+
+        let grabbed = Arc::new(AtomicBool::new(true));
+
+        // Collect yield events and drive the mock grab.
+        let grabbed_for_task = grabbed.clone();
+        let (collected_tx, mut collected_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(cmd) = yield_rx.recv().await {
+                if matches!(cmd, YieldEvent::Release) {
+                    grabbed_for_task.store(false, Ordering::SeqCst);
+                }
+                let label: &'static str = match cmd {
+                    YieldEvent::Release => "Release",
+                    YieldEvent::Regrab  => "Regrab",
+                };
+                let _ = collected_tx.send(label).await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (_, handle) = open_grabbed_with(
+            Path::new(DEV_REGRAB_NO_LOOP),
+            mock_grab(grabbed),
+        ).await.expect("should grab");
+
+        let e1 = timeout(Duration::from_secs(2), collected_rx.recv()).await
+            .expect("timeout waiting for Release").expect("closed");
+        assert_eq!(e1, "Release");
+
+        // Drop handle → GrabReleased → listener emits GrabPending + sends Regrab.
+        drop(handle);
+
+        let e2 = timeout(Duration::from_secs(2), collected_rx.recv()).await
+            .expect("timeout waiting for Regrab").expect("closed");
+        assert_eq!(e2, "Regrab");
+
+        // Allow the echoed GrabPending to propagate and be processed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // No spurious Release must arrive.
+        let spurious = timeout(Duration::from_millis(100), collected_rx.recv()).await;
+        assert!(spurious.is_err(), "spurious event received after Regrab — echo-loop not suppressed");
     }
 
     // ── Test 4: GrabPending emitted even when device is immediately available ─
