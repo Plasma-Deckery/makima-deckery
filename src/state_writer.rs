@@ -23,6 +23,7 @@ pub type StateWriterHandle = mpsc::Sender<StateCommand>;
 #[derive(Debug, Clone)]
 pub enum AppLifecycle {
     Starting,
+    Reinitializing,
     Ready,
 }
 
@@ -92,8 +93,9 @@ pub(crate) fn build_json(
     configs:     &[ConfigEntry],
 ) -> String {
     let lifecycle_str = match lifecycle {
-        AppLifecycle::Starting => "starting",
-        AppLifecycle::Ready    => "ready",
+        AppLifecycle::Starting       => "starting",
+        AppLifecycle::Reinitializing => "reinitializing",
+        AppLifecycle::Ready          => "ready",
     };
 
     let errors_json: serde_json::Map<String, serde_json::Value> = errors

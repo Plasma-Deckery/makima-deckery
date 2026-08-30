@@ -188,6 +188,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
                 if let Some(Ok(event)) = event {
                     if is_mapped(&event.device(), &registry) {
                         println!("---------------------\n\nReinitializing...\n");
+                        let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
                         release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
                         for task in &tasks {
                             task.abort();
@@ -201,6 +202,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
                 // A genuine device error (USB unplug or reconnect timeout from the
                 // controller's reconnecting task). Full reinit — rebuild VirtualDevices.
                 println!("---------------------\n\nDevice error detected, reinitializing...\n");
+                let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
                 release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();
@@ -215,6 +217,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
                 while config_rx.try_recv().is_ok() {}
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 println!("---------------------\n\nConfig changed, reloading...\n");
+                let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
                 registry.reload(&config_dir);
                 let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(registry.snapshot()));
                 release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
