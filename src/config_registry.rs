@@ -81,11 +81,12 @@ impl ConfigRegistry {
         let mut entries = self.entries.lock().unwrap();
         for (name, old) in entries.iter() {
             if let Some(new) = new_entries.get_mut(name) {
-                // Only carry over the runtime-toggled enabled flag when the old
-                // entry was valid (config: Some).  If the old entry was broken
-                // and is now fixed, let it default to enabled=true so it
-                // becomes active again without manual intervention.
-                if old.config.is_some() {
+                // Only carry over the runtime-toggled enabled flag when both
+                // the old AND new entry are valid (config: Some).
+                // - old broken → new fixed:   keep new default (enabled=true)
+                // - old valid  → new broken:  keep new default (enabled=false)
+                // - old valid  → new valid:   preserve user's IPC toggle
+                if old.config.is_some() && new.config.is_some() {
                     new.enabled = old.enabled;
                 }
             }
