@@ -181,9 +181,15 @@ impl ConfigRegistry {
     // ── IPC API ───────────────────────────────────────────────────────────────
 
     /// Set the enabled flag for one config entry.
-    /// Returns true if the name was found, false if it does not exist.
+    /// Returns true if the change was applied.
+    /// Returns false if the name does not exist, or if `enabled = true` is
+    /// requested for an entry that failed to parse (`config: None`) — a
+    /// broken config cannot be activated regardless of the flag.
     pub fn set_enabled(&self, name: &str, enabled: bool) -> bool {
         if let Some(entry) = self.entries.lock().unwrap().get_mut(name) {
+            if enabled && entry.config.is_none() {
+                return false;
+            }
             entry.enabled = enabled;
             true
         } else {
@@ -237,10 +243,19 @@ impl ConfigRegistry {
             let mut errors = assoc_errors;
             errors.extend(parse_errors);
 
+            // Log every error/warning to stderr so they appear in the journal
+            // even without the tray open.
+            for e in &errors {
+                eprintln!("deckery: config {:?}: [{}] {}", name, e.severity, e.message);
+            }
+
+            // Configs that failed to parse start as disabled — they cannot be
+            // used and should not appear as active in the tray.
+            let enabled = config_opt.is_some();
             map.insert(name.clone(), ConfigEntry {
                 name,
                 config: config_opt,
-                enabled: true,
+                enabled,
                 errors,
             });
         }
