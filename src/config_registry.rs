@@ -215,6 +215,22 @@ impl ConfigRegistry {
             .collect()
     }
 
+    /// Returns the first parse error message for any base config (name without
+    /// "::"), or None if all base configs are valid.
+    ///
+    /// A broken base config is a global failure: the entire config stack for
+    /// that device is non-functional.  Callers use this to send a
+    /// `StateCommand::SetError { id: "base_config", … }` so the tray shows
+    /// a red icon rather than just a per-config error marker.
+    pub fn base_config_error(&self) -> Option<String> {
+        self.entries.lock().unwrap()
+            .values()
+            .filter(|e| !e.name.contains("::"))
+            .flat_map(|e| e.errors.iter())
+            .find(|err| err.severity == "error")
+            .map(|err| err.message.clone())
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn load_entries(config_dir: &str) -> HashMap<String, ConfigEntry> {

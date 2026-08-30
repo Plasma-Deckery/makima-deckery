@@ -220,6 +220,19 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
                 let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
                 registry.reload(&config_dir);
                 let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(registry.snapshot()));
+                match registry.base_config_error() {
+                    Some(msg) => {
+                        eprintln!("deckery: base config has parse errors — system degraded");
+                        let _ = state_tx.try_send(StateCommand::SetError {
+                            id: "base_config".to_string(), message: msg, severity: "error",
+                        });
+                    }
+                    None => {
+                        let _ = state_tx.try_send(StateCommand::ClearError {
+                            id: "base_config".to_string(),
+                        });
+                    }
+                }
                 release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();
