@@ -69,6 +69,15 @@ impl ConfigRegistry {
         })
     }
 
+    /// Build a registry directly from a list of entries — for use in tests
+    /// outside the `config_registry` module where `entries` is private.
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<ConfigEntry>) -> Arc<Self> {
+        Arc::new(Self {
+            entries: Mutex::new(entries.into_iter().map(|e| (e.name.clone(), e)).collect()),
+        })
+    }
+
     // ── Reload ────────────────────────────────────────────────────────────────
 
     /// Replace all entries with freshly loaded ones.

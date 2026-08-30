@@ -220,19 +220,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
                 let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
                 registry.reload(&config_dir);
                 let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(registry.snapshot()));
-                match registry.base_config_error() {
-                    Some(msg) => {
-                        eprintln!("deckery: base config has parse errors — system degraded");
-                        let _ = state_tx.try_send(StateCommand::SetError {
-                            id: "base_config".to_string(), message: msg, severity: "error",
-                        });
-                    }
-                    None => {
-                        let _ = state_tx.try_send(StateCommand::ClearError {
-                            id: "base_config".to_string(),
-                        });
-                    }
-                }
+                report_base_config_error(&registry, &state_tx);
                 release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();
@@ -584,6 +572,26 @@ fn copy_variables() {
     }
 }
 
+
+/// Check the registry for a broken base config and report it via the state
+/// writer: sends `SetError { id: "base_config" }` when broken, `ClearError`
+/// when healthy.  Called once at startup (main.rs) and after every config
+/// reload (udev_monitor event loop) so the tray icon stays in sync.
+pub(crate) fn report_base_config_error(registry: &ConfigRegistry, state_tx: &StateWriterHandle) {
+    match registry.base_config_error() {
+        Some(msg) => {
+            eprintln!("deckery: base config has parse errors — system degraded");
+            let _ = state_tx.try_send(StateCommand::SetError {
+                id: "base_config".to_string(), message: msg, severity: "error",
+            });
+        }
+        None => {
+            let _ = state_tx.try_send(StateCommand::ClearError {
+                id: "base_config".to_string(),
+            });
+        }
+    }
+}
 
 pub fn is_mapped(udev_device: &tokio_udev::Device, registry: &Arc<ConfigRegistry>) -> bool {
     // Only consider devices that have an actual evdev node (/dev/input/eventX).

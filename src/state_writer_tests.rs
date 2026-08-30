@@ -37,6 +37,13 @@ fn lifecycle_ready_serialises() {
 }
 
 #[test]
+fn lifecycle_reinitializing_serialises() {
+    let json = build_json(&AppLifecycle::Reinitializing, &no_errors(), &None, &no_configs());
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["lifecycle"], "reinitializing");
+}
+
+#[test]
 fn set_error_appears_in_json() {
     let mut errors = no_errors();
     errors.insert("no_device".to_string(), ErrorEntry {
@@ -47,6 +54,21 @@ fn set_error_appears_in_json() {
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["errors"]["no_device"]["severity"], "error");
     assert!(v["errors"]["no_device"]["message"].as_str().unwrap().contains("device"));
+}
+
+#[test]
+fn base_config_error_appears_in_json() {
+    // Verify the base_config error slot — used by the tray to show the red icon
+    // when the base config fails to parse.
+    let mut errors = no_errors();
+    errors.insert("base_config".to_string(), ErrorEntry {
+        message:  "TOML error in \"Steam Deck\": expected `.`, `=`".to_string(),
+        severity: "error",
+    });
+    let json = build_json(&lifecycle_ready(), &errors, &None, &no_configs());
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["errors"]["base_config"]["severity"], "error");
+    assert!(v["errors"]["base_config"]["message"].as_str().unwrap().contains("TOML error"));
 }
 
 #[test]

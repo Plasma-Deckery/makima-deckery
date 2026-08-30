@@ -99,19 +99,7 @@ async fn main() {
     let _ = state_tx.try_send(state_writer::StateCommand::SetLoadedConfigs(registry.snapshot()));
     // A broken base config is a global failure — escalate to a top-level error
     // so the tray shows red, not just a per-config marker in the submenu.
-    match registry.base_config_error() {
-        Some(msg) => {
-            eprintln!("deckery: base config has parse errors — system degraded");
-            let _ = state_tx.try_send(state_writer::StateCommand::SetError {
-                id: "base_config".to_string(), message: msg, severity: "error",
-            });
-        }
-        None => {
-            let _ = state_tx.try_send(state_writer::StateCommand::ClearError {
-                id: "base_config".to_string(),
-            });
-        }
-    }
+    udev_monitor::report_base_config_error(&registry, &state_tx);
     let tasks: Vec<JoinHandle<()>> = Vec::new();
     let gaming_mode: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
 

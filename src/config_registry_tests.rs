@@ -243,3 +243,104 @@ fn resolve_wrong_device_returns_none() {
     let r = make_registry(vec![entry("Steam Deck", 0, Client::Default, true)]);
     assert!(r.resolve("Xbox Controller", &Client::Default, 0).is_none());
 }
+
+// ── base_config_error ─────────────────────────────────────────────────────────
+
+#[test]
+fn base_config_error_none_when_empty_registry() {
+    // Empty registry → no base config → no error.
+    let r = ConfigRegistry::empty();
+    assert!(r.base_config_error().is_none());
+}
+
+#[test]
+fn base_config_error_none_when_all_valid() {
+    // All configs parse fine → no global error.
+    let r = make_registry(vec![
+        entry("Steam Deck",          0, Client::Default,  true),
+        entry("Steam Deck::Firefox", 0, class("Firefox"), true),
+    ]);
+    assert!(r.base_config_error().is_none());
+}
+
+#[test]
+fn base_config_error_some_when_base_broken() {
+    // Base config fails to parse → error message returned.
+    let r = make_registry(vec![
+        broken_entry("Steam Deck"),
+        entry("Steam Deck::Firefox", 0, class("Firefox"), true),
+    ]);
+    let msg = r.base_config_error();
+    assert!(msg.is_some());
+    assert!(msg.unwrap().contains("parse failed"));
+}
+
+#[test]
+fn base_config_error_none_when_only_app_config_broken() {
+    // A broken app config (with "::") is NOT a global base error.
+    let r = make_registry(vec![
+        entry("Steam Deck",          0, Client::Default,  true),
+        broken_entry("Steam Deck::Firefox"),
+    ]);
+    assert!(r.base_config_error().is_none());
+}
+
+#[test]
+fn base_config_error_none_when_app_config_has_warning() {
+    // Warnings on app configs are not errors.
+    let r = make_registry(vec![
+        entry("Steam Deck", 0, Client::Default, true),
+        ConfigEntry {
+            name:    "Steam Deck::Firefox".to_string(),
+            config:  None,
+            enabled: false,
+            errors:  vec![ConfigError { severity: "warning", message: "deprecated key".into() }],
+        },
+    ]);
+    assert!(r.base_config_error().is_none());
+}
+
+#[test]
+fn base_config_error_ignores_warning_severity_on_base() {
+    // A warning on the base config is NOT a global error — only "error" severity counts.
+    let r = make_registry(vec![
+        ConfigEntry {
+            name:    "Steam Deck".to_string(),
+            config:  Some(Config::new_empty("Steam Deck".to_string())),
+            enabled: true,
+            errors:  vec![ConfigError { severity: "warning", message: "unknown key".into() }],
+        },
+    ]);
+    assert!(r.base_config_error().is_none());
+}
+
+#[test]
+fn base_config_error_multiple_devices_only_returns_broken_base() {
+    // Two devices: one with a broken base, one fine.
+    // Error should be reported (we only check Some vs None here — the
+    // registry doesn't guarantee which device's message comes first).
+    let r = make_registry(vec![
+        broken_entry("Steam Deck"),
+        entry("Xbox Controller",          0, Client::Default,  true),
+        entry("Xbox Controller::Firefox", 0, class("Firefox"), true),
+    ]);
+    assert!(r.base_config_error().is_some());
+}
+
+#[test]
+fn base_config_error_cleared_after_entry_removed_and_recreated() {
+    // Simulate a reload: broken entry replaced by a valid one.
+    // base_config_error() reflects current in-memory state.
+    let mut entries = std::collections::HashMap::new();
+    let broken = broken_entry("Steam Deck");
+    entries.insert(broken.name.clone(), broken);
+    let r = Arc::new(ConfigRegistry { entries: std::sync::Mutex::new(entries) });
+    assert!(r.base_config_error().is_some());
+
+    // Replace with a valid entry (simulates successful reload).
+    {
+        let mut map = r.entries.lock().unwrap();
+        map.insert("Steam Deck".to_string(), entry("Steam Deck", 0, Client::Default, true));
+    }
+    assert!(r.base_config_error().is_none());
+}
