@@ -81,7 +81,13 @@ impl ConfigRegistry {
         let mut entries = self.entries.lock().unwrap();
         for (name, old) in entries.iter() {
             if let Some(new) = new_entries.get_mut(name) {
-                new.enabled = old.enabled;
+                // Only carry over the runtime-toggled enabled flag when the old
+                // entry was valid (config: Some).  If the old entry was broken
+                // and is now fixed, let it default to enabled=true so it
+                // becomes active again without manual intervention.
+                if old.config.is_some() {
+                    new.enabled = old.enabled;
+                }
             }
         }
         *entries = new_entries;
