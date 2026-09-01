@@ -278,9 +278,29 @@ pub async fn run_hidraw_reader(
         }
     };
     let mut reader = tokio::io::BufReader::new(file);
-    let mut buf      = [0u8; 64];
-    let mut prev_buf = [0u8; 64];
-    let mut last_pad: Option<PadFrame> = None;
+    let mut buf = [0u8; 64];
+
+    // Seed prev_buf from the first report so the diff on subsequent reports
+    // only fires for actual changes, not for every non-zero field in the
+    // controller's idle state.  The initial PadFrame is sent so the trackpad
+    // router has a valid baseline, but no ControllerEvent::Input is emitted.
+    let mut last_pad: Option<PadFrame>;
+    let mut prev_buf = match reader.read_exact(&mut buf).await {
+        Ok(_) => {
+            let frame = PadFrame::parse(&buf);
+            last_pad = Some(frame);
+            if tx.send(frame).await.is_err() {
+                return;
+            }
+            buf
+        }
+        Err(e) => {
+            eprintln!("deckery-controller: hidraw reader: read error on {:?}: {}", path, e);
+            if let Some(n) = device_error_notify { n.notify_one(); }
+            return;
+        }
+    };
+
     loop {
         match reader.read_exact(&mut buf).await {
             Ok(_) => {
