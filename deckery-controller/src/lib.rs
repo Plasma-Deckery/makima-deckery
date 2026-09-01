@@ -340,6 +340,24 @@ impl SteamDeckController {
         let (event_tx, event_rx) = mpsc::channel(64);
         let path = self.evdev_path.clone();
 
+        // Determine upfront whether a hidraw sibling exists, so we can:
+        // (a) clone event_tx for the hidraw reader *before* it is moved into
+        //     the evdev reconnect task, and
+        // (b) give the evdev reconnect task a *silent* device_error_notify when
+        //     hidraw is available — on Linux ≥ 6.12 / kernel 7.1 the evdev node
+        //     disappears as soon as hidraw is opened (hid-steam commit cd33a91),
+        //     so the evdev reader will never reconnect; hidraw owns reinit instead.
+        let hidraw_event_tx: Option<mpsc::Sender<ControllerEvent>> =
+            if self.hidraw_path.is_some() { Some(event_tx.clone()) } else { None };
+
+        // When hidraw handles events, the evdev reader is expected to fail and
+        // should exit quietly (no reinit loop). Use a local silent notify for it.
+        let evdev_error_notify: Arc<Notify> = if self.hidraw_path.is_some() {
+            Arc::new(Notify::new()) // dropped at function end — nobody listens
+        } else {
+            device_error_notify.clone()
+        };
+
         // All yieldable sessions listen for GrabPending so they can flush held
         // output keys via ControllerEvent::ReleaseAll before another process
         // acquires EVIOCGRAB — avoiding stuck virtual keys during the grab.
@@ -369,8 +387,8 @@ impl SteamDeckController {
             path,
             grab,
             resume_notify,
-            event_tx,
-            device_error_notify,
+            event_tx, // moved here — clone already saved above for hidraw
+            evdev_error_notify,
             yield_rx,
             |p, g| try_open_event_stream(p, g),
         ));
@@ -379,7 +397,24 @@ impl SteamDeckController {
         let (click_pressure_tx, click_pressure_rx) = watch::channel::<Option<ClickPressureConfig>>(None);
         let (pad_rx, haptic_tx, click_pressure) = match &self.hidraw_path {
             Some(p) => {
-                let (rx, tx) = hidraw::spawn_hidraw_tasks(p.clone(), lizard_rx, click_pressure_rx);
+                // hidraw_event_tx carries the pre-cloned sender. The hidraw
+                // reader synthesises button/axis ControllerEvents and sends them
+                // through the same channel as the (now-defunct) evdev source.
+                let hidraw_device_error = Arc::new(Notify::new());
+                let (rx, tx) = hidraw::spawn_hidraw_tasks(
+                    p.clone(),
+                    lizard_rx,
+                    click_pressure_rx,
+                    hidraw_event_tx,
+                    Some(hidraw_device_error.clone()),
+                );
+                // Bridge hidraw errors → real device_error_notify so the
+                // consuming binary triggers a full session reinit on unplug.
+                let real_notify = device_error_notify.clone();
+                tokio::spawn(async move {
+                    hidraw_device_error.notified().await;
+                    real_notify.notify_one();
+                });
                 (Some(rx), Some(tx), Some(ClickPressureHandle(click_pressure_tx)))
             }
             None => {
