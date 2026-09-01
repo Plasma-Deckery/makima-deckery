@@ -289,20 +289,68 @@ impl SteamDeckController {
     /// `ControllerSession` with caller-facing channel ends, or an `io::Error`
     /// if the device cannot be opened.
     ///
-    /// When `grab=true`, the yield protocol runs first: establishes one D-Bus
-    /// connection, emits `GrabPending` so any `grab=true && yieldable=true`
-    /// session releases its `EVIOCGRAB`, then retries until success or timeout.
-    /// Returns a `GrabbedHandle` in `session.grab_handle` — dropping it emits
-    /// `GrabReleased` on the same connection.
-    /// When `grab=false`, the device is opened without exclusive access; the
-    /// evdev stream pauses automatically if another process holds `EVIOCGRAB`.
+    /// **Backend selection (decided here, invisible to the caller):**
+    /// - If a hidraw sibling was found at construction time: opens hidraw only.
+    ///   evdev is never opened. Events, PadFrames, haptics, Lizard Mode, and
+    ///   click-pressure all flow through hidraw. No grab/yield protocol.
+    /// - If no hidraw sibling: opens evdev only. PadFrames, haptics, and
+    ///   click-pressure are unavailable (`None` in the returned session).
     ///
-    /// Spawns on success:
-    /// - reconnecting evdev reader (suspend-transparent `ControllerEvent` stream)
-    /// - if `yieldable`: D-Bus listener for `GrabPending` → `ControllerEvent::ReleaseAll`
-    /// - hidraw reader → `pad_rx`
-    /// - hidraw writer (serialises haptics + Lizard Mode heartbeat onto one fd)
+    /// The `grab` and `yieldable` parameters apply only to the evdev backend.
     pub async fn start(
+        self,
+        grab: bool,
+        device_error_notify: Arc<Notify>,
+        initial_lizard_cfg: Option<LizardModeSuppression>,
+    ) -> std::io::Result<ControllerSession> {
+        if let Some(hidraw_path) = self.hidraw_path {
+            Ok(Self::start_hidraw_backend(hidraw_path, device_error_notify, initial_lizard_cfg))
+        } else {
+            self.start_evdev_backend(grab, device_error_notify, initial_lizard_cfg).await
+        }
+    }
+
+    // ── Private helpers ──────────────────────────────────────────────────────
+
+    /// hidraw backend: sole event source, evdev never opened.
+    ///
+    /// Spawns hidraw reader (events + PadFrames) and hidraw writer (haptics +
+    /// Lizard Mode + click-pressure). No reconnecting evdev task, no grab
+    /// protocol, no resume watcher — hidraw read errors are the reinit trigger.
+    fn start_hidraw_backend(
+        hidraw_path: PathBuf,
+        device_error_notify: Arc<Notify>,
+        initial_lizard_cfg: Option<LizardModeSuppression>,
+    ) -> ControllerSession {
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (lizard_tx,         lizard_rx)         = watch::channel(initial_lizard_cfg);
+        let (click_pressure_tx, click_pressure_rx) = watch::channel::<Option<ClickPressureConfig>>(None);
+
+        let (pad_rx, haptic_tx) = hidraw::spawn_hidraw_tasks(
+            hidraw_path,
+            lizard_rx,
+            click_pressure_rx,
+            Some(event_tx),
+            Some(device_error_notify),
+        );
+
+        ControllerSession {
+            event_rx,
+            pad_rx:         Some(pad_rx),
+            haptic_tx:      Some(haptic_tx),
+            lizard_mode:    LizardModeHandle(lizard_tx),
+            click_pressure: Some(ClickPressureHandle(click_pressure_tx)),
+            grab_handle:    None,
+        }
+    }
+
+    /// evdev backend: sole event source, hidraw not available.
+    ///
+    /// Opens the evdev device (with or without grab), spawns the reconnecting
+    /// reader task (suspend-transparent), the resume watcher, and optionally
+    /// the grab coordinator. PadFrames, haptics, and click-pressure are
+    /// unavailable (`None`) because there is no hidraw sibling.
+    async fn start_evdev_backend(
         self,
         grab: bool,
         device_error_notify: Arc<Notify>,
@@ -317,54 +365,13 @@ impl SteamDeckController {
             println!("deckery-controller: opened {:?} (no grab)", self.evdev_path);
             (s, None)
         };
-        let mut session = self.spawn_tasks(stream, grab, device_error_notify, initial_lizard_cfg);
-        session.grab_handle = grab_handle;
-        Ok(session)
-    }
 
-    // ── Private helpers ──────────────────────────────────────────────────────
-
-    /// Spawn all background tasks for a session whose evdev stream is already open.
-    ///
-    /// Called by `start()` after the device is opened (grabbed or not).
-    fn spawn_tasks(
-        self,
-        stream: EventStream,
-        grab: bool,
-        device_error_notify: Arc<Notify>,
-        initial_lizard_cfg: Option<LizardModeSuppression>,
-    ) -> ControllerSession {
         let resume_notify = Arc::new(Notify::new());
         tokio::spawn(resume_watcher::start_resume_watcher(resume_notify.clone()));
 
         let (event_tx, event_rx) = mpsc::channel(64);
         let path = self.evdev_path.clone();
 
-        // Determine upfront whether a hidraw sibling exists, so we can:
-        // (a) clone event_tx for the hidraw reader *before* it is moved into
-        //     the evdev reconnect task, and
-        // (b) give the evdev reconnect task a *silent* device_error_notify when
-        //     hidraw is available — on Linux ≥ 6.12 / kernel 7.1 the evdev node
-        //     disappears as soon as hidraw is opened (hid-steam commit cd33a91),
-        //     so the evdev reader will never reconnect; hidraw owns reinit instead.
-        let hidraw_event_tx: Option<mpsc::Sender<ControllerEvent>> =
-            if self.hidraw_path.is_some() { Some(event_tx.clone()) } else { None };
-
-        // When hidraw handles events, the evdev reader is expected to fail and
-        // should exit quietly (no reinit loop). Use a local silent notify for it.
-        let evdev_error_notify: Arc<Notify> = if self.hidraw_path.is_some() {
-            Arc::new(Notify::new()) // dropped at function end — nobody listens
-        } else {
-            device_error_notify.clone()
-        };
-
-        // All yieldable sessions listen for GrabPending so they can flush held
-        // output keys via ControllerEvent::ReleaseAll before another process
-        // acquires EVIOCGRAB — avoiding stuck virtual keys during the grab.
-        //
-        // grab=true yieldable sessions additionally release EVIOCGRAB on
-        // GrabPending and re-grab on GrabReleased, coordinated via a dedicated
-        // channel between spawn_grab_listener and reconnecting_reader_task.
         let yield_rx = if self.yieldable {
             let (yield_tx, yield_rx) = if grab {
                 let (tx, rx) = mpsc::channel(4);
@@ -387,56 +394,30 @@ impl SteamDeckController {
             path,
             grab,
             resume_notify,
-            event_tx, // moved here — clone already saved above for hidraw
-            evdev_error_notify,
+            event_tx,
+            device_error_notify,
             yield_rx,
             |p, g| try_open_event_stream(p, g),
         ));
 
-        let (lizard_tx,         lizard_rx)         = watch::channel(initial_lizard_cfg);
-        let (click_pressure_tx, click_pressure_rx) = watch::channel::<Option<ClickPressureConfig>>(None);
-        let (pad_rx, haptic_tx, click_pressure) = match &self.hidraw_path {
-            Some(p) => {
-                // hidraw_event_tx carries the pre-cloned sender. The hidraw
-                // reader synthesises button/axis ControllerEvents and sends them
-                // through the same channel as the (now-defunct) evdev source.
-                let hidraw_device_error = Arc::new(Notify::new());
-                let (rx, tx) = hidraw::spawn_hidraw_tasks(
-                    p.clone(),
-                    lizard_rx,
-                    click_pressure_rx,
-                    hidraw_event_tx,
-                    Some(hidraw_device_error.clone()),
-                );
-                // Bridge hidraw errors → real device_error_notify so the
-                // consuming binary triggers a full session reinit on unplug.
-                let real_notify = device_error_notify.clone();
-                tokio::spawn(async move {
-                    hidraw_device_error.notified().await;
-                    real_notify.notify_one();
-                });
-                (Some(rx), Some(tx), Some(ClickPressureHandle(click_pressure_tx)))
-            }
-            None => {
-                drop(lizard_rx);
-                drop(click_pressure_rx);
-                drop(click_pressure_tx);
-                println!(
-                    "deckery-controller: no hidraw sibling found for {:?} — trackpad position/haptics not available",
-                    self.evdev_path
-                );
-                (None, None, None)
-            }
-        };
+        // No hidraw in this path — log and return None for all hidraw-dependent
+        // session fields. The lizard/click-pressure watch channels are dropped
+        // immediately; their senders are returned as inert handles.
+        let (lizard_tx, lizard_rx) = watch::channel::<Option<LizardModeSuppression>>(initial_lizard_cfg);
+        drop(lizard_rx);
+        println!(
+            "deckery-controller: no hidraw sibling found for {:?} — trackpad/haptics/lizard-mode not available",
+            self.evdev_path
+        );
 
-        ControllerSession {
+        Ok(ControllerSession {
             event_rx,
-            pad_rx,
-            haptic_tx,
-            lizard_mode: LizardModeHandle(lizard_tx),
-            click_pressure,
-            grab_handle: None, // filled in by start() after open_grabbed
-        }
+            pad_rx:         None,
+            haptic_tx:      None,
+            lizard_mode:    LizardModeHandle(lizard_tx),
+            click_pressure: None,
+            grab_handle,
+        })
     }
 
     fn open_event_stream_inner(evdev_path: &Path) -> std::io::Result<EventStream> {
