@@ -380,9 +380,8 @@ pub async fn launch_tasks(
         let (event_rx, pad_rx, haptic_tx, lizard_mode, click_pressure) = if is_steam_deck {
             // Full Steam Deck path — hidraw reader/writer + Lizard Mode heartbeat
             // are all spawned inside controller.start().
-            let controller = SteamDeckController::from_evdev(Path::new(&event_device), /*yieldable=*/ true);
+            let controller = SteamDeckController::from_evdev(Path::new(&event_device));
             let session = match controller.start(
-                grab,
                 device_error_notify.clone(),
                 lizard_cfg.clone(),
             ).await {

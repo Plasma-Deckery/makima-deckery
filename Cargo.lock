@@ -288,12 +288,9 @@ name = "deckery-controller"
 version = "0.1.0"
 dependencies = [
  "evdev",
- "futures-core",
  "libc",
  "serde",
  "tokio",
- "tokio-stream",
- "zbus",
 ]
 
 [[package]]

@@ -1,28 +1,35 @@
 //! `deckery-controller` — Steam Deck controller library.
 //!
 //! Encapsulates everything specific to the Steam Deck as a physical device:
-//! evdev event streaming (with suspend/resume transparency), hidraw I/O,
-//! Lizard Mode suppression, click-pressure thresholds, and haptic playback.
+//! hidraw I/O, Lizard Mode suppression, click-pressure thresholds, and haptic
+//! playback.
 //!
 //! Higher-level concerns (input mapping, virtual devices, config routing)
 //! belong in the consuming binary.
+//!
+//! ## Backend
+//!
+//! Steam Deck controller I/O is hidraw-only (see issue #47 for why the old
+//! evdev fallback backend and its `EVIOCGRAB`/D-Bus grab-yield protocol were
+//! removed). `SteamDeckController::start()` fails if no hidraw sibling is
+//! found for the evdev device it was constructed from.
 //!
 //! ## Module layout
 //!
 //! ```text
 //! lib.rs            ← SteamDeckController, ControllerSession, public API
 //! hidraw.rs         ← PadFrame reader + unified writer (owns the fd)
+//! hid_report.rs     ← raw HID report → ControllerEvent::Input synthesis
 //! haptic.rs         ← HapticChain API + player task
 //! lizard_mode.rs    ← Lizard Mode suppression heartbeat helpers
-//! resume_watcher.rs ← logind PrepareForSleep D-Bus watcher
 //! ```
 //!
 //! ## Typical usage (makima path — device path already known)
 //!
 //! ```ignore
 //! let controller = SteamDeckController::from_evdev(Path::new(&event_device));
-//! let session = controller.start(grab, device_error_notify, lizard_cfg);
-//! // session.event_rx             — ControllerEvent channel (suspend-transparent)
+//! let session = controller.start(device_error_notify, lizard_cfg).await?;
+//! // session.event_rx             — ControllerEvent channel
 //! // session.pad_rx               — PadFrame channel (trackpad position)
 //! // session.haptic_tx            — HapticRequest channel (haptic playback)
 //! // session.lizard_mode.set(cfg) — live Lizard Mode update
@@ -33,22 +40,19 @@
 //!
 //! ```ignore
 //! let controller = SteamDeckController::find()?;
-//! let session = controller.start(false, Arc::new(Notify::new()), None);
+//! let session = controller.start(Arc::new(Notify::new()), None).await?;
 //! ```
 
-pub(crate) mod grab_coordinator;
 pub(crate) mod haptic;
+pub(crate) mod hid_report;
 pub(crate) mod hidraw;
 pub(crate) mod lizard_mode;
-pub(crate) mod resume_watcher;
-pub(crate) mod yield_protocol;
 
 // Re-export the types that consumers need so they import from here,
 // not from the internal submodule. This is the stable public API surface.
 pub use haptic::{HapticChain, HapticChainStep, HapticPad, HapticPulse, HapticRequest};
 pub use hidraw::PadFrame;
 pub use lizard_mode::LizardModeSuppression;
-pub use yield_protocol::GrabbedHandle;
 
 // ── Internal startup timing ───────────────────────────────────────────────────
 
@@ -130,22 +134,10 @@ impl LizardModeHandle {
     }
 }
 
-use evdev::{Device, EventStream, InputEvent};
-use futures_core::Stream;
-use std::io;
+use evdev::InputEvent;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{mpsc, watch, Notify};
-use tokio_stream::StreamExt;
-use libc;
-
-/// How long to keep trying to reopen an evdev device after a stream error
-/// before concluding the device is genuinely gone.
-const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Polling interval while waiting for a device to reappear.
-const RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 // ── Known Steam Deck device names ─────────────────────────────────────────────
 
@@ -191,9 +183,7 @@ pub enum ControllerEvent {
 /// Returned by `SteamDeckController::start()`. The controller owns all
 /// background tasks; this struct holds the caller-facing ends of their channels.
 pub struct ControllerSession {
-    /// evdev button/axis events. Survives suspend transparently.
-    /// `ControllerEvent::Reconnected` signals a resume so callers can release
-    /// held keys before resuming.
+    /// Button/axis events, synthesised from the hidraw stream.
     pub event_rx: mpsc::Receiver<ControllerEvent>,
 
     /// Raw trackpad position frames from hidraw. `None` if no hidraw sibling
@@ -216,12 +206,6 @@ pub struct ControllerSession {
     /// lifetime (allowing future dynamic updates) and calls `set()` once with
     /// the user-configured values.
     pub click_pressure: Option<ClickPressureHandle>,
-
-    /// RAII guard that emits `GrabReleased` on drop via the pre-established
-    /// D-Bus connection. `None` when the session was opened without grab.
-    /// Keep alive for the full grab session lifetime — dropping it releases
-    /// the cooperative grab lock on the D-Bus.
-    pub grab_handle: Option<GrabbedHandle>,
 }
 
 // ── SteamDeckController ──────────────────────────────────────────────────────
@@ -235,37 +219,19 @@ pub struct SteamDeckController {
     /// Raw controller hidraw path. `None` on non-Steam Deck hardware or if
     /// sysfs traversal failed.
     pub hidraw_path: Option<PathBuf>,
-    /// If `true`, the library spawns a D-Bus listener for `GrabPending` and
-    /// emits `ControllerEvent::ReleaseAll` so the consumer can flush held
-    /// virtual output keys before another process acquires `EVIOCGRAB`.
-    ///
-    /// For `grab=true` yieldable sessions: additionally releases `EVIOCGRAB`
-    /// on `GrabPending` (so the requester can acquire it) and re-acquires on
-    /// `GrabReleased` with the same retry/timeout logic as suspend/resume.
-    ///
-    /// For `grab=false` yieldable sessions (e.g. makima): only the key-flush
-    /// (`ReleaseAll`) matters — the evdev stream pauses/resumes automatically,
-    /// no EVIOCGRAB coordination needed.
-    pub yieldable:   bool,
 }
 
 impl SteamDeckController {
     /// Construct from a known evdev device path.
     ///
-    /// `yieldable`: set `true` if this session should participate in the
-    /// cooperative grab protocol. See field doc for exact behaviour per
-    /// `grab` value.
-    ///
     /// Immediately discovers the hidraw sibling via sysfs — a synchronous read
     /// that completes in microseconds.
-    pub fn from_evdev(evdev_path: &Path, yieldable: bool) -> Self {
+    pub fn from_evdev(evdev_path: &Path) -> Self {
         let hidraw_path = find_controller_hidraw_for_evdev(evdev_path);
-        Self { evdev_path: evdev_path.to_path_buf(), hidraw_path, yieldable }
+        Self { evdev_path: evdev_path.to_path_buf(), hidraw_path }
     }
 
     /// Find the Steam Deck controller by known device names (standalone path).
-    ///
-    /// `yieldable`: see `from_evdev`.
     ///
     /// Scans `/dev/input/event*` for a device whose name matches one of the
     /// entries in `KNOWN_DEVICE_NAMES`. Returns `None` if no match is found
@@ -274,11 +240,11 @@ impl SteamDeckController {
     /// For makima: use `from_evdev` instead — the udev_monitor already has the
     /// path via config-file-name matching. `find()` is for callers without
     /// makima infrastructure (`deckery-auth`, standalone tools).
-    pub fn find(yieldable: bool) -> Option<Self> {
+    pub fn find() -> Option<Self> {
         for (path, device) in evdev::enumerate() {
             if let Some(name) = device.name() {
                 if is_known_device_name(name) {
-                    return Some(Self::from_evdev(&path, yieldable));
+                    return Some(Self::from_evdev(&path));
                 }
             }
         }
@@ -287,41 +253,21 @@ impl SteamDeckController {
 
     /// Consume the controller and spawn all internal tasks. Returns the
     /// `ControllerSession` with caller-facing channel ends, or an `io::Error`
-    /// if the device cannot be opened.
-    ///
-    /// **Backend selection (decided here, invisible to the caller):**
-    /// - If a hidraw sibling was found at construction time: opens hidraw only.
-    ///   evdev is never opened. Events, PadFrames, haptics, Lizard Mode, and
-    ///   click-pressure all flow through hidraw. No grab/yield protocol.
-    /// - If no hidraw sibling: opens evdev only. PadFrames, haptics, and
-    ///   click-pressure are unavailable (`None` in the returned session).
-    ///
-    /// The `grab` and `yieldable` parameters apply only to the evdev backend.
+    /// if no hidraw sibling was found for the evdev device (see issue #47 —
+    /// the evdev-only fallback backend was removed as dead code, since
+    /// hid-steam always exposes a hidraw sibling on real hardware).
     pub async fn start(
         self,
-        grab: bool,
         device_error_notify: Arc<Notify>,
         initial_lizard_cfg: Option<LizardModeSuppression>,
     ) -> std::io::Result<ControllerSession> {
-        if let Some(hidraw_path) = self.hidraw_path {
-            Ok(Self::start_hidraw_backend(hidraw_path, device_error_notify, initial_lizard_cfg))
-        } else {
-            self.start_evdev_backend(grab, device_error_notify, initial_lizard_cfg).await
-        }
-    }
+        let hidraw_path = self.hidraw_path.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no hidraw sibling found for {:?}", self.evdev_path),
+            )
+        })?;
 
-    // ── Private helpers ──────────────────────────────────────────────────────
-
-    /// hidraw backend: sole event source, evdev never opened.
-    ///
-    /// Spawns hidraw reader (events + PadFrames) and hidraw writer (haptics +
-    /// Lizard Mode + click-pressure). No reconnecting evdev task, no grab
-    /// protocol, no resume watcher — hidraw read errors are the reinit trigger.
-    fn start_hidraw_backend(
-        hidraw_path: PathBuf,
-        device_error_notify: Arc<Notify>,
-        initial_lizard_cfg: Option<LizardModeSuppression>,
-    ) -> ControllerSession {
         let (event_tx, event_rx) = mpsc::channel(64);
         let (lizard_tx,         lizard_rx)         = watch::channel(initial_lizard_cfg);
         let (click_pressure_tx, click_pressure_rx) = watch::channel::<Option<ClickPressureConfig>>(None);
@@ -334,303 +280,14 @@ impl SteamDeckController {
             Some(device_error_notify),
         );
 
-        ControllerSession {
+        Ok(ControllerSession {
             event_rx,
             pad_rx:         Some(pad_rx),
             haptic_tx:      Some(haptic_tx),
             lizard_mode:    LizardModeHandle(lizard_tx),
             click_pressure: Some(ClickPressureHandle(click_pressure_tx)),
-            grab_handle:    None,
-        }
-    }
-
-    /// evdev backend: sole event source, hidraw not available.
-    ///
-    /// Opens the evdev device (with or without grab), spawns the reconnecting
-    /// reader task (suspend-transparent), the resume watcher, and optionally
-    /// the grab coordinator. PadFrames, haptics, and click-pressure are
-    /// unavailable (`None`) because there is no hidraw sibling.
-    async fn start_evdev_backend(
-        self,
-        grab: bool,
-        device_error_notify: Arc<Notify>,
-        initial_lizard_cfg: Option<LizardModeSuppression>,
-    ) -> std::io::Result<ControllerSession> {
-        let (stream, grab_handle) = if grab {
-            let (s, h) = yield_protocol::open_grabbed(&self.evdev_path).await?;
-            println!("deckery-controller: grabbed {:?} (exclusive evdev access)", self.evdev_path);
-            (s, Some(h))
-        } else {
-            let s = Self::open_event_stream_inner(&self.evdev_path)?;
-            println!("deckery-controller: opened {:?} (no grab)", self.evdev_path);
-            (s, None)
-        };
-
-        let resume_notify = Arc::new(Notify::new());
-        tokio::spawn(resume_watcher::start_resume_watcher(resume_notify.clone()));
-
-        let (event_tx, event_rx) = mpsc::channel(64);
-        let path = self.evdev_path.clone();
-
-        let yield_rx = if self.yieldable {
-            let (yield_tx, yield_rx) = if grab {
-                let (tx, rx) = mpsc::channel(4);
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
-            grab_coordinator::spawn_grab_listener(
-                path.to_string_lossy().into_owned(),
-                event_tx.clone(),
-                yield_tx,
-            );
-            yield_rx
-        } else {
-            None
-        };
-
-        tokio::spawn(reconnecting_reader_task_with(
-            stream,
-            path,
-            grab,
-            resume_notify,
-            event_tx,
-            device_error_notify,
-            yield_rx,
-            |p, g| try_open_event_stream(p, g),
-        ));
-
-        // No hidraw in this path — log and return None for all hidraw-dependent
-        // session fields. The lizard/click-pressure watch channels are dropped
-        // immediately; their senders are returned as inert handles.
-        let (lizard_tx, lizard_rx) = watch::channel::<Option<LizardModeSuppression>>(initial_lizard_cfg);
-        drop(lizard_rx);
-        println!(
-            "deckery-controller: no hidraw sibling found for {:?} — trackpad/haptics/lizard-mode not available",
-            self.evdev_path
-        );
-
-        Ok(ControllerSession {
-            event_rx,
-            pad_rx:         None,
-            haptic_tx:      None,
-            lizard_mode:    LizardModeHandle(lizard_tx),
-            click_pressure: None,
-            grab_handle,
         })
     }
-
-    fn open_event_stream_inner(evdev_path: &Path) -> std::io::Result<EventStream> {
-        Device::open(evdev_path)?.into_event_stream()
-    }
-}
-
-// ── Reconnecting reader task ─────────────────────────────────────────────────
-
-/// Resolves to the next `YieldEvent` if `yield_rx` is `Some`, otherwise
-/// returns a future that never resolves — effectively disabling the yield arm
-/// in `tokio::select!` when the session is not `grab=true && yieldable=true`.
-async fn yield_rx_recv(
-    yield_rx: &mut Option<mpsc::Receiver<grab_coordinator::YieldEvent>>,
-) -> Option<grab_coordinator::YieldEvent> {
-    match yield_rx {
-        Some(rx) => rx.recv().await,
-        None     => std::future::pending().await,
-    }
-}
-
-/// Returns `true` if `e` represents a busy/locked device (EBUSY or WouldBlock).
-pub(crate) fn is_grab_busy(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::WouldBlock
-        || e.raw_os_error() == Some(libc::EBUSY)
-}
-
-/// Generic core of the reconnecting reader task — the stream-reopen operation
-/// is injected so it can be replaced with a mock in tests without needing real
-/// evdev hardware or a uinput device.
-///
-/// Reads events from `stream` and forwards them to `tx`, transparently
-/// reconnecting on suspend/resume.
-///
-/// On `resume_notify` or stream error, calls `try_reopen(path, grab)` to get a
-/// new stream (polling every `RECONNECT_POLL_INTERVAL`). Once back, sends
-/// `ControllerEvent::Reconnected` so the consumer can release held keys.
-///
-/// If `yield_rx` is `Some` (session is `grab=true && yieldable=true`):
-/// - On `YieldEvent::Release` (triggered by `GrabPending`): drops the stream,
-///   releasing `EVIOCGRAB`, then waits for `YieldEvent::Regrab`.
-/// - On `YieldEvent::Regrab` (triggered by `GrabReleased`): re-acquires via
-///   `try_reopen(path, true)` with the same retry/timeout as normal reconnect.
-///
-/// If `try_reopen` does not succeed within `RECONNECT_TIMEOUT`, fires
-/// `device_error_notify` and exits.
-pub(crate) async fn reconnecting_reader_task_with<S, F>(
-    mut stream: S,
-    path: PathBuf,
-    grab: bool,
-    resume_notify: Arc<Notify>,
-    tx: mpsc::Sender<ControllerEvent>,
-    device_error_notify: Arc<Notify>,
-    mut yield_rx: Option<mpsc::Receiver<grab_coordinator::YieldEvent>>,
-    try_reopen: F,
-)
-where
-    S: Stream<Item = io::Result<InputEvent>> + Unpin,
-    F: Fn(&Path, bool) -> io::Result<S>,
-{
-    use grab_coordinator::YieldEvent;
-
-    // Reason the inner read loop broke out.
-    enum BreakReason { StreamError, Resume, Yield }
-
-    loop {
-        // ── Read phase: forward events until stream dies, resume fires, or yield ──
-        let break_reason = loop {
-            tokio::select! {
-                event = stream.next() => {
-                    match event {
-                        Some(Ok(e)) => {
-                            if tx.send(ControllerEvent::Input(e)).await.is_err() {
-                                return; // consumer dropped — process exiting
-                            }
-                        }
-                        Some(Err(e)) => {
-                            println!("deckery-controller: stream error on {:?}: {} — reconnecting", path, e);
-                            break BreakReason::StreamError;
-                        }
-                        None => {
-                            println!("deckery-controller: stream ended on {:?} — reconnecting", path);
-                            break BreakReason::StreamError;
-                        }
-                    }
-                }
-                _ = resume_notify.notified() => {
-                    println!("deckery-controller: resume signal — proactive reconnect on {:?}", path);
-                    break BreakReason::Resume;
-                }
-                yield_cmd = yield_rx_recv(&mut yield_rx) => {
-                    match yield_cmd {
-                        Some(YieldEvent::Release) => {
-                            println!(
-                                "deckery-controller: GrabPending — yielding EVIOCGRAB on {:?}",
-                                path
-                            );
-                            break BreakReason::Yield;
-                        }
-                        // Channel closed — disable this arm from now on.
-                        None => { yield_rx = None; }
-                        // Stale Regrab (shouldn't arrive here) — ignore.
-                        Some(YieldEvent::Regrab) => {}
-                    }
-                }
-            }
-        };
-
-        // ── Drop old stream BEFORE reconnecting ────────────────────────────────
-        // CRITICAL: the old EventStream holds an open evdev fd. If grab=true,
-        // that fd holds EVIOCGRAB. Keeping it alive while try_reopen attempts a
-        // new grab would fail with EBUSY, causing every reconnect attempt to
-        // silently fail for the full RECONNECT_TIMEOUT before triggering a
-        // spurious full reinit.
-        drop(stream);
-
-        // ── Yield path: wait for GrabReleased, then re-acquire EVIOCGRAB ─────
-        if matches!(break_reason, BreakReason::Yield) {
-            // Block until the requester signals that it has released the grab.
-            println!("deckery-controller: waiting for GrabReleased on {:?}", path);
-            loop {
-                match yield_rx_recv(&mut yield_rx).await {
-                    Some(YieldEvent::Regrab) => {
-                        println!("deckery-controller: GrabReleased — re-grabbing {:?}", path);
-                        break;
-                    }
-                    Some(YieldEvent::Release) => {} // stale duplicate — ignore
-                    None => return,                 // session ending
-                }
-            }
-
-            // Re-acquire with retry — same pattern as the normal reconnect loop.
-            let deadline = tokio::time::Instant::now() + RECONNECT_TIMEOUT;
-            stream = loop {
-                match try_reopen(&path, true) {
-                    Ok(s) => {
-                        println!("deckery-controller: re-grabbed {:?} after yield", path);
-                        if tx.send(ControllerEvent::Reconnected).await.is_err() {
-                            return;
-                        }
-                        break s;
-                    }
-                    Err(e) if is_grab_busy(&e) => {
-                        if tokio::time::Instant::now() >= deadline {
-                            eprintln!(
-                                "deckery-controller: could not re-grab {:?} within {:?} \
-                                 (last error: {}) — triggering reinit",
-                                path, RECONNECT_TIMEOUT, e
-                            );
-                            device_error_notify.notify_one();
-                            return;
-                        }
-                        tokio::time::sleep(RECONNECT_POLL_INTERVAL).await;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "deckery-controller: re-grab of {:?} failed: {} — triggering reinit",
-                            path, e
-                        );
-                        device_error_notify.notify_one();
-                        return;
-                    }
-                }
-            };
-            continue; // back to the read loop
-        }
-
-        // ── Normal reconnect path (suspend/resume or stream error) ────────────
-
-        // Reactive reconnect: give the kernel a moment to complete the USB
-        // reset and re-enumerate the device. Proactive: the device should
-        // already be back — try immediately, polling handles any brief gap.
-        if matches!(break_reason, BreakReason::StreamError) {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-
-        let deadline = tokio::time::Instant::now() + RECONNECT_TIMEOUT;
-        stream = loop {
-            match try_reopen(&path, grab) {
-                Ok(s) => {
-                    if grab {
-                        println!("deckery-controller: reconnected to {:?} (grab re-acquired)", path);
-                    } else {
-                        println!("deckery-controller: reconnected to {:?}", path);
-                    }
-                    if tx.send(ControllerEvent::Reconnected).await.is_err() {
-                        return; // consumer dropped — session ending
-                    }
-                    break s;
-                }
-                Err(e) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        eprintln!(
-                            "deckery-controller: {:?} did not return within {:?} \
-                             (last error: {}) — triggering full reinit",
-                            path, RECONNECT_TIMEOUT, e
-                        );
-                        device_error_notify.notify_one();
-                        return;
-                    }
-                    tokio::time::sleep(RECONNECT_POLL_INTERVAL).await;
-                }
-            }
-        };
-    }
-}
-
-/// Try to open an evdev device and return an `EventStream`. Non-panicking —
-/// used in the reconnect poll loop inside `reconnecting_reader_task_with`.
-pub(crate) fn try_open_event_stream(path: &Path, grab: bool) -> std::io::Result<EventStream> {
-    let mut device = Device::open(path)?;
-    if grab { device.grab()?; }
-    device.into_event_stream()
 }
 
 // ── Hidraw discovery ─────────────────────────────────────────────────────────
@@ -687,177 +344,23 @@ mod tests {
 
     #[test]
     fn steam_deck_controller_from_nonexistent_evdev_has_no_hidraw() {
-        let ctrl = SteamDeckController::from_evdev(Path::new("/dev/input/event99999"), false);
+        let ctrl = SteamDeckController::from_evdev(Path::new("/dev/input/event99999"));
         assert_eq!(ctrl.evdev_path, PathBuf::from("/dev/input/event99999"));
         assert!(ctrl.hidraw_path.is_none());
-    }
-
-    #[test]
-    fn try_open_event_stream_returns_error_for_nonexistent_path() {
-        let result = try_open_event_stream(Path::new("/dev/input/event99999"), false);
-        assert!(result.is_err());
     }
 
     #[test]
     fn find_does_not_panic() {
         // find() scans live evdev nodes — result is hardware-dependent.
         // This test only verifies it doesn't panic and returns a consistent type.
-        let _result: Option<SteamDeckController> = SteamDeckController::find(false);
-    }
-
-    // ── reconnecting_reader_task_with: yield path ────────────────────────────
-    //
-    // Uses a channel-backed mock stream (ReceiverStream) and a mock try_reopen
-    // closure instead of real evdev hardware. Verifies that YieldEvent::Release
-    // followed by YieldEvent::Regrab causes the task to call try_reopen and
-    // send ControllerEvent::Reconnected — without needing a uinput device.
-
-    use tokio_stream::wrappers::ReceiverStream;
-    use grab_coordinator::YieldEvent;
-    use tokio::time::{timeout, Duration};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    /// A mock stream backed by an mpsc channel.
-    /// Dropping the sender closes the stream (stream.next() returns None).
-    fn mock_stream() -> (
-        tokio::sync::mpsc::Sender<io::Result<InputEvent>>,
-        ReceiverStream<io::Result<InputEvent>>,
-    ) {
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        (tx, ReceiverStream::new(rx))
+        let _result: Option<SteamDeckController> = SteamDeckController::find();
     }
 
     #[tokio::test]
-    async fn yield_release_then_regrab_calls_try_reopen_and_sends_reconnected() {
-        let (_stream_tx, initial_stream) = mock_stream();
-
-        let resume_notify      = Arc::new(Notify::new());
-        let device_error_notify = Arc::new(Notify::new());
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
-        let (yield_tx, yield_rx)     = tokio::sync::mpsc::channel(4);
-
-        // Flag set when try_reopen is called — confirms the re-grab attempt.
-        let reopen_called = Arc::new(AtomicBool::new(false));
-        let reopen_called_clone = reopen_called.clone();
-
-        tokio::spawn(reconnecting_reader_task_with(
-            initial_stream,
-            PathBuf::from("/dev/input/event-mock-regrab"),
-            /*grab=*/ true,
-            resume_notify,
-            event_tx,
-            device_error_notify,
-            Some(yield_rx),
-            move |_path, _grab| {
-                reopen_called_clone.store(true, Ordering::SeqCst);
-                // Return a new mock stream that stays open.
-                let (_tx, rx) = tokio::sync::mpsc::channel::<io::Result<InputEvent>>(1);
-                Ok(ReceiverStream::new(rx))
-            },
-        ));
-
-        // Trigger the yield: tell the task to release EVIOCGRAB.
-        yield_tx.send(YieldEvent::Release).await.unwrap();
-
-        // After releasing, send Regrab: tell the task GrabReleased, time to re-grab.
-        // Brief sleep ensures the task has entered the wait-for-Regrab phase.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        yield_tx.send(YieldEvent::Regrab).await.unwrap();
-
-        // try_reopen must have been called.
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if reopen_called.load(Ordering::SeqCst) { break; }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }).await.expect("try_reopen not called after YieldEvent::Regrab");
-
-        // Reconnected must have been sent to the consumer.
-        let event = timeout(Duration::from_secs(2), event_rx.recv()).await
-            .expect("timeout waiting for Reconnected")
-            .expect("event_rx closed");
-        assert!(
-            matches!(event, ControllerEvent::Reconnected),
-            "expected Reconnected after re-grab, got something else",
-        );
-    }
-
-    #[tokio::test]
-    async fn yield_regrab_busy_then_succeeds_on_retry() {
-        let (_stream_tx, initial_stream) = mock_stream();
-
-        let resume_notify       = Arc::new(Notify::new());
-        let device_error_notify = Arc::new(Notify::new());
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
-        let (yield_tx, yield_rx)     = tokio::sync::mpsc::channel(4);
-
-        // First call returns EBUSY, second succeeds.
-        let attempt = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let attempt_clone = attempt.clone();
-
-        tokio::spawn(reconnecting_reader_task_with(
-            initial_stream,
-            PathBuf::from("/dev/input/event-mock-busy"),
-            /*grab=*/ true,
-            resume_notify,
-            event_tx,
-            device_error_notify,
-            Some(yield_rx),
-            move |_path, _grab| {
-                let n = attempt_clone.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    Err(io::Error::from_raw_os_error(libc::EBUSY))
-                } else {
-                    let (_tx, rx) = tokio::sync::mpsc::channel::<io::Result<InputEvent>>(1);
-                    Ok(ReceiverStream::new(rx))
-                }
-            },
-        ));
-
-        yield_tx.send(YieldEvent::Release).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        yield_tx.send(YieldEvent::Regrab).await.unwrap();
-
-        // Reconnected must arrive despite the initial EBUSY.
-        let event = timeout(Duration::from_secs(3), event_rx.recv()).await
-            .expect("timeout — EBUSY retry did not succeed")
-            .expect("event_rx closed");
-        assert!(matches!(event, ControllerEvent::Reconnected));
-        assert!(
-            attempt.load(Ordering::SeqCst) >= 2,
-            "expected at least two try_reopen calls (EBUSY + success)",
-        );
-    }
-
-    #[tokio::test]
-    async fn yield_regrab_non_busy_error_triggers_device_error_notify() {
-        let (_stream_tx, initial_stream) = mock_stream();
-
-        let resume_notify       = Arc::new(Notify::new());
-        let device_error_notify = Arc::new(Notify::new());
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
-        let (yield_tx, yield_rx)  = tokio::sync::mpsc::channel(4);
-
-        tokio::spawn(reconnecting_reader_task_with(
-            initial_stream,
-            PathBuf::from("/dev/input/event-mock-error"),
-            /*grab=*/ true,
-            resume_notify,
-            event_tx,
-            device_error_notify.clone(),
-            Some(yield_rx),
-            |_path, _grab| -> io::Result<ReceiverStream<io::Result<InputEvent>>> {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "no permission"))
-            },
-        ));
-
-        yield_tx.send(YieldEvent::Release).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        yield_tx.send(YieldEvent::Regrab).await.unwrap();
-
-        // Non-EBUSY error must fire device_error_notify immediately.
-        timeout(Duration::from_secs(2), device_error_notify.notified()).await
-            .expect("device_error_notify not fired on non-EBUSY re-grab error");
+    async fn start_fails_when_no_hidraw_sibling_found() {
+        let ctrl = SteamDeckController::from_evdev(Path::new("/dev/input/event99999"));
+        let err = ctrl.start(Arc::new(Notify::new()), None).await
+            .err().expect("expected an error when no hidraw sibling is found");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
