@@ -309,8 +309,15 @@ pub fn find_controller_hidraw_for_evdev(evdev_path: &Path) -> Option<PathBuf> {
         format!("/sys/class/input/{}/device", dev_name)
     ).ok()?;
     // evdev_sysfs is …/usb_iface/HID_A/input/inputN
-    // Go up three levels: inputN → input/ → HID_A/ → usb_iface/
-    let usb_iface = evdev_sysfs.parent()?.parent()?.parent()?;
+    // Go up four levels: inputN → input/ → HID_A/ → usb_iface/ → usb_device/
+    //
+    // We compare at the USB-device level (one above the USB interface) so that
+    // the raw-controller hidraw (which may be under a *different* USB interface
+    // than the evdev node) is still recognised as a sibling.  This matters in
+    // QEMU passthrough (usb-host / USB-IP) where each HID interface is exposed
+    // as its own USB interface, whereas on real hardware they all live under the
+    // same interface — both layouts resolve correctly at the device level.
+    let usb_device = evdev_sysfs.parent()?.parent()?.parent()?.parent()?;
 
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir("/sys/class/hidraw/").ok()? {
@@ -319,7 +326,7 @@ pub fn find_controller_hidraw_for_evdev(evdev_path: &Path) -> Option<PathBuf> {
         if let Ok(hidraw_sysfs) = std::fs::canonicalize(
             format!("/sys/class/hidraw/{}/device", name)
         ) {
-            if hidraw_sysfs.parent() != Some(usb_iface) { continue; }
+            if hidraw_sysfs.parent()?.parent() != Some(usb_device) { continue; }
             if Path::new(&format!("/sys/class/hidraw/{}/device/input", name)).exists() {
                 continue;
             }
