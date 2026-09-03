@@ -1748,7 +1748,11 @@ impl EventReader {
     async fn change_active_layout(&self) {
         // Get the current client for layout matching.
         let client: Client = match &self.environment.server {
-            Server::Connected(s) if s == "KDE" => self.active_client.lock().await.clone(),
+            // Event-driven compositors push focus changes into active_client — read directly.
+            Server::Connected(s) if crate::compositor::detect(s).is_event_driven() => {
+                self.active_client.lock().await.clone()
+            }
+            // Polling fallback (sway, niri, x11): query on demand.
             _ => {
                 let known = self.registry.enabled_app_configs(&self.device_name);
                 get_active_window(&self.environment, &known).await
@@ -1787,7 +1791,11 @@ impl EventReader {
         Box::pin(async move {
             let active_layout = *self.active_layout.lock().await;
             let client: Client = match &self.environment.server {
-                Server::Connected(s) if s == "KDE" => self.active_client.lock().await.clone(),
+                // Event-driven compositors push focus changes into active_client — read directly.
+                Server::Connected(s) if crate::compositor::detect(s).is_event_driven() => {
+                    self.active_client.lock().await.clone()
+                }
+                // Polling fallback (sway, niri, x11): query on demand.
                 _ => {
                     let known = self.registry.enabled_app_configs(&self.device_name);
                     get_active_window(&self.environment, &known).await

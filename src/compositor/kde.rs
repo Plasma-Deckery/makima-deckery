@@ -1,22 +1,19 @@
-// ── KWin Window-Activation Watcher ───────────────────────────────────────────
-//
-// Registers a persistent KWin script (via D-Bus Scripting API) that listens
-// for workspace.windowActivated and calls back into makima's own D-Bus object.
-// This replaces the old kdotool-per-button-press approach with a true
-// event-driven mechanism: zero overhead when nothing changes.
-//
-// Flow:
-//   1. We register "org.makima.watcher" on the session bus and expose
-//      the object /watcher with method WindowActivated(class_name, caption).
-//   2. We write a tiny KWin script to /tmp and load it via
-//      org.kde.kwin.Scripting.loadScript / .start().
-//   3. Whenever KWin fires workspace.windowActivated, the script calls
-//      back into our method → we update the shared Arc<Mutex<Client>> with
-//      Client::Class(class, caption) and fire Arc<Notify>.
-//
-// This module only reports focus changes. All Gaming Mode policy lives in
-// EventReader::steam_detection_loop(), which reads the caption from active_client.
+//! KDE / KWin compositor adapter.
+//!
+//! Registers a persistent KWin script (via D-Bus Scripting API) that listens
+//! for `workspace.windowActivated` and calls back into makima's own D-Bus object.
+//! Event-driven: zero overhead when nothing changes.
+//!
+//! Flow:
+//!   1. We register `org.makima.watcher` on the session bus and expose
+//!      the object `/watcher` with method `WindowActivated(class, caption, pid)`.
+//!   2. We write a tiny KWin script to /tmp and load it via
+//!      `org.kde.kwin.Scripting.loadScript` / `.start()`.
+//!   3. Whenever KWin fires `workspace.windowActivated`, the script calls
+//!      back into our method → we update the shared `Arc<Mutex<Client>>`
+//!      via `super::notify_focus_change()` and fire `Arc<Notify>`.
 
+use super::notify_focus_change;
 use crate::udev_monitor::Client;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
@@ -24,8 +21,8 @@ use zbus::{interface, proxy, connection::Builder};
 
 // ── KWin script ──────────────────────────────────────────────────────────────
 //
-// Forwards raw class + caption — no classification logic here.
-// `steam_detector` decides what they mean in Rust.
+// Forwards raw class + caption + pid — no classification logic here.
+// steam_detector decides what they mean in Rust.
 
 const KWIN_SCRIPT: &str = r#"
 workspace.windowActivated.connect(function(w) {
@@ -42,30 +39,20 @@ const SCRIPT_PATH: &str = "/tmp/makima-kwin-watcher.js";
 // ── D-Bus interface exposed by makima ─────────────────────────────────────────
 
 struct WatcherIface {
-    /// Shared client state — holds class + caption after every focus change.
-    /// EventReader uses class for config selection; steam_detection_loop
-    /// uses caption for Big Picture Mode detection.
     active_client: Arc<Mutex<Client>>,
-    /// Wakes all EventReader tasks on every focus change.
     notify: Arc<Notify>,
 }
 
 #[interface(name = "org.makima.watcher")]
 impl WatcherIface {
     /// Called by the KWin script on every window-activation change.
-    /// Stores raw class, caption, and PID in active_client and fires notify.
-    /// No detection logic here — that lives in steam_detection_task.
     ///
     /// Note: KWin's callDBus sends JavaScript numbers as D-Bus int32 (i),
     /// so pid must be i32 here — not u32 — to avoid a silent type mismatch
     /// that would cause the entire D-Bus call to be silently dropped.
     async fn window_activated(&self, class_name: String, caption: String, pid: i32) {
-        *self.active_client.lock().await = if class_name.is_empty() {
-            Client::Default
-        } else {
-            Client::Class(class_name, caption, if pid <= 0 { None } else { Some(pid as u32) })
-        };
-        self.notify.notify_waiters();
+        let pid = if pid > 0 { Some(pid as u32) } else { None };
+        notify_focus_change(&self.active_client, &self.notify, class_name, caption, pid).await;
     }
 }
 
@@ -87,18 +74,14 @@ trait KwinScripting {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Starts the KWin window-activation watcher.
-/// Meant to be spawned once as a tokio task; runs indefinitely.
-///
-/// On every focus change the watcher stores `Client::Class(class, caption)`
-/// in `active_client` and fires `notify`, waking all EventReader tasks
-/// (config re-evaluation and steam_detection_loop).
-pub async fn start_kwin_watcher(
+/// KDE focus-watcher: loads a KWin script via D-Bus that calls back on every
+/// `workspace.windowActivated` event. Runs indefinitely.
+pub async fn run_focus_watcher(
     active_client: Arc<Mutex<Client>>,
     notify: Arc<Notify>,
 ) {
     if let Err(e) = std::fs::write(SCRIPT_PATH, KWIN_SCRIPT) {
-        eprintln!("deckery: kwin_watcher: failed to write script: {e}");
+        eprintln!("deckery: kde_watcher: failed to write script: {e}");
         return;
     }
 
@@ -116,12 +99,12 @@ pub async fn start_kwin_watcher(
         Ok(builder) => match builder.build().await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("deckery: kwin_watcher: D-Bus connection failed: {e}");
+                eprintln!("deckery: kde_watcher: D-Bus connection failed: {e}");
                 return;
             }
         },
         Err(e) => {
-            eprintln!("deckery: kwin_watcher: D-Bus setup failed: {e}");
+            eprintln!("deckery: kde_watcher: D-Bus setup failed: {e}");
             return;
         }
     };
@@ -140,7 +123,7 @@ pub async fn start_kwin_watcher(
         match scripting.load_script(SCRIPT_PATH, PLUGIN_NAME).await {
             Ok(id) => {
                 println!(
-                    "deckery: kwin_watcher: script loaded (id {id}), window-activation events enabled. +{}ms since startup",
+                    "deckery: kde_watcher: script loaded (id {id}), window-activation events enabled. +{}ms since startup",
                     crate::startup_ms()
                 );
                 let _ = scripting.start().await;

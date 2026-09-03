@@ -10,7 +10,7 @@ use crate::virtual_devices::VirtualDevices;
 use std::{env, path::{Path, PathBuf}, process::Command, sync::Arc};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
-use crate::kwin_watcher;
+use crate::compositor;
 use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle};
 use tokio_stream::StreamExt;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -115,14 +115,16 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
     let active_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::Default));
     let window_changed: Arc<Notify> = Arc::new(Notify::new());
 
-    // Start the KWin watcher once — persists across device reinitializations.
+    // Start the compositor focus-watcher once — persists across device reinitializations.
+    // Event-driven adapters (KDE, Hyprland) push focus changes into active_client + notify.
+    // The Fallback adapter is a no-op; EventReader falls back to get_active_window() polling.
     if let Server::Connected(s) = &environment.server {
-        if s == "KDE" {
-            tokio::spawn(kwin_watcher::start_kwin_watcher(
-                active_client.clone(),
-                window_changed.clone(),
-            ));
-        }
+        let adapter = compositor::detect(s);
+        println!("deckery: compositor adapter: {}", adapter.name());
+        tokio::spawn(adapter.run_focus_watcher(
+            active_client.clone(),
+            window_changed.clone(),
+        ));
     }
 
     let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx).await;
@@ -505,7 +507,10 @@ fn set_environment() -> Environment {
         env::set_var("XDG_SESSION_TYPE", "wayland")
     }
 
-    let supported_compositors = vec!["Hyprland", "sway", "KDE", "niri"]
+    // Compositors listed here get Server::Connected and enable per-app bindings.
+    // KDE and Hyprland use event-driven adapters (compositor module).
+    // sway and niri use the legacy get_active_window() polling fallback.
+    let supported_compositors = vec!["KDE", "Hyprland", "sway", "niri"]
         .into_iter()
         .map(|str| String::from(str))
         .collect::<Vec<String>>();
@@ -522,7 +527,7 @@ fn set_environment() -> Environment {
         }
         (Ok(session), Ok(desktop)) if session == wayland => {
             println!("Warning: unsupported compositor: {}, won't be able to change bindings according to the active window.\n\
-                    Currently supported desktops: Hyprland, Sway, Niri, Plasma/KWin, X11.\n", desktop);
+                    Currently supported desktops: Plasma/KWin (event-driven), Hyprland (event-driven), Sway (polling), Niri (polling), X11.\n", desktop);
             Server::Unsupported
         }
         (Ok(session), _) if session == x11 => {
