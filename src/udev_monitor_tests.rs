@@ -1,9 +1,10 @@
 use super::*;
 use crate::config_registry::{ConfigRegistry, ConfigEntry, ConfigError};
 use crate::config::Config;
+use crate::virtual_devices::VirtualDevices;
 
 #[tokio::test]
-async fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
+async fn launch_tasks_returns_modifiers() {
     let registry = ConfigRegistry::empty();
     let mut tasks = Vec::new();
     let env = Environment {
@@ -14,11 +15,11 @@ async fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
     let error_notify = Arc::new(Notify::new());
     let client = Arc::new(Mutex::new(Client::Default));
     let window_changed = Arc::new(Notify::new());
-
     let gaming_mode = Arc::new(Mutex::new(false));
     let (state_tx, _state_rx) = tokio::sync::mpsc::channel(8);
     let (ipc_tx, _) = tokio::sync::broadcast::channel(1);
-    let (virt_dev_opt, modifiers) = launch_tasks(
+    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new_headless()));
+    let modifiers = launch_tasks(
         &registry,
         &mut tasks,
         env,
@@ -28,12 +29,11 @@ async fn launch_tasks_returns_modifiers_and_virt_dev_holder() {
         gaming_mode,
         state_tx,
         &ipc_tx,
+        virt_dev,
     ).await;
 
-    if let Some(_) = virt_dev_opt {
-        // If a device was found, modifiers must be a connected Arc.
-        let _ = modifiers;
-    }
+    // With no configs and no devices, modifiers should be an empty Arc.
+    assert!(modifiers.lock().await.is_empty());
 }
 
 /// When no configs are loaded, launch_tasks must:
@@ -57,6 +57,7 @@ async fn no_config_files_sends_lifecycle_ready_and_no_device_error() {
 
     let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(8);
     let (ipc_tx, _) = tokio::sync::broadcast::channel(1);
+    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new_headless()));
     launch_tasks(
         &registry,
         &mut tasks,
@@ -67,6 +68,7 @@ async fn no_config_files_sends_lifecycle_ready_and_no_device_error() {
         gaming_mode,
         state_tx,
         &ipc_tx,
+        virt_dev,
     ).await;
 
     // Drain all commands sent synchronously by launch_tasks.

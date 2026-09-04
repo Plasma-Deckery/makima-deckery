@@ -107,18 +107,26 @@ impl ConfigRegistry {
 
     /// True if at least one config exists whose device-name prefix matches.
     /// Used by udev_monitor to decide whether to open a given evdev device.
+    ///
+    /// For Class A (hid-steam) devices, the lookup is performed against the
+    /// canonical config name rather than the raw kernel-reported evdev name,
+    /// so "Valve Software Steam Controller" finds "Steam Deck.toml" just as
+    /// well as "Steam Deck" does. Class B (generic evdev) devices use an exact
+    /// prefix match as before.
     pub fn device_has_configs(&self, device_name: &str) -> bool {
+        let lookup = effective_config_name(device_name);
         self.entries.lock().unwrap()
             .keys()
-            .any(|n| n.split("::").next() == Some(device_name))
+            .any(|n| n.split("::").next() == Some(lookup))
     }
 
     /// The unmerged base config for a device — the entry whose name is exactly
-    /// the device name (no "::" suffix) and whose associations are default.
+    /// the (canonical) device name with no "::" suffix and default associations.
     /// Returns None if not found, parse-failed, or disabled.
     pub fn base_config(&self, device_name: &str) -> Option<Config> {
+        let lookup = effective_config_name(device_name);
         self.entries.lock().unwrap()
-            .get(device_name)
+            .get(lookup)
             .filter(|e| e.enabled)
             .and_then(|e| e.config.clone())
     }
@@ -126,6 +134,11 @@ impl ConfigRegistry {
     // ── Query API (EventReader) ───────────────────────────────────────────────
 
     /// Resolve the active, fully-merged config for the given runtime context.
+    ///
+    /// `device_name` may be the raw kernel-reported evdev name or the canonical
+    /// config name — both work. For Class A (hid-steam) devices the lookup is
+    /// performed against the canonical name so "Valve Software Steam Controller"
+    /// finds "Steam Deck::Firefox" app configs the same way "Steam Deck" does.
     ///
     /// Steps:
     ///   1. Find the enabled, valid base config for `device_name`.
@@ -137,12 +150,14 @@ impl ConfigRegistry {
     pub fn resolve(&self, device_name: &str, client: &Client, layout: u16) -> Option<Config> {
         let entries = self.entries.lock().unwrap();
 
+        let lookup = effective_config_name(device_name);
+
         // Step 1 — base config.
-        let base = entries.get(device_name)
+        let base = entries.get(lookup)
             .filter(|e| e.enabled && e.config.is_some())
             .and_then(|e| e.config.as_ref())?;
 
-        let prefix = format!("{}::", device_name);
+        let prefix = format!("{}::", lookup);
 
         // Step 2a — exact match: layout + client class.
         let exact = entries.values()
@@ -184,7 +199,8 @@ impl ConfigRegistry {
     /// Passed to `get_active_window()` so it can validate the window class
     /// against known configs before returning a Client::Class.
     pub fn enabled_app_configs(&self, device_name: &str) -> Vec<Config> {
-        let prefix = format!("{}::", device_name);
+        let lookup = effective_config_name(device_name);
+        let prefix = format!("{}::", lookup);
         self.entries.lock().unwrap()
             .values()
             .filter(|e| e.enabled && e.config.is_some())
@@ -297,6 +313,22 @@ impl ConfigRegistry {
 }
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
+
+// ── Canonical name resolution ─────────────────────────────────────────────────
+
+/// Return the canonical config-file name prefix to use for all registry lookups.
+///
+/// For Class A (hid-steam) devices this maps the raw kernel-reported evdev name
+/// to the stable canonical name (e.g. "Valve Software Steam Controller" →
+/// "Steam Deck"). For all other devices the name is returned unchanged.
+///
+/// This is the single choke-point that makes every registry query kernel-version
+/// agnostic for hid-steam devices — callers never need to know which name variant
+/// the current kernel reports.
+fn effective_config_name(device_name: &str) -> &str {
+    deckery_controller::canonical_device_name(device_name)
+        .unwrap_or(device_name)
+}
 
 /// Parse associations (device, window class, layout) from a config file name.
 ///

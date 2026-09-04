@@ -127,7 +127,27 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
         ));
     }
 
-    let (mut prev_virt_dev, mut prev_modifiers) = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx).await;
+    // Pre-create the output device layer once at startup.
+    //
+    // Virtual keyboard/mouse/pointer devices are instantiated here, before any
+    // physical controller is detected. They persist for the entire lifetime of
+    // the process — across device connect/disconnect cycles and full reinits.
+    // This means:
+    //   • KDE/libinput see stable, persistent virtual device nodes (no "device
+    //     disappeared" flicker on controller reconnect or config reload).
+    //   • The correct output layer is always available, even briefly before the
+    //     physical controller is enumerated.
+    //   • Multiple evdev nodes that map to the same hidraw sibling share this
+    //     single output layer (deduplication in launch_tasks prevents double
+    //     sessions, so only one EventReader ever writes to these devices).
+    //
+    // Trackpad virtual devices (lpad, rpad, gesture_pad) start as None and are
+    // enabled the first time launch_tasks finds a Steam Deck controller —
+    // VirtualDevices::enable_trackpads() is idempotent, so subsequent reinits
+    // leave the already-active uinput nodes untouched.
+    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new_headless()));
+
+    let mut prev_modifiers = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx, virt_dev.clone()).await;
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
         tokio_udev::MonitorBuilder::new()
             .unwrap()
@@ -191,27 +211,28 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
                     if is_mapped(&event.device(), &registry) {
                         println!("---------------------\n\nReinitializing...\n");
                         let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
-                        release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
+                        release_held_modifiers(&virt_dev, &prev_modifiers).await;
                         for task in &tasks {
                             task.abort();
                         }
                         tasks.clear();
-                        (prev_virt_dev, prev_modifiers) = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx).await;
+                        prev_modifiers = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx, virt_dev.clone()).await;
                     }
                 }
             }
             _ = device_error_notify.notified() => {
                 // A genuine device error (USB unplug or reconnect timeout from the
-                // controller's reconnecting task). Full reinit — rebuild VirtualDevices.
+                // controller's reconnecting task). Restart input tasks — the output
+                // layer (virt_dev) is preserved across reinits.
                 println!("---------------------\n\nDevice error detected, reinitializing...\n");
                 let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
-                release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
+                release_held_modifiers(&virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();
                 }
                 tasks.clear();
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx).await;
+                prev_modifiers = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx, virt_dev.clone()).await;
             }
             Some(_) = config_rx.recv() => {
                 // Debounce: drain any queued events, then wait briefly for the
@@ -223,31 +244,30 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
                 registry.reload(&config_dir);
                 let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(registry.snapshot()));
                 report_base_config_error(&registry, &state_tx);
-                release_held_modifiers(&prev_virt_dev, &prev_modifiers).await;
+                release_held_modifiers(&virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();
                 }
                 tasks.clear();
-                (prev_virt_dev, prev_modifiers) = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx).await;
+                prev_modifiers = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx, virt_dev.clone()).await;
             }
         }
     }
 }
 
-/// Before destroying the old virtual devices during reinit, release all held
-/// modifier output keys so the kernel (and thus XWayland/compositor) knows
-/// those keys are no longer pressed. Without this, a stuck-modifier state
-/// persists across the reinit — modifiers held at reinit time (e.g. Ctrl+Alt
-/// from a paddle+button combo) are never released, causing phantom combo
-/// activation until the user physically presses and releases those keys again.
+/// Before restarting input tasks on reinit, release all held modifier output
+/// keys so the kernel (and thus XWayland/compositor) knows those keys are no
+/// longer pressed. Without this, a stuck-modifier state persists across the
+/// reinit — modifiers held at reinit time (e.g. Ctrl+Alt from a paddle+button
+/// combo) are never released, causing phantom combo activation until the user
+/// physically presses and releases those keys again.
+///
+/// The output device layer (`virt_dev`) is preserved across reinits, so the
+/// release events land on the same uinput nodes the compositor already knows.
 async fn release_held_modifiers(
-    prev_virt_dev: &Option<Arc<Mutex<VirtualDevices>>>,
+    virt_dev: &Arc<Mutex<VirtualDevices>>,
     prev_modifiers: &Arc<Mutex<Vec<Event>>>,
 ) {
-    let virt_dev = match prev_virt_dev {
-        Some(vd) => vd,
-        None => return,
-    };
     let held = prev_modifiers.lock().await.clone();
     if held.is_empty() {
         return;
@@ -272,7 +292,11 @@ pub async fn launch_tasks(
     gaming_mode: Arc<Mutex<bool>>,
     state_tx: StateWriterHandle,
     ipc_tx: &broadcast::Sender<String>,
-) -> (Option<Arc<Mutex<VirtualDevices>>>, Arc<Mutex<Vec<Event>>>) {
+    // Persistent output device layer, pre-created by start_monitoring_udev.
+    // All EventReader instances share this single set of virtual devices; the
+    // same Arc is reused across reinits so uinput nodes never disappear.
+    virt_dev: Arc<Mutex<VirtualDevices>>,
+) -> Arc<Mutex<Vec<Event>>> {
     // Unified Gaming Mode channel: steam detection and IPC both send here.
     // The EventReader's gaming_mode_set_loop is the sole consumer.
     let (gaming_mode_tx, gaming_mode_rx) = mpsc::channel::<bool>(32);
@@ -301,7 +325,7 @@ pub async fn launch_tasks(
 
     let modifiers: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Default::default()));
     let modifier_was_activated: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
-    let mut virt_dev_holder: Option<Arc<Mutex<VirtualDevices>>> = None;
+
     let user_has_access = match Command::new("groups").output() {
         Ok(groups)
             if std::str::from_utf8(&groups.stdout.as_slice())
@@ -331,15 +355,41 @@ pub async fn launch_tasks(
             false
         }
     };
+
+    // ── Hidraw deduplication ─────────────────────────────────────────────────
+    //
+    // hid-steam on kernels ≥7.1 creates multiple evdev nodes per physical
+    // controller (one per HID interface: mouse, keyboard, …). All of them share
+    // the same hidraw sibling. Without deduplication, launch_tasks would open
+    // one EventReader per evdev node → doubled key events, doubled virtual
+    // devices, doubled haptics.
+    //
+    // Solution: track the hidraw paths we have already claimed this cycle.
+    // The first evdev node that leads to a given hidraw path wins; subsequent
+    // nodes that resolve to the same path are silently skipped.
+    let mut seen_hidraw: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+
     let devices: evdev::EnumerateDevices = evdev::enumerate();
     let mut devices_found = 0;
     for device in devices {
-        let device_name = device.1.name().unwrap_or("").replace("/", "");
-        if !registry.device_has_configs(&device_name) {
+        let evdev_name = device.1.name().unwrap_or("").replace("/", "");
+
+        // Check if any config exists for this device (by evdev name or canonical
+        // name for Class A hid-steam devices).
+        if !registry.device_has_configs(&evdev_name) {
             continue;
         }
 
-        let base = registry.base_config(&device_name);
+        // Resolve the canonical config name. For Class A (hid-steam) devices
+        // this maps the kernel-reported name to the stable "Steam Deck" name so
+        // the EventReader uses the same config name regardless of kernel version.
+        // For Class B (generic evdev) devices the name is unchanged.
+        let config_name: String = deckery_controller::canonical_device_name(&evdev_name)
+            .map(str::to_string)
+            .unwrap_or_else(|| evdev_name.clone());
+
+        let base = registry.base_config(&config_name);
         let lizard_cfg = lizard_cfg_from_base(base.clone());
         let grab = base.as_ref()
             .and_then(|c| c.settings.get("GRAB_DEVICE"))
@@ -351,15 +401,15 @@ pub async fn launch_tasks(
         let event_device = device.0.as_path().to_str().unwrap().to_string();
 
         // Determine whether this is a Steam Deck controller or a generic device.
-        // Steam Deck: use the full controller path (hidraw, Lizard Mode, haptics,
+        // Steam Deck: full controller path (hidraw, Lizard Mode, haptics,
         //   hardcoded is_tablet=false / max_abs_wheel=0).
         // Generic: query capabilities from the evdev device, spawn a simple
         //   reconnecting reader — no hidraw, no haptics, no Lizard Mode.
         let is_steam_deck = device.1.name()
             .map_or(false, |n| is_known_device_name(n));
 
-        // Query generic device capabilities BEFORE device.1 is moved into
-        // VirtualDevices::new below. Steam Deck values are hardware constants.
+        // Query generic device capabilities before device.1 is consumed.
+        // Steam Deck values are hardware constants (not a tablet, no wheel).
         let (is_tablet, max_abs_wheel) = if is_steam_deck {
             (false, 0i32)
         } else {
@@ -383,6 +433,30 @@ pub async fn launch_tasks(
             // Full Steam Deck path — hidraw reader/writer + Lizard Mode heartbeat
             // are all spawned inside controller.start().
             let controller = SteamDeckController::from_evdev(Path::new(&event_device));
+
+            // Deduplication: skip this evdev node if its hidraw sibling was
+            // already claimed by an earlier node this cycle (same physical device
+            // appearing as multiple evdev interfaces, kernel ≥7.1 behaviour).
+            match &controller.hidraw_path {
+                Some(hidraw) => {
+                    if !seen_hidraw.insert(hidraw.clone()) {
+                        println!(
+                            "deckery: {:?} — hidraw {:?} already claimed, \
+                             skipping duplicate evdev node",
+                            event_device, hidraw
+                        );
+                        continue;
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "deckery: {:?}: no hidraw sibling found — skipping device",
+                        event_device
+                    );
+                    continue;
+                }
+            }
+
             let session = match controller.start(
                 device_error_notify.clone(),
                 lizard_cfg.clone(),
@@ -407,9 +481,6 @@ pub async fn launch_tasks(
             (rx, None, None, None, None)
         };
 
-        let virt_dev = Arc::new(Mutex::new(VirtualDevices::new(device.1)));
-        virt_dev_holder = Some(virt_dev.clone());
-
         // Set up the trackpad session only for Steam Deck devices.
         // Generic devices have no hidraw, no haptics, and no trackpad channels —
         // there is nothing for TrackpadSession to do, and we skip the KDE-input-
@@ -433,10 +504,10 @@ pub async fn launch_tasks(
             dead_rx
         });
         let reader = EventReader::new(
-            base.unwrap_or_else(|| Config::new_empty(device_name.clone())),
+            base.unwrap_or_else(|| Config::new_empty(config_name.clone())),
             registry.clone(),
-            device_name.clone(),
-            virt_dev,
+            config_name.clone(),
+            virt_dev.clone(),
             event_rx,
             is_tablet,
             max_abs_wheel,
@@ -467,10 +538,17 @@ pub async fn launch_tasks(
                 severity: "error",
             });
         } else {
-            println!("No matching devices found.\nNote: double-check that your device and its associated config file have the same name, as reported by 'evtest'.\n");
+            println!(
+                "No matching devices found.\n\
+                 Note: for Steam Deck / Steam Controller, name the config file \
+                 \"Steam Deck.toml\" — makima normalises all kernel-reported name \
+                 variants to that canonical name automatically.\n\
+                 For other devices, the config file name must match the evdev device \
+                 name as reported by 'evtest'.\n"
+            );
             let _ = state_tx.try_send(StateCommand::SetError {
                 id:       "no_device".to_string(),
-                message:  "No matching device found — check device name matches config file name".to_string(),
+                message:  "No matching device found — for Steam Deck use \"Steam Deck.toml\"; for other devices check evdev name matches config file name".to_string(),
                 severity: "error",
             });
         }
@@ -478,7 +556,7 @@ pub async fn launch_tasks(
         let _ = state_tx.try_send(StateCommand::ClearError { id: "no_device".to_string() });
     }
 
-    (virt_dev_holder, modifiers)
+    modifiers
 }
 
 pub async fn start_reader(reader: EventReader, gaming_rx: mpsc::Receiver<bool>, ipc_rx: broadcast::Receiver<String>, session: Option<TrackpadSession>) {
