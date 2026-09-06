@@ -70,5 +70,17 @@ if [ -f "$OLD_BIN" ]; then
     rm -f "$OLD_BIN"
 fi
 
-# ── 4. Build + deploy ────────────────────────────────────────────────────────
+# ── 4. qdbus compatibility shim ──────────────────────────────────────────────
+#
+# CachyOS and other Qt6-only distros ship qdbus6 but not qdbus. The deckery
+# configs use `run = ["qdbus ..."]` for KDE actions (nextDesktop, invokeShortcut
+# etc.). Create a user-level symlink so the existing configs work unchanged.
+_QDBUS_BIN="$HOME/.local/bin/qdbus"
+if ! command -v qdbus &>/dev/null && command -v qdbus6 &>/dev/null; then
+    echo "qdbus not found but qdbus6 is available — creating compatibility symlink"
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$(command -v qdbus6)" "$_QDBUS_BIN"
+fi
+
+# ── 5. Build + deploy ────────────────────────────────────────────────────────
 bash "$REPO/redeploy.sh"
