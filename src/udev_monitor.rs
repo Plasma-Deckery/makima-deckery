@@ -115,6 +115,12 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
     let active_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::Default));
     let window_changed: Arc<Notify> = Arc::new(Notify::new());
 
+    // Subscribe to logind PrepareForSleep — fires device_error_notify on resume
+    // so the existing reinit path handles reconnect without a full process restart.
+    tokio::spawn(crate::resume_watcher::start_resume_watcher(
+        device_error_notify.clone(),
+    ));
+
     // Start the compositor focus-watcher once — persists across device reinitializations.
     // Event-driven adapters (KDE, Hyprland) push focus changes into active_client + notify.
     // The Fallback adapter is a no-op; EventReader falls back to get_active_window() polling.

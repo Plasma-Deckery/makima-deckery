@@ -7,6 +7,7 @@ mod event_reader;
 mod gesture_pad;
 mod compositor;
 mod kde_input_defaults;
+mod resume_watcher;
 mod steam_detector;
 mod mt_trackpad;
 mod resolver;
