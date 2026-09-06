@@ -76,7 +76,15 @@ pub async fn start_resume_watcher(device_error_notify: Arc<Notify>) {
                 "deckery: resume_watcher: resume detected, triggering device reinit. +{}ms since startup",
                 crate::startup_ms()
             );
-            device_error_notify.notify_waiters();
+            // notify_one(), not notify_waiters(): the consumer is a select! arm
+            // in udev_monitor's main loop, which is only re-armed at the top of
+            // each iteration. While that loop is inside launch_tasks() — a full
+            // device reinit — no waiter is registered, and notify_waiters()
+            // keeps no permit, so a resume landing there would be dropped and
+            // the devices would never come back. notify_one() stores a permit,
+            // so the reinit happens on the next iteration instead. This also
+            // matches the other producer on this same Notify (udev_monitor.rs).
+            device_error_notify.notify_one();
         }
     }
 }
