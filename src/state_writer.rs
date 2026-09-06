@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use crate::config_registry::ConfigEntry;
+use crate::config_registry::ConfigSummary;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -47,7 +47,7 @@ pub enum StateCommand {
     /// Clear a previously reported error.
     ClearError { id: String },
     /// Full snapshot of the config registry — sent whenever the registry changes.
-    SetLoadedConfigs(Vec<ConfigEntry>),
+    SetLoadedConfigs(Vec<ConfigSummary>),
 }
 
 // ── Spawner ───────────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ pub fn spawn_state_writer() -> StateWriterHandle {
         let mut lifecycle   = AppLifecycle::Starting;
         let mut errors: HashMap<String, ErrorEntry> = HashMap::new();
         let mut event_state: Option<serde_json::Value> = None;
-        let mut configs: Vec<ConfigEntry> = Vec::new();
+        let mut configs: Vec<ConfigSummary> = Vec::new();
 
         // Write the initial "starting" state before any command arrives so the
         // tray sees a non-stale file the moment makima boots.
@@ -90,7 +90,7 @@ pub(crate) fn build_json(
     lifecycle:   &AppLifecycle,
     errors:      &HashMap<String, ErrorEntry>,
     event_state: &Option<serde_json::Value>,
-    configs:     &[ConfigEntry],
+    configs:     &[ConfigSummary],
 ) -> String {
     let lifecycle_str = match lifecycle {
         AppLifecycle::Starting       => "starting",
@@ -111,6 +111,8 @@ pub(crate) fn build_json(
             else { "warning" };
         serde_json::json!({
             "name":    e.name,
+            "kind":    e.kind,
+            "parent":  e.parent,
             "enabled": e.enabled,
             "status":  status,
             "errors":  e.errors.iter().map(|err| serde_json::json!({
@@ -142,7 +144,7 @@ fn flush(
     lifecycle:   &AppLifecycle,
     errors:      &HashMap<String, ErrorEntry>,
     event_state: &Option<serde_json::Value>,
-    configs:     &[ConfigEntry],
+    configs:     &[ConfigSummary],
 ) {
     let json  = build_json(lifecycle, errors, event_state, configs);
     let tmp   = "/tmp/makima-state.json.tmp";

@@ -5,20 +5,17 @@ use std::process::{Command, Stdio};
 use swayipc_async::Connection;
 use x11rb::protocol::xproto::{get_input_focus, get_property, Atom, AtomEnum};
 
-/// Returns `Client::Class(class, "")` if `class` matches any loaded config,
-/// otherwise `Client::Default`.
-fn match_class(class: String, config: &[Config]) -> Client {
-    if config.iter().any(|x| match &x.associations.client {
-        Client::Class(c, _, _) => c == &class,
-        Client::Default => false,
-    }) {
+/// Returns `Client::Class(class, "")` if a loaded module declares this window
+/// class via `[module] match_window_class`, otherwise `Client::Default`.
+fn match_class(class: String, modules: &[Config]) -> Client {
+    if modules.iter().any(|m| m.module.match_window_class.as_deref() == Some(class.as_str())) {
         Client::Class(class, String::new(), None)
     } else {
         Client::Default
     }
 }
 
-pub async fn get_active_window(environment: &Environment, config: &[Config]) -> Client {
+pub async fn get_active_window(environment: &Environment, modules: &[Config]) -> Client {
     match &environment.server {
         Server::Connected(server) => {
             let server_str = server.as_str();
@@ -32,7 +29,7 @@ pub async fn get_active_window(environment: &Environment, config: &[Config]) -> 
                         std::str::from_utf8(query.stdout.as_slice()).unwrap(),
                     ) {
                         let class = reply["class"].to_string().replace("\"", "");
-                        match_class(class, config)
+                        match_class(class, modules)
                     } else {
                         Client::Default
                     }
@@ -51,7 +48,7 @@ pub async fn get_active_window(environment: &Environment, config: &[Config]) -> 
                         },
                         None => return Client::Default,
                     };
-                    match_class(class, config)
+                    match_class(class, modules)
                 }
                 "niri" => {
                     let query = Command::new("niri")
@@ -62,7 +59,7 @@ pub async fn get_active_window(environment: &Environment, config: &[Config]) -> 
                         std::str::from_utf8(query.stdout.as_slice()).unwrap(),
                     ) {
                         let class = reply["app_id"].to_string().replace("\"", "");
-                        match_class(class, config)
+                        match_class(class, modules)
                     } else {
                         Client::Default
                     }
@@ -96,7 +93,7 @@ pub async fn get_active_window(environment: &Environment, config: &[Config]) -> 
                         .unwrap()
                         .trim()
                         .to_string();
-                    match_class(class, config)
+                    match_class(class, modules)
                 }
                 "x11" => {
                     let Ok((connection, _)) = x11rb::connect(None) else {
@@ -133,7 +130,7 @@ pub async fn get_active_window(environment: &Environment, config: &[Config]) -> 
                         let Ok(class_str) = std::str::from_utf8(rest) else {
                             return Client::Default;
                         };
-                        match_class(class_str.to_string(), config)
+                        match_class(class_str.to_string(), modules)
                     } else {
                         Client::Default
                     }

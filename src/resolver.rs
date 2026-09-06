@@ -219,6 +219,7 @@ mod tests {
             while_gaming: HashSet::new(),
             labels: labels.into_iter().collect(),
             silent: HashSet::new(),
+            ..Default::default()
         }
     }
 
@@ -559,6 +560,7 @@ mod tests {
             while_gaming: std::collections::HashSet::new(),
             labels: HashMap::new(),
             silent: std::collections::HashSet::new(),
+            ..Default::default()
         };
         let result = resolve_binding(&bindings, trigger, &[], false);
         assert_eq!(result, ResolvedBinding::Movement { movement, is_combo: false });
@@ -580,6 +582,7 @@ mod tests {
             while_gaming: std::collections::HashSet::new(),
             labels: HashMap::new(),
             silent: std::collections::HashSet::new(),
+            ..Default::default()
         };
         let result = resolve_binding(&bindings, trigger, &[btn_tl], false);
         assert_eq!(result, ResolvedBinding::Movement { movement, is_combo: true });

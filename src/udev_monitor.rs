@@ -1,10 +1,9 @@
-use crate::config::{Config, Event};
+use crate::config::{DeviceClass, Event};
 use crate::config_registry::ConfigRegistry;
 use crate::device_session::TrackpadSession;
 use crate::event_reader::EventReader;
 use deckery_controller::{
-    is_known_device_name, SteamDeckController, LizardModeSuppression,
-    ControllerEvent,
+    SteamDeckController, LizardModeSuppression, ControllerEvent,
 };
 use crate::virtual_devices::VirtualDevices;
 use std::{env, path::{Path, PathBuf}, process::Command, sync::Arc};
@@ -111,6 +110,15 @@ fn lizard_cfg_from_base(base: Option<crate::config::Config>) -> Option<LizardMod
 
 pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: String, mut tasks: Vec<JoinHandle<()>>, gaming_mode: Arc<Mutex<bool>>, state_tx: StateWriterHandle, ipc_tx: broadcast::Sender<String>) {
     let environment = set_environment();
+    // Modules gated by `[module] requires_compositor` can only be judged once
+    // the session environment is known, which is later than registry load time.
+    registry.set_compositor(match &environment.server {
+        Server::Connected(name) => Some(name.clone()),
+        Server::Unsupported | Server::Failed => None,
+    });
+    // The snapshot main.rs published at load time hid every gated module — with
+    // no compositor known yet, none of them could match. Republish now that it is.
+    let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(registry.snapshot()));
     let device_error_notify = Arc::new(Notify::new());
     let active_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::Default));
     let window_changed: Arc<Notify> = Arc::new(Notify::new());
@@ -151,7 +159,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
     // enabled the first time launch_tasks finds a Steam Deck controller —
     // VirtualDevices::enable_trackpads() is idempotent, so subsequent reinits
     // leave the already-active uinput nodes untouched.
-    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new_headless()));
+    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new()));
 
     let mut prev_modifiers = launch_tasks(&registry, &mut tasks, environment.clone(), device_error_notify.clone(), active_client.clone(), window_changed.clone(), gaming_mode.clone(), state_tx.clone(), &ipc_tx, virt_dev.clone()).await;
     let mut monitor = tokio_udev::AsyncMonitorSocket::new(
@@ -310,14 +318,10 @@ pub async fn launch_tasks(
     // Steam detection task — spawned once per session, outside any EventReader.
     // auto_detect comes from the first base config found in the registry;
     // defaults to true (detect by default) when no base config is loaded yet.
-    let auto_detect = {
-        let snap = registry.snapshot();
-        snap.iter()
-            .find(|e| !e.name.contains("::") && e.config.is_some())
-            .and_then(|e| e.config.as_ref())
-            .map(|c| c.gaming_mode_config.auto_detect_steam_games)
-            .unwrap_or(true)
-    };
+    let auto_detect = registry.base_configs()
+        .first()
+        .map(|c| c.gaming_mode_config.auto_detect_steam_games)
+        .unwrap_or(true);
     tokio::spawn(crate::steam_detector::steam_detection_task(
         window_changed.clone(),
         active_client.clone(),
@@ -373,76 +377,61 @@ pub async fn launch_tasks(
     // Solution: track the hidraw paths we have already claimed this cycle.
     // The first evdev node that leads to a given hidraw path wins; subsequent
     // nodes that resolve to the same path are silently skipped.
-    let mut seen_hidraw: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
+    let mut seen_hidraw: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    let devices: evdev::EnumerateDevices = evdev::enumerate();
     let mut devices_found = 0;
-    for device in devices {
-        let evdev_name = device.1.name().unwrap_or("").replace("/", "");
 
-        // Check if any config exists for this device (by evdev name or canonical
-        // name for Class A hid-steam devices).
-        if !registry.device_has_configs(&evdev_name) {
-            continue;
-        }
+    // ── New path: content-based discovery ────────────────────────────────────
+    //
+    // Iterate base configs (those with a [device] section). For each, scan all
+    // evdev devices and open the first one whose name matches the declaration.
+    // This inverts the old loop: config → find device (instead of device → find config).
+    let base_configs = registry.base_configs();
+    for base_config in base_configs {
+        let decl = base_config.device.as_ref().unwrap(); // guaranteed by base_configs()
+        let is_hid_steam = decl.class == DeviceClass::HidSteam;
 
-        // Resolve the canonical config name. For Class A (hid-steam) devices
-        // this maps the kernel-reported name to the stable "Steam Deck" name so
-        // the EventReader uses the same config name regardless of kernel version.
-        // For Class B (generic evdev) devices the name is unchanged.
-        let config_name: String = deckery_controller::canonical_device_name(&evdev_name)
-            .map(str::to_string)
-            .unwrap_or_else(|| evdev_name.clone());
+        let lizard_cfg = lizard_cfg_from_base(Some(base_config.clone()));
+        let grab = base_config.settings.get("GRAB_DEVICE").map_or(false, |v| v == "true");
+        let trackpad_config = base_config.trackpad.clone();
+        let config_name = base_config.name.clone();
 
-        let base = registry.base_config(&config_name);
-        let lizard_cfg = lizard_cfg_from_base(base.clone());
-        let grab = base.as_ref()
-            .and_then(|c| c.settings.get("GRAB_DEVICE"))
-            .map_or(false, |v| v == "true");
-        let trackpad_config = base.as_ref()
-            .map(|c| c.trackpad.clone())
-            .unwrap_or_default();
+        // Find the first physical device matching this declaration.
+        let matched = evdev::enumerate().find(|(_, d)| {
+            let name = d.name().unwrap_or("").replace("/", "");
+            decl.matches_evdev_name(&name)
+        });
 
-        let event_device = device.0.as_path().to_str().unwrap().to_string();
+        let (event_device_path, evdev_device) = match matched {
+            Some((path, dev)) => (path, dev),
+            None => {
+                println!("deckery: no device found matching config {:?} (names: {:?})", config_name, decl.names);
+                continue;
+            }
+        };
+        let event_device = event_device_path.to_str().unwrap_or("").to_string();
 
-        // Determine whether this is a Steam Deck controller or a generic device.
-        // Steam Deck: full controller path (hidraw, Lizard Mode, haptics,
-        //   hardcoded is_tablet=false / max_abs_wheel=0).
-        // Generic: query capabilities from the evdev device, spawn a simple
-        //   reconnecting reader — no hidraw, no haptics, no Lizard Mode.
-        let is_steam_deck = device.1.name()
-            .map_or(false, |n| is_known_device_name(n));
-
-        // Query generic device capabilities before device.1 is consumed.
-        // Steam Deck values are hardware constants (not a tablet, no wheel).
-        let (is_tablet, max_abs_wheel) = if is_steam_deck {
+        let (is_tablet, max_abs_wheel) = if is_hid_steam {
             (false, 0i32)
         } else {
-            let tablet = device.1.supported_keys()
+            let tablet = evdev_device.supported_keys()
                 .map_or(false, |keys| keys.contains(evdev::Key::BTN_TOOL_PEN));
-            let wheel = device.1.get_abs_state()
+            let wheel = evdev_device.get_abs_state()
                 .ok()
-                .and_then(|abs| {
-                    // ABS_WHEEL = axis index 8
-                    abs.get(evdev::AbsoluteAxisType::ABS_WHEEL.0 as usize)
-                        .map(|info| info.maximum)
-                })
+                .and_then(|abs| abs.get(evdev::AbsoluteAxisType::ABS_WHEEL.0 as usize)
+                    .map(|info| info.maximum))
                 .unwrap_or(0);
             (tablet, wheel)
         };
 
-        // Build the event channel and optional hidraw channels.
-        // Lizard Mode config is passed to controller.start() and managed
-        // internally by the writer task — no sender to keep alive here.
-        let (event_rx, pad_rx, haptic_tx, lizard_mode, click_pressure) = if is_steam_deck {
-            // Full Steam Deck path — hidraw reader/writer + Lizard Mode heartbeat
-            // are all spawned inside controller.start().
-            let controller = SteamDeckController::from_evdev(Path::new(&event_device));
+        // A pen's axis ranges are device-specific, so the shared output layer
+        // can only learn them once an actual tablet has been discovered.
+        if is_tablet {
+            virt_dev.lock().await.enable_tablet(&evdev_device);
+        }
 
-            // Deduplication: skip this evdev node if its hidraw sibling was
-            // already claimed by an earlier node this cycle (same physical device
-            // appearing as multiple evdev interfaces, kernel ≥7.1 behaviour).
+        let (event_rx, pad_rx, haptic_tx, lizard_mode, click_pressure) = if is_hid_steam {
+            let controller = SteamDeckController::from_evdev(Path::new(&event_device));
             match &controller.hidraw_path {
                 Some(hidraw) => {
                     if !seen_hidraw.insert(hidraw.clone()) {
@@ -455,18 +444,11 @@ pub async fn launch_tasks(
                     }
                 }
                 None => {
-                    eprintln!(
-                        "deckery: {:?}: no hidraw sibling found — skipping device",
-                        event_device
-                    );
+                    eprintln!("deckery: {:?}: no hidraw sibling found — skipping device", event_device);
                     continue;
                 }
             }
-
-            let session = match controller.start(
-                device_error_notify.clone(),
-                lizard_cfg.clone(),
-            ).await {
+            let session = match controller.start(device_error_notify.clone(), lizard_cfg).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("deckery: cannot open {:?}: {} — skipping device", event_device, e);
@@ -475,42 +457,25 @@ pub async fn launch_tasks(
             };
             (session.event_rx, session.pad_rx, session.haptic_tx, Some(session.lizard_mode), session.click_pressure)
         } else {
-            // Generic path — reconnecting evdev reader only; no Lizard Mode.
-            let rx = match spawn_event_reader(
-                Path::new(&event_device).to_path_buf(),
-                grab,
-                device_error_notify.clone(),
-            ) {
+            let rx = match spawn_event_reader(event_device_path, grab, device_error_notify.clone()) {
                 Some(rx) => rx,
-                None => continue, // device disappeared between scan and open
+                None => continue,
             };
             (rx, None, None, None, None)
         };
 
-        // Set up the trackpad session only for Steam Deck devices.
-        // Generic devices have no hidraw, no haptics, and no trackpad channels —
-        // there is nothing for TrackpadSession to do, and we skip the KDE-input-
-        // defaults write and uinput-node creation that setup() would otherwise
-        // perform for a non-Steam-Deck device.
-        let session = if is_steam_deck {
-            Some(TrackpadSession::setup(
-                &trackpad_config,
-                &virt_dev,
-                pad_rx,
-                haptic_tx.clone(),
-                click_pressure,
-            ).await)
+        let session = if is_hid_steam {
+            Some(TrackpadSession::setup(&trackpad_config, &virt_dev, pad_rx, haptic_tx.clone(), click_pressure).await)
         } else {
             None
         };
 
-        // First reader takes the real rx; subsequent readers get a dead one.
         let gaming_rx = gaming_mode_rx_opt.take().unwrap_or_else(|| {
             let (_, dead_rx) = mpsc::channel(1);
             dead_rx
         });
         let reader = EventReader::new(
-            base.unwrap_or_else(|| Config::new_empty(config_name.clone())),
+            base_config,
             registry.clone(),
             config_name.clone(),
             virt_dev.clone(),
@@ -531,6 +496,7 @@ pub async fn launch_tasks(
         tasks.push(tokio::spawn(start_reader(reader, gaming_rx, ipc_tx.subscribe(), session)));
         devices_found += 1;
     }
+
 
     // Lifecycle: scan complete — transition to "ready" regardless of result.
     // Error slot: set when no device found, clear when at least one is active.
@@ -690,7 +656,7 @@ pub fn is_mapped(udev_device: &tokio_udev::Device, registry: &Arc<ConfigRegistry
     }
     if let Some(name) = udev_device.property_value("NAME") {
         let name = name.to_string_lossy().replace("\"", "").replace("/", "");
-        return registry.device_has_configs(&name);
+        return registry.any_device_matches(&name);
     }
     false
 }

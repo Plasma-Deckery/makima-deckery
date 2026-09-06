@@ -150,46 +150,10 @@ const KNOWN_DEVICE_NAMES: &[&str] = &[
 ];
 
 /// Returns `true` if `name` matches one of the known Steam Deck device names.
-///
-/// Used by the consuming binary to decide whether to use the full Steam Deck
-/// controller path (hidraw, Lizard Mode, haptics) or the generic evdev-only
-/// path for a matched device.
-pub fn is_known_device_name(name: &str) -> bool {
+/// Internal to `SteamDeckController::find()` — which device a config drives is
+/// decided by its `[device]` section, not by a list compiled into this crate.
+fn is_known_device_name(name: &str) -> bool {
     KNOWN_DEVICE_NAMES.iter().any(|&known| name.contains(known))
-}
-
-/// Canonical config-file name for all hid-steam devices (Steam Deck, Steam Controller).
-///
-/// Config files for these devices should use this name as their filename prefix,
-/// independent of the kernel-reported evdev name. This decouples config naming
-/// from kernel-version-dependent device names ("Steam Deck" on one kernel,
-/// "Valve Software Steam Controller" on another).
-pub const CANONICAL_STEAM_DECK_CONFIG_NAME: &str = "Steam Deck";
-
-/// Returns the canonical config-file name for a hid-steam device, or `None`
-/// if `evdev_name` is not a known hid-steam device.
-///
-/// Use this to resolve which config file applies to a device regardless of the
-/// name the current kernel version reports. The canonical name is stable:
-/// user config files should be named after it, not after the raw evdev name.
-///
-/// # Examples
-/// ```
-/// assert_eq!(
-///     deckery_controller::canonical_device_name("Valve Software Steam Controller"),
-///     Some("Steam Deck"),
-/// );
-/// assert_eq!(
-///     deckery_controller::canonical_device_name("Some Random Gamepad"),
-///     None,
-/// );
-/// ```
-pub fn canonical_device_name(evdev_name: &str) -> Option<&'static str> {
-    if is_known_device_name(evdev_name) {
-        Some(CANONICAL_STEAM_DECK_CONFIG_NAME)
-    } else {
-        None
-    }
 }
 
 // ── Public event type ────────────────────────────────────────────────────────

@@ -44,6 +44,7 @@ distrobox enter deckery -- cargo test
 - **Event-driven window focus** — KWin D-Bus script replaces `kdotool` subprocess spawning; no polling, no latency
 - **Per-app configs with inheritance** — app overrides only declare what differs; base config is merged at runtime
 - **Binding attributes** — `label` and `no_pause` per binding
+- **Hints** — display-only labels for shortcuts that already fall out of the base config (R5 emits Ctrl, so R5+Up *is* Ctrl+Up) but had no entry anywhere and were therefore invisible in the HUD. A `[hints]` line attaches a name without creating a binding or touching the event path → [docs/hints.md](docs/hints.md)
 - **Gaming Mode** — Steam games are auto-detected on window focus and activate Gaming Mode, disabling all remapping so Deckery and in-game input don't collide
 - **Haptic feedback** — configurable haptic pulses on the Steam Deck's trackpad actuators, triggered on button events, trackpad touch/click, and Gaming Mode transitions
 - **State export** → `/tmp/makima-state.json` — all state needed for a real-time button preview HUD: active bindings, modifier context, currently held buttons, last executed action, and analog sensor values (sticks, trackpads, IMU)
@@ -51,7 +52,7 @@ distrobox enter deckery -- cargo test
 - **Lizard Mode suppression** — periodic hidraw heartbeat keeps the `hid-steam` kernel driver's built-in mouse/scroll fallback disabled without Steam running; configurable via `SUPPRESS_LIZARD_MODE`
 - **Pause / Resume IPC** — runtime control via Unix socket at `/tmp/makima-control.sock`
 - **Steam Deck keycodes** — `BTN_GRIPL/R/L2/R2` for the back paddles via patched `evdev` crate
-- **Unit test suite** — 150 tests covering resolver, state export, analog helpers, config parsing, trackpad routing, and haptic report encoding
+- **Unit test suite** — 250 tests covering resolver, state export, analog helpers, config parsing, trackpad routing, and haptic report encoding
 
 → [Full documentation](https://plasma-deckery.github.io/deckery/projects/makima-deckery/)
 
@@ -75,10 +76,13 @@ BTN_THUMBL = { run = ["deckery-hud-toggle"], no_pause = true, label = "Toggle HU
 
 ### Application-aware configuration
 
-On window focus change, makima automatically loads the matching per-app config. App overrides only declare what differs from the base config — everything else is inherited.
+On window focus change, makima automatically loads the matching per-app config. App overrides only declare what differs from the base config — everything else is inherited. Filenames are free: a config declares what it is through its content — `[device]` makes it a base config, `[module]` gives it activation conditions.
 
 ```toml
-# Steam Deck::org.mozilla.firefox.toml
+# apps/firefox.toml
+[module]
+match_window_class = "org.mozilla.firefox"
+
 [remap]
 BTN_TL-BTN_DPAD_LEFT  = ["KEY_LEFTALT", "KEY_LEFT"]   # L1+← → Back
 BTN_TL-BTN_DPAD_RIGHT = ["KEY_LEFTALT", "KEY_RIGHT"]  # L1+→ → Forward

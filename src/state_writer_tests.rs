@@ -1,23 +1,18 @@
 use super::*;
-use crate::config_registry::ConfigEntry;
-use crate::config::{Config, Associations, Bindings, MappedModifiers,
-                    TrackpadConfig, GamingModeConfig};
+use crate::config_registry::ConfigSummary;
 
 fn lifecycle_ready() -> AppLifecycle { AppLifecycle::Ready }
 fn lifecycle_starting() -> AppLifecycle { AppLifecycle::Starting }
 fn no_errors() -> HashMap<String, ErrorEntry> { HashMap::new() }
-fn no_configs() -> Vec<ConfigEntry> { Vec::new() }
+fn no_configs() -> Vec<ConfigSummary> { Vec::new() }
 
-fn dummy_config(name: &str) -> Config {
-    Config {
-        name: name.to_string(),
-        associations: Associations::default(),
-        bindings: Bindings::default(),
-        override_bindings: None,
-        settings: Default::default(),
-        mapped_modifiers: MappedModifiers::default(),
-        trackpad: TrackpadConfig::default(),
-        gaming_mode_config: GamingModeConfig::default(),
+fn summary(name: &str, kind: &'static str, parent: Option<&str>, enabled: bool) -> ConfigSummary {
+    ConfigSummary {
+        name:    name.to_string(),
+        kind,
+        parent:  parent.map(str::to_string),
+        enabled,
+        errors:  vec![],
     }
 }
 
@@ -110,8 +105,8 @@ fn configs_always_present_in_json() {
 #[test]
 fn loaded_configs_appear_with_enabled_flag() {
     let configs = vec![
-        ConfigEntry { name: "Steam Deck".to_string(),          config: Some(dummy_config("Steam Deck")),          enabled: true,  errors: vec![] },
-        ConfigEntry { name: "Steam Deck::Firefox".to_string(), config: Some(dummy_config("Steam Deck::Firefox")), enabled: false, errors: vec![] },
+        summary("Steam Deck", "base", None, true),
+        summary("Firefox", "app", None, false),
     ];
     let json = build_json(&lifecycle_ready(), &no_errors(), &None, &configs);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -120,6 +115,25 @@ fn loaded_configs_appear_with_enabled_flag() {
     let deck = arr.iter().find(|e| e["name"] == "Steam Deck").unwrap();
     assert_eq!(deck["enabled"], true);
     assert_eq!(deck["status"], "ok");
-    let firefox = arr.iter().find(|e| e["name"] == "Steam Deck::Firefox").unwrap();
+    let firefox = arr.iter().find(|e| e["name"] == "Firefox").unwrap();
     assert_eq!(firefox["enabled"], false);
+}
+
+#[test]
+fn kind_and_parent_are_serialised() {
+    let configs = vec![
+        summary("Steam Deck",  "base",   None,               true),
+        summary("KDE Desktop", "module", Some("Steam Deck"), true),
+        summary("Firefox",     "app",    None,               true),
+    ];
+    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &configs);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let arr = v["configs"].as_array().unwrap();
+    let by = |n: &str| arr.iter().find(|e| e["name"] == n).unwrap().clone();
+    assert_eq!(by("Steam Deck")["kind"],  "base");
+    assert!(by("Steam Deck")["parent"].is_null());
+    assert_eq!(by("KDE Desktop")["kind"],   "module");
+    assert_eq!(by("KDE Desktop")["parent"], "Steam Deck");
+    assert_eq!(by("Firefox")["kind"], "app");
+    assert!(by("Firefox")["parent"].is_null());
 }

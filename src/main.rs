@@ -93,6 +93,12 @@ async fn main() {
         }
     };
     let registry = ConfigRegistry::load(&config_dir);
+    // Hints resolve against the merged config, so a dead or ambiguous one can
+    // only be detected here — not while parsing the file it was written in.
+    // Reported, never fatal: a hint is display-only.
+    for warning in registry.hint_warnings() {
+        eprintln!("deckery: {warning}");
+    }
     eprintln!("deckery: config loaded, +{}ms since startup", startup_ms());
     let state_tx = state_writer::spawn_state_writer();
     // Publish initial config list so the tray sees all configs on startup,

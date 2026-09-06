@@ -23,7 +23,6 @@ fn make_config(
     let all_mods = custom_modifiers.clone();
     Config {
         name: "test".to_string(),
-        associations: Default::default(),
         bindings: Bindings {
             remap: remap_map,
             commands: cmd_map,
@@ -32,6 +31,7 @@ fn make_config(
             while_gaming: HashSet::new(),
             labels: HashMap::new(),
             silent: HashSet::new(),
+            ..Default::default()
         },
         override_bindings: None,
         settings: HashMap::new(),
@@ -42,6 +42,10 @@ fn make_config(
         },
         trackpad: Default::default(),
         gaming_mode_config: Default::default(),
+        device: None,
+        module: Default::default(),
+        module_includes: Vec::new(),
+        aliases: Default::default(),
     }
 }
 
@@ -109,6 +113,7 @@ fn make_config_with_override(
         while_gaming: HashSet::new(),
         labels: HashMap::new(),
         silent: HashSet::new(),
+        ..Default::default()
     });
     base
 }
@@ -557,7 +562,6 @@ fn override_remap_hides_base_command() {
             .insert(combo.clone(), vec!["previous-desktop".to_string()]);
         Config {
             name: "Steam Deck".to_string(),
-            associations: Default::default(),
             bindings: crate::config::Bindings {
                 commands,
                 ..Default::default()
@@ -571,6 +575,10 @@ fn override_remap_hides_base_command() {
             },
             trackpad: Default::default(),
             gaming_mode_config: Default::default(),
+        device: None,
+        module: Default::default(),
+        module_includes: Vec::new(),
+        aliases: Default::default(),
         }
     };
 
@@ -581,7 +589,6 @@ fn override_remap_hides_base_command() {
             .insert(combo.clone(), vec![Key::KEY_LEFTCTRL, Key::KEY_R]);
         Config {
             name: "firefox".to_string(),
-            associations: Default::default(),
             bindings: crate::config::Bindings {
                 remap,
                 ..Default::default()
@@ -591,6 +598,10 @@ fn override_remap_hides_base_command() {
             mapped_modifiers: Default::default(),
             trackpad: Default::default(),
             gaming_mode_config: Default::default(),
+        device: None,
+        module: Default::default(),
+        module_includes: Vec::new(),
+        aliases: Default::default(),
         }
     };
 
@@ -634,7 +645,6 @@ fn override_clears_base_label() {
 
     let base = Config {
         name: "Steam Deck".to_string(),
-        associations: Default::default(),
         bindings: base_bindings,
         override_bindings: None,
         settings: HashMap::new(),
@@ -643,6 +653,10 @@ fn override_clears_base_label() {
         },
         trackpad: Default::default(),
         gaming_mode_config: Default::default(),
+        device: None,
+        module: Default::default(),
+        module_includes: Vec::new(),
+        aliases: Default::default(),
     };
 
     // Override replaces with a remap, no label defined.
@@ -651,13 +665,16 @@ fn override_clears_base_label() {
         .insert(combo.clone(), vec![Key::KEY_LEFTCTRL, Key::KEY_R]);
     let mut app = Config {
         name: "firefox".to_string(),
-        associations: Default::default(),
         bindings: crate::config::Bindings { remap: app_remap, ..Default::default() },
         override_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: Default::default(),
         trackpad: Default::default(),
         gaming_mode_config: Default::default(),
+        device: None,
+        module: Default::default(),
+        module_includes: Vec::new(),
+        aliases: Default::default(),
     };
 
     app.merge_base(&base);
@@ -692,7 +709,6 @@ fn override_label_replaces_base_label() {
 
     let base = Config {
         name: "Steam Deck".to_string(),
-        associations: Default::default(),
         bindings: base_bindings,
         override_bindings: None,
         settings: HashMap::new(),
@@ -701,6 +717,10 @@ fn override_label_replaces_base_label() {
         },
         trackpad: Default::default(),
         gaming_mode_config: Default::default(),
+        device: None,
+        module: Default::default(),
+        module_includes: Vec::new(),
+        aliases: Default::default(),
     };
 
     // Override replaces with a remap AND defines its own label.
@@ -711,13 +731,16 @@ fn override_label_replaces_base_label() {
     app_bindings.labels.insert((btn_up, combo.clone()), "Reload".to_string());
     let mut app = Config {
         name: "firefox".to_string(),
-        associations: Default::default(),
         bindings: app_bindings,
         override_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: Default::default(),
         trackpad: Default::default(),
         gaming_mode_config: Default::default(),
+        device: None,
+        module: Default::default(),
+        module_includes: Vec::new(),
+        aliases: Default::default(),
     };
 
     app.merge_base(&base);
@@ -763,7 +786,6 @@ fn origin_override_vs_base() {
 
     let config = Config {
         name: "firefox".to_string(),
-        associations: Default::default(),
         bindings: Bindings {
             remap: merged_remap,
             commands: HashMap::new(),
@@ -772,6 +794,7 @@ fn origin_override_vs_base() {
             while_gaming: HashSet::new(),
             labels: HashMap::new(),
             silent: HashSet::new(),
+            ..Default::default()
         },
         override_bindings: Some(Bindings {
             remap: override_remap,
@@ -781,6 +804,7 @@ fn origin_override_vs_base() {
             while_gaming: HashSet::new(),
             labels: HashMap::new(),
             silent: HashSet::new(),
+            ..Default::default()
         }),
         settings: HashMap::new(),
         mapped_modifiers: MappedModifiers {
@@ -790,6 +814,10 @@ fn origin_override_vs_base() {
         },
         trackpad: Default::default(),
         gaming_mode_config: Default::default(),
+        device: None,
+        module: Default::default(),
+        module_includes: Vec::new(),
+        aliases: Default::default(),
     };
 
     let state = build_state(
@@ -982,4 +1010,209 @@ fn gaming_mode_trigger_null_when_disabled() {
     };
     let state = build_state(&config, &[], 0, false, false, &[], &None, &["test".to_string()], &gm_config);
     assert!(state["gaming_mode_trigger"].is_null(), "gaming_mode_trigger should be null when trigger is disabled");
+}
+
+// ── Hints in state.json ───────────────────────────────────────────────────
+//
+// The other half of docs/hints.md: resolution is covered in config_tests,
+// these cover what the HUD actually receives.
+
+/// Base layout mirroring the live config: R5 → Ctrl, DPad Up/Down → arrows,
+/// L1 a real modifier with one combo on it.
+fn config_with_ctrl_hints() -> Config {
+    let mut config = make_config(
+        vec![
+            (key(Key::BTN_GRIPR2),    vec![],                  vec![Key::KEY_LEFTCTRL]),
+            (key(Key::BTN_DPAD_UP),   vec![],                  vec![Key::KEY_UP]),
+            (key(Key::BTN_DPAD_DOWN), vec![],                  vec![Key::KEY_DOWN]),
+            (key(Key::BTN_NORTH),     vec![key(Key::BTN_TL)],  vec![Key::KEY_C]),
+        ],
+        vec![],
+        vec![key(Key::BTN_TL)],
+    );
+    config.bindings.hints = [
+        ("KEY_LEFTCTRL-KEY_UP".to_string(),   "Jump to Top".to_string()),
+        ("KEY_LEFTCTRL-KEY_DOWN".to_string(), "Jump to Bottom".to_string()),
+    ].into_iter().collect();
+    config.resolve_hints();
+    config
+}
+
+/// Holding R5 must surface the hint on DPad Up, even though R5 is not a
+/// modifier and therefore never appears in `modifiers`.
+#[test]
+fn held_hint_modifier_surfaces_hints_in_modifier_active() {
+    let config = config_with_ctrl_hints();
+    let state = build_state(
+        &config, &[], 0, false, false,
+        &[key(Key::BTN_GRIPR2)],   // held_keys: R5 down, nothing else
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    let entry = &state["modifier_active"]["BTN_DPAD_UP"];
+    assert_eq!(entry["label"], "Jump to Top");
+    assert_eq!(entry["kind"], "hint");
+    assert_eq!(entry["action"], serde_json::json!([]));
+}
+
+/// Invariant 5: hints must not leak into held_modifiers — that field means
+/// makima's own input modifiers and nothing else.
+#[test]
+fn held_hint_modifier_stays_out_of_held_modifiers() {
+    let config = config_with_ctrl_hints();
+    let state = build_state(
+        &config, &[], 0, false, false,
+        &[key(Key::BTN_GRIPR2)],
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert_eq!(state["context"]["held_modifiers"], serde_json::json!([]));
+}
+
+/// Matching is exact. Adding a real modifier on top of the hint modifier must
+/// hide the hint — L1 opens an actual layer, so R5-only hints no longer apply.
+#[test]
+fn hint_disappears_when_a_real_modifier_is_also_held() {
+    let config = config_with_ctrl_hints();
+    let state = build_state(
+        &config, &[key(Key::BTN_TL)], 0, false, false,
+        &[key(Key::BTN_GRIPR2), key(Key::BTN_TL)],
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert!(state["modifier_active"].get("BTN_DPAD_UP").is_none(),
+        "R5-only hint survived L1 being held: {}", state["modifier_active"]);
+}
+
+/// Before the button is pressed, the hint modifier is advertised in
+/// available_modifiers so the HUD can signal that something is there.
+#[test]
+fn hint_modifier_is_advertised_as_virtual_when_not_held() {
+    let config = config_with_ctrl_hints();
+    let state = build_state(
+        &config, &[], 0, false, false, &[],
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    let avail = &state["context"]["available_modifiers"];
+    assert_eq!(avail["BTN_GRIPR2"]["virtual"], true);
+    // A real modifier is still listed, and is not marked virtual.
+    assert!(avail["BTN_TL"].get("virtual").is_none());
+}
+
+/// `has_app_combos` means the same thing for a virtual modifier as for a real
+/// one — "something behind this button is app-specific" — so it follows where
+/// the hints were written instead of being assumed.
+#[test]
+fn virtual_modifier_reports_whether_its_hints_are_app_specific() {
+    let avail_of = |config: &Config| {
+        build_state(
+            config, &[], 0, false, false, &[],
+            &None, &["test".to_string()], &GamingModeConfig::default(),
+        )["context"]["available_modifiers"]["BTN_GRIPR2"]["has_app_combos"].clone()
+    };
+
+    assert_eq!(avail_of(&config_with_ctrl_hints()), false,
+        "hints written in the base config are not app-specific");
+
+    let mut app = config_with_ctrl_hints();
+    app.override_bindings = Some(Bindings {
+        hints: app.bindings.hints.clone(),
+        ..Default::default()
+    });
+    app.resolve_hints();
+
+    assert_eq!(avail_of(&app), true);
+}
+
+/// Once held, the hint modifier is no longer "available" — it is in use.
+#[test]
+fn hint_modifier_leaves_available_modifiers_once_held() {
+    let config = config_with_ctrl_hints();
+    let state = build_state(
+        &config, &[], 0, false, false,
+        &[key(Key::BTN_GRIPR2)],
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert!(state["context"]["available_modifiers"].get("BTN_GRIPR2").is_none());
+}
+
+// ── Modifier-less hints ───────────────────────────────────────────────────
+
+/// `from_override` mirrors the merge: the hint is in the merged map either way,
+/// and `override_bindings.hints` is the only record that it came from the app.
+fn config_with_plain_hint(from_override: bool) -> Config {
+    let mut config = make_config(
+        vec![(key(Key::BTN_SOUTH), vec![], vec![Key::KEY_ENTER])],
+        vec![],
+        vec![],
+    );
+    config.name = "Claude Desktop".to_string();
+    let hints: HashMap<String, String> = [
+        ("KEY_ENTER".to_string(), "Enter (Send Message)".to_string()),
+    ].into_iter().collect();
+    config.bindings.hints = hints.clone();
+    if from_override {
+        config.override_bindings = Some(Bindings { hints, ..Default::default() });
+    }
+    config.resolve_hints();
+    config
+}
+
+/// A hint with no modifier has nothing to wait for, so it belongs in the base
+/// `bindings` map. The action is kept — the label sits on top of it.
+#[test]
+fn modifier_less_hint_relabels_the_base_binding() {
+    let config = config_with_plain_hint(true);
+    let state = build_state(
+        &config, &[], 0, false, false, &[],
+        &None, &["Steam Deck".to_string()], &GamingModeConfig::default(),
+    );
+
+    let entry = &state["bindings"]["BTN_SOUTH"];
+    assert_eq!(entry["label"], "Enter (Send Message)");
+    assert_eq!(entry["kind"], "hint");
+    assert_eq!(entry["action"], serde_json::json!(["KEY_ENTER"]));
+    // The hint line lives in the app config, so origin flips and the HUD shows
+    // it as app-specific.
+    assert_eq!(entry["origin"], "Claude Desktop");
+}
+
+/// The other direction, and the reason `hints_from_override` exists: a hint
+/// written in the base config must keep the base origin while an app config is
+/// active, or every base hint would render as an app override everywhere.
+#[test]
+fn base_hint_keeps_the_base_origin_under_an_app_config() {
+    let config = config_with_plain_hint(false);
+    let state = build_state(
+        &config, &[], 0, false, false, &[],
+        &None, &["Steam Deck".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert_eq!(state["bindings"]["BTN_SOUTH"]["origin"], "Steam Deck");
+}
+
+/// It must not leak into modifier_active — there is no combo to activate.
+#[test]
+fn modifier_less_hint_stays_out_of_modifier_active() {
+    let config = config_with_plain_hint(true);
+    let state = build_state(
+        &config, &[], 0, false, false, &[key(Key::BTN_SOUTH)],
+        &None, &["Steam Deck".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert_eq!(state["modifier_active"], serde_json::json!({}));
+}
+
+/// …and it must not turn its own trigger into an advertised modifier.
+#[test]
+fn modifier_less_hint_adds_no_available_modifier() {
+    let config = config_with_plain_hint(true);
+    let state = build_state(
+        &config, &[], 0, false, false, &[],
+        &None, &["Steam Deck".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert_eq!(state["context"]["available_modifiers"], serde_json::json!({}));
 }

@@ -1,5 +1,4 @@
 use deckery_controller::{HapticChain, HapticPulse};
-use crate::udev_monitor::Client;
 use evdev::Key;
 use serde;
 use std::{collections::{HashMap, HashSet}, str::FromStr};
@@ -228,9 +227,35 @@ impl FromStr for Relative {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Default, Clone)]
-pub struct Associations {
-    pub client: Client,
+/// Which hardware class a base config targets.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeviceClass {
+    HidSteam,
+    Evdev,
+}
+
+/// Declared hardware target — present only in base configs (those with a `[device]` table).
+#[derive(Debug, Clone)]
+pub struct DeviceDeclaration {
+    pub class: DeviceClass,
+    /// Substring-match list: first evdev device whose name contains any of these strings is used.
+    pub names: Vec<String>,
+}
+
+impl DeviceDeclaration {
+    pub fn matches_evdev_name(&self, evdev_name: &str) -> bool {
+        self.names.iter().any(|n| evdev_name.contains(n.as_str()))
+    }
+}
+
+/// Module-level activation conditions. Meaningful for files without a `[device]` section.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModuleMetadata {
+    /// Only active when the named compositor is running.
+    pub requires_compositor: Option<String>,
+    /// Applied when the focused window's class matches this string exactly.
+    pub match_window_class: Option<String>,
+    /// Applied only while this layout is active. Defaults to layout 0.
     pub layout: u16,
 }
 
@@ -251,6 +276,31 @@ pub struct Bindings {
     /// Bindings whose outputs are suppressed from active_outputs in the HUD.
     /// Set via `silent = true` in an inline-table binding.
     pub silent: HashSet<(Event, Vec<Event>)>,
+    /// Raw `[hints]` entries in source form: TOML key → label.
+    ///
+    /// Kept unresolved on purpose. A hint written in output space
+    /// (`KEY_LEFTCTRL-KEY_UP`) has to be answered by "which button emits this
+    /// key", and that answer depends on the *merged* config — a module or an
+    /// app override can move `KEY_LEFTCTRL` onto a different button. Resolving
+    /// per file would bake in the base config's answer. See `resolve_hints`.
+    pub hints: HashMap<String, String>,
+    /// Hints resolved to concrete (trigger, combo) button pairs.
+    ///
+    /// Rebuilt by `resolve_hints` after every merge; never written by the parser.
+    /// Display-only — nothing in here ever reaches `resolve_binding`, and no
+    /// entry ever lands in `MappedModifiers`.
+    pub hints_resolved: HashMap<(Event, Vec<Event>), Hint>,
+}
+
+/// A resolved hint: what to show, and where the line was written.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Hint {
+    pub label: String,
+    /// True when the source line lives in the app override rather than the base
+    /// config. The merge flattens both into one map, so this is the only record
+    /// left — and without it a base-config hint would report the active app as
+    /// its origin and render as an app-specific override everywhere.
+    pub from_override: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -336,14 +386,14 @@ impl Default for GamingModeConfig {
 }
 
 impl GamingModeConfig {
-    fn from_raw(raw: Option<RawGamingModeConfig>) -> Self {
+    fn from_raw(raw: Option<RawGamingModeConfig>, aliases: &HashMap<String, String>) -> Self {
         let Some(raw) = raw else { return Self::default(); };
 
         // Parse trigger: absent → default, key="disabled" → None, invalid → None + warning.
         let trigger: Option<DoubleclickTrigger> = match raw.trigger {
             None => Self::default().trigger,
             Some(ref t) if t.key == "disabled" => None,
-            Some(ref t) => match Key::from_str(&t.key) {
+            Some(ref t) => match Key::from_str(resolve_alias(&t.key, aliases)) {
                 Ok(key) => Some(DoubleclickTrigger { key, ms: t.ms.unwrap_or(400) }),
                 Err(_) => {
                     eprintln!(
@@ -365,6 +415,35 @@ impl GamingModeConfig {
     }
 }
 
+// ── Raw TOML types for [device] / [module] / [modules] ───────────────────────
+
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct RawDeviceDeclaration {
+    pub class: String,
+    pub names: Vec<String>,
+    /// Readable names for this hardware's buttons, e.g. `L1 = "BTN_TL"`.
+    /// Declared on the base config and applied to every file in the config
+    /// directory: button labels belong to the device, not to the program.
+    #[serde(default)]
+    pub aliases: HashMap<String, String>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone, Default)]
+pub struct RawModuleMetadata {
+    pub requires_compositor: Option<String>,
+    pub match_window_class: Option<String>,
+    #[serde(default)]
+    pub layout: u16,
+}
+
+#[derive(serde::Deserialize, Debug, Clone, Default)]
+pub struct RawModuleIncludes {
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+// ── RawConfig ─────────────────────────────────────────────────────────────────
+
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct RawConfig {
     #[serde(default)]
@@ -373,44 +452,28 @@ pub struct RawConfig {
     pub commands: HashMap<String, CommandValue>,
     #[serde(default)]
     pub movements: HashMap<String, String>,
+    /// Display-only labels for button combinations that are not bindings.
+    /// Same `-` separator as `[remap]`, but every segment is a `KEY_*` name —
+    /// see `resolve_hints`.
+    #[serde(default)]
+    pub hints: HashMap<String, String>,
     #[serde(default)]
     pub settings: HashMap<String, String>,
     #[serde(default)]
     pub trackpad: RawTrackpadConfig,
     #[serde(default)]
     pub gaming_mode: Option<RawGamingModeConfig>,
-}
-
-impl RawConfig {
-    fn new_from_file(file: &str) -> Self {
-        println!(
-            "Parsing config file:\n{:?}\n",
-            file.rsplit_once("/").unwrap().1
-        );
-        let file_content: String = std::fs::read_to_string(file).unwrap();
-        let raw_config: RawConfig =
-            toml::from_str(&file_content).expect("Couldn't parse config file.");
-        let remap = raw_config.remap;
-        let commands = raw_config.commands;
-        let movements = raw_config.movements;
-        let settings = raw_config.settings;
-        let trackpad = raw_config.trackpad;
-        let gaming_mode = raw_config.gaming_mode;
-        Self {
-            remap,
-            commands,
-            movements,
-            settings,
-            trackpad,
-            gaming_mode,
-        }
-    }
+    #[serde(default)]
+    pub device: Option<RawDeviceDeclaration>,
+    #[serde(default)]
+    pub module: RawModuleMetadata,
+    #[serde(default)]
+    pub modules: RawModuleIncludes,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub name: String,
-    pub associations: Associations,
     pub bindings: Bindings,
     /// Snapshot of bindings before base was merged in.
     /// None for the base config itself (everything is its own).
@@ -425,20 +488,47 @@ pub struct Config {
     /// Gaming Mode trigger configuration parsed from `[gaming_mode]`.
     /// Only meaningful on the base config; app-specific configs inherit from base.
     pub gaming_mode_config: GamingModeConfig,
+    /// Hardware target declaration — present only when `[device]` is in the TOML.
+    /// Identifies this as a base config and specifies which physical device to open.
+    pub device: Option<DeviceDeclaration>,
+    /// Module-level metadata — activation conditions for non-base configs.
+    pub module: ModuleMetadata,
+    /// Names of plain modules to merge in, from `[modules] include = [...]`.
+    pub module_includes: Vec<String>,
+    /// Button aliases in effect while this file was parsed, kept so settings
+    /// read later at runtime (`LSTICK_ACTIVATION_MODIFIERS`) resolve the same way.
+    pub aliases: HashMap<String, String>,
 }
 
 impl Config {
     /// Parse a config file, returning `Err(message)` instead of panicking on
-    /// read or TOML errors.  Associations are left at default — the caller
-    /// (ConfigRegistry::load) sets them from the filename.
-    pub fn try_from_file(file: &str, file_name: String) -> Result<Self, String> {
+    /// read or TOML errors.
+    pub fn try_from_file(
+        file: &str,
+        file_name: String,
+        aliases: &HashMap<String, String>,
+    ) -> Result<Self, String> {
         println!("Parsing config file:\n{:?}\n",
             file.rsplit_once('/').map(|(_, f)| f).unwrap_or(file));
         let content = std::fs::read_to_string(file)
             .map_err(|e| format!("Cannot read {:?}: {}", file, e))?;
         let raw: RawConfig = toml::from_str(&content)
             .map_err(|e| format!("TOML error in {:?}: {}", file_name, e))?;
-        Ok(Self::from_raw(raw, file_name))
+        Ok(Self::from_raw(raw, file_name, aliases))
+    }
+
+    /// Read only the `[device] aliases` table from a config file. Used by the
+    /// registry to collect the alias map before any file is fully parsed —
+    /// bindings cannot be resolved until the device's button names are known.
+    pub fn read_aliases(file: &str) -> HashMap<String, String> {
+        #[derive(serde::Deserialize)]
+        struct Probe { device: Option<RawDeviceDeclaration> }
+
+        std::fs::read_to_string(file).ok()
+            .and_then(|c| toml::from_str::<Probe>(&c).ok())
+            .and_then(|p| p.device)
+            .map(|d| d.aliases)
+            .unwrap_or_default()
     }
 
     /// Merge `base` into `self` and return the result as a new Config.
@@ -452,11 +542,17 @@ impl Config {
     }
 
     /// Build a Config from an already-parsed RawConfig.
-    /// Associations are left at default — set them separately after construction.
-    fn from_raw(raw_config: RawConfig, file_name: String) -> Self {
+    fn from_raw(
+        raw_config: RawConfig,
+        file_name: String,
+        aliases: &HashMap<String, String>,
+    ) -> Self {
         let raw_trackpad    = raw_config.trackpad.clone();
         let raw_gaming_mode = raw_config.gaming_mode.clone();
-        let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config);
+        let raw_device      = raw_config.device.clone();
+        let raw_module      = raw_config.module.clone();
+        let raw_modules     = raw_config.modules.clone();
+        let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config, aliases);
         let trackpad = TrackpadConfig {
             left: parse_trackpad_side(raw_trackpad.left.as_ref()),
             right: parse_trackpad_side(raw_trackpad.right.as_ref()),
@@ -468,34 +564,44 @@ impl Config {
             gesture_handler_config: raw_trackpad.gestures
                 .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
         };
-        let gaming_mode_config = GamingModeConfig::from_raw(raw_gaming_mode);
+        let gaming_mode_config = GamingModeConfig::from_raw(raw_gaming_mode, aliases);
+        let device = raw_device.map(|d| DeviceDeclaration {
+            class: if d.class == "hid-steam" { DeviceClass::HidSteam } else { DeviceClass::Evdev },
+            names: d.names,
+        });
+        let module = ModuleMetadata {
+            requires_compositor: raw_module.requires_compositor,
+            match_window_class: raw_module.match_window_class,
+            layout: raw_module.layout,
+        };
         Self {
             name: file_name,
-            associations: Default::default(),
             bindings,
             override_bindings: None,
             settings,
             mapped_modifiers,
             trackpad,
             gaming_mode_config,
+            device,
+            module,
+            module_includes: raw_modules.include,
+            aliases: aliases.clone(),
         }
-    }
-
-    pub fn new_from_file(file: &str, file_name: String) -> Self {
-        let raw_config = RawConfig::new_from_file(file);
-        Self::from_raw(raw_config, file_name)
     }
 
     pub fn new_empty(file_name: String) -> Self {
         Self {
             name: file_name,
-            associations: Default::default(),
             bindings: Default::default(),
             override_bindings: None,
             settings: Default::default(),
             mapped_modifiers: Default::default(),
             trackpad: Default::default(),
             gaming_mode_config: Default::default(),
+            device: None,
+            module: Default::default(),
+            module_includes: Vec::new(),
+            aliases: Default::default(),
         }
     }
 
@@ -562,6 +668,11 @@ impl Config {
         for entry in &self.bindings.silent {
             merged.silent.insert(entry.clone());
         }
+        // Hints merge like labels: same key → override wins. They stay in source
+        // form; resolve_hints turns them into buttons once the merge is complete.
+        for (key, label) in &self.bindings.hints {
+            merged.hints.insert(key.clone(), label.clone());
+        }
 
         self.bindings = merged;
 
@@ -588,31 +699,230 @@ impl Config {
         self.mapped_modifiers.all.sort();
         self.mapped_modifiers.all.dedup();
     }
+
+    /// Turn the raw `[hints]` entries into concrete (trigger, combo) button
+    /// pairs, filling `bindings.hints_resolved`. Returns one message per
+    /// problem found, for the caller to surface.
+    ///
+    /// Must run on the *merged* config: an output-space segment asks "which
+    /// button emits this key", and a module or app override can change that
+    /// answer. Idempotent — clears and rebuilds.
+    ///
+    /// Every segment is a `KEY_*` name, resolved through the reverse index to
+    /// the buttons that emit it. There is no input-space form: a hint names the
+    /// shortcut the application listens for, and the button follows from it.
+    ///
+    /// A key with no separator resolves to an empty combo. That is the
+    /// modifier-less form: it relabels a plain button instead of describing a
+    /// combination. Both forms share `hints_resolved`; `state_export` routes
+    /// the empty-combo ones into `bindings` and the rest into `modifier_active`.
+    ///
+    /// Known limit: a combination is only hintable when every part of it sends a
+    /// key. `L1-…` cannot be hinted — no application would recognise it anyway;
+    /// that case wants a real binding.
+    pub fn resolve_hints(&mut self) -> Vec<String> {
+        self.bindings.hints_resolved.clear();
+        let mut warnings: Vec<String> = Vec::new();
+        if self.bindings.hints.is_empty() {
+            return warnings;
+        }
+
+        // The merge flattens base and override hints into one map, so the only
+        // record of where a line came from is the override's own raw section.
+        let override_hints = self.override_bindings.as_ref().map(|ov| &ov.hints);
+
+        // Reverse index over base remaps only (combo == []): output key → the
+        // buttons that emit it. Combo outputs are excluded on purpose — a hint
+        // must land on a button you can press *while* the modifiers are held.
+        let mut emitters: HashMap<Key, Vec<Event>> = HashMap::new();
+        for (trigger, modifier_map) in &self.bindings.remap {
+            let Some(out_keys) = modifier_map.get(&vec![]) else { continue };
+            for key in out_keys {
+                emitters.entry(*key).or_default().push(*trigger);
+            }
+        }
+        for buttons in emitters.values_mut() {
+            buttons.sort();
+            buttons.dedup();
+        }
+
+        // Hints live in output space only. A hint describes a keyboard shortcut
+        // the focused application understands, so every segment names a key —
+        // the button is what the lookup *returns*, never what it is given.
+        // Naming a button directly (`A`, `BTN_SOUTH`) would skip the lookup and
+        // assert a mapping instead of describing one, for a combination no app
+        // can ever see. Aliases are button names, so they do not apply here.
+        let resolve_segment = |seg: &str| -> Result<Vec<Event>, String> {
+            if !seg.starts_with("KEY_") {
+                return Err(format!(
+                    "{seg:?} is not a key name — hints are written in output space (KEY_*)"));
+            }
+            let Some(Event::Key(k)) = event_from_name(seg) else {
+                return Err(format!("{seg:?} is not a known key"));
+            };
+            match emitters.get(&k) {
+                Some(buttons) => Ok(buttons.clone()),
+                None => Err(format!("no button emits {seg:?}")),
+            }
+        };
+
+        // Which raw line claimed each resolved button, so a second line landing
+        // on the same one is reported instead of silently replacing it.
+        let mut claimed_by: HashMap<(Event, Vec<Event>), &String> = HashMap::new();
+
+        // Sorted, not HashMap order: two lines can resolve to the same button
+        // (`KEY_ENTER` and `A` both reach BTN_SOUTH), and which one wins must
+        // not change between runs.
+        let mut raw_keys: Vec<&String> = self.bindings.hints.keys().collect();
+        raw_keys.sort();
+
+        for raw in raw_keys {
+            let label = &self.bindings.hints[raw];
+            // No separator means no modifier side: the hint relabels a plain
+            // button. That is a deliberate second use of the same syntax —
+            // "label without a binding" — not a malformed combo.
+            let (mods_str, trigger_str) = raw.rsplit_once('-').unwrap_or(("", raw.as_str()));
+            let from_override = override_hints.map_or(false, |h| h.contains_key(raw));
+
+            // Modifier side: build every combination the segments can stand for.
+            // Several buttons emitting the same key multiply the combinations.
+            let mut combos: Vec<Vec<Event>> = vec![Vec::new()];
+            let mut dead_segment = false;
+            for seg in mods_str.split('-').filter(|s| !s.is_empty()) {
+                let candidates = match resolve_segment(seg) {
+                    Ok(c) => c,
+                    Err(why) => {
+                        warnings.push(format!(
+                            "hint {raw:?}: {why} — hint can never be shown"));
+                        dead_segment = true;
+                        break;
+                    }
+                };
+                if candidates.len() > 1 {
+                    warnings.push(format!(
+                        "hint {:?}: {:?} maps to {} buttons — shown on all of them",
+                        raw, seg, candidates.len()));
+                }
+                combos = combos.iter().flat_map(|prefix| {
+                    candidates.iter().map(move |cand| {
+                        let mut next = prefix.clone();
+                        next.push(*cand);
+                        next
+                    })
+                }).collect();
+            }
+            if dead_segment {
+                continue;
+            }
+
+            let triggers = match resolve_segment(trigger_str) {
+                Ok(t) => t,
+                Err(why) => {
+                    warnings.push(format!("hint {raw:?}: {why} — hint can never be shown"));
+                    continue;
+                }
+            };
+            if triggers.len() > 1 {
+                warnings.push(format!(
+                    "hint {:?}: {:?} maps to {} buttons — shown on all of them",
+                    raw, trigger_str, triggers.len()));
+            }
+
+            for mut combo in combos {
+                combo.sort();
+                combo.dedup();
+                for trigger in &triggers {
+                    // A real binding always wins over a combo hint — a typo in
+                    // [hints] must never mask something that actually fires.
+                    // Spelled out per map because the three value types differ.
+                    //
+                    // A modifier-less hint is the exception: it exists *to* sit
+                    // on top of a base binding, so the base remap it resolved
+                    // through cannot disqualify it. Only a label written out on
+                    // the binding itself outranks it.
+                    let taken = if combo.is_empty() {
+                        self.bindings.labels.contains_key(&(*trigger, Vec::new()))
+                    } else {
+                        self.bindings.remap.get(trigger).map_or(false, |m| m.contains_key(&combo))
+                     || self.bindings.commands.get(trigger).map_or(false, |m| m.contains_key(&combo))
+                     || self.bindings.movements.get(trigger).map_or(false, |m| m.contains_key(&combo))
+                    };
+                    if taken {
+                        continue;
+                    }
+                    // Two lines can reach the same button, because a button can
+                    // emit several keys (`Y = ["KEY_SPACE", "KEY_X"]`, both
+                    // hinted). Only one label fits, so the loser is dropped —
+                    // but loudly: a silently vanished hint looks like a bug in
+                    // the resolver, not like a duplicate in the config.
+                    let resolved_key = (*trigger, combo.clone());
+                    match claimed_by.get(&resolved_key) {
+                        Some(owner) if *owner != raw => {
+                            warnings.push(format!(
+                                "hint {:?}: resolves to the same button as {:?} — only {:?} is shown",
+                                raw, owner, owner));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    claimed_by.insert(resolved_key.clone(), raw);
+                    self.bindings.hints_resolved.insert(
+                        resolved_key,
+                        Hint { label: label.clone(), from_override },
+                    );
+                }
+            }
+        }
+        warnings
+    }
 }
 
 /// Parse a single event name like "BTN_MODE" or "LSTICK_UP" into an Event.
 /// Returns None and logs a warning if the name is not recognized.
 pub fn parse_event_name(name: &str) -> Option<Event> {
+    let event = event_from_name(name);
+    if event.is_none() {
+        eprintln!("[makima] WARNING: unknown binding name {:?} — skipping (typo in config?)", name);
+    }
+    event
+}
+
+/// Resolve a name to its event without logging. The alias table is checked with
+/// this so a broken entry can be reported once by its alias name, instead of
+/// once per use site under the substituted value.
+pub fn event_from_name(name: &str) -> Option<Event> {
     if let Ok(axis) = Axis::from_str(name) {
         return Some(Event::Axis(axis));
     }
-    if let Ok(key) = evdev::Key::from_str(name) {
-        return Some(Event::Key(key));
-    }
-    eprintln!("[makima] WARNING: unknown binding name {:?} — skipping (typo in config?)", name);
-    None
+    evdev::Key::from_str(name).ok().map(Event::Key)
 }
 
-/// Parse a binding input string (e.g. "BTN_TL-BTN_SOUTH" or "BTN_EAST") into
-/// the trigger event and its modifier list. Registers any new custom modifiers.
+/// Substitute a device alias (`L1`) for the name it stands for (`BTN_TL`).
+/// Unknown names pass through so kernel names keep working alongside aliases.
+fn resolve_alias<'a>(name: &'a str, aliases: &'a HashMap<String, String>) -> &'a str {
+    aliases.get(name).map(String::as_str).unwrap_or(name)
+}
+
+/// Parse a binding input string (e.g. "BTN_TL-BTN_SOUTH", "L1-A") into the
+/// trigger event and its modifier list. Registers any new custom modifiers.
 /// Returns (None, _) if the trigger event name is unrecognized.
-fn parse_binding_input(input: &str, mapped_modifiers: &mut MappedModifiers) -> (Option<Event>, Vec<Event>) {
+fn parse_binding_input(
+    input: &str,
+    mapped_modifiers: &mut MappedModifiers,
+    aliases: &HashMap<String, String>,
+) -> (Option<Event>, Vec<Event>) {
     if let Some((mods_str, event_str)) = input.rsplit_once('-') {
         let str_modifiers: Vec<&str> = mods_str.split('-').collect();
-        let mut modifiers: Vec<Event> = str_modifiers.iter()
-            .filter(|&&m| !m.is_empty())
-            .filter_map(|m| parse_event_name(m))
-            .collect();
+        let mut modifiers: Vec<Event> = Vec::new();
+        for m in str_modifiers.iter().filter(|&&m| !m.is_empty()) {
+            match parse_event_name(resolve_alias(m, aliases)) {
+                Some(event) => modifiers.push(event),
+                // Dropping just the modifier would leave the binding firing
+                // unmodified, so `L1-A` would quietly hijack a bare A press.
+                // A combo whose modifier is unknown is no binding at all.
+                None => return (None, Vec::new()),
+            }
+        }
         modifiers.sort();
         modifiers.dedup();
         for modifier in &modifiers {
@@ -623,13 +933,16 @@ fn parse_binding_input(input: &str, mapped_modifiers: &mut MappedModifiers) -> (
         if str_modifiers.first().map(|s| s.is_empty()).unwrap_or(false) {
             modifiers.push(Event::Hold);
         }
-        (parse_event_name(event_str), modifiers)
+        (parse_event_name(resolve_alias(event_str, aliases)), modifiers)
     } else {
-        (parse_event_name(input), Vec::new())
+        (parse_event_name(resolve_alias(input, aliases)), Vec::new())
     }
 }
 
-fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>, MappedModifiers) {
+fn parse_raw_config(
+    raw_config: RawConfig,
+    aliases: &HashMap<String, String>,
+) -> (Bindings, HashMap<String, String>, MappedModifiers) {
     let remap: HashMap<String, RemapValue> = raw_config.remap;
     let commands: HashMap<String, CommandValue> = raw_config.commands;
     let movements: HashMap<String, String> = raw_config.movements;
@@ -649,11 +962,11 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
         custom: Vec::new(),
         all: Vec::new(),
     };
-    let custom_modifiers: Vec<Event> = parse_modifiers(&settings, "CUSTOM_MODIFIERS");
+    let custom_modifiers: Vec<Event> = parse_modifiers(&settings, "CUSTOM_MODIFIERS", aliases);
     let lstick_activation_modifiers: Vec<Event> =
-        parse_modifiers(&settings, "LSTICK_ACTIVATION_MODIFIERS");
+        parse_modifiers(&settings, "LSTICK_ACTIVATION_MODIFIERS", aliases);
     let rstick_activation_modifiers: Vec<Event> =
-        parse_modifiers(&settings, "RSTICK_ACTIVATION_MODIFIERS");
+        parse_modifiers(&settings, "RSTICK_ACTIVATION_MODIFIERS", aliases);
 
     mapped_modifiers.custom.extend(custom_modifiers);
     mapped_modifiers.custom.extend(lstick_activation_modifiers);
@@ -664,7 +977,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
             RemapValue::Simple(keys) => (keys, false, false, None, false),
             RemapValue::WithAttrs { keys, no_pause, while_gaming, label, silent } => (keys, no_pause, while_gaming, label, silent),
         };
-        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers) else { continue; };
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else { continue; };
         if np { bindings.no_pause.insert((evt, modifiers.clone())); }
         if wg { bindings.while_gaming.insert((evt, modifiers.clone())); }
         if let Some(l) = lbl { bindings.labels.insert((evt, modifiers.clone()), l); }
@@ -677,7 +990,7 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
             CommandValue::Simple(cmds) => (cmds, false, false, None, false),
             CommandValue::WithAttrs { run, no_pause, while_gaming, label, silent } => (run, no_pause, while_gaming, label, silent),
         };
-        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers) else { continue; };
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else { continue; };
         if np { bindings.no_pause.insert((evt, modifiers.clone())); }
         if wg { bindings.while_gaming.insert((evt, modifiers.clone())); }
         if let Some(l) = lbl { bindings.labels.insert((evt, modifiers.clone()), l); }
@@ -687,9 +1000,15 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
 
     for (input, output) in movements {
         let rel = Relative::from_str(output.as_str()).expect("Invalid movement in [movements].");
-        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers) else { continue; };
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else { continue; };
         bindings.movements.entry(evt).or_default().insert(modifiers, rel);
     }
+
+    // Hints are stored verbatim and deliberately do NOT go through
+    // parse_binding_input: that function registers every modifier it sees in
+    // mapped_modifiers.custom, which would turn a hinted button into a real
+    // layer key — the exact breakage hints exist to avoid (see docs/hints.md).
+    bindings.hints = raw_config.hints;
 
     mapped_modifiers.custom.sort();
     mapped_modifiers.custom.dedup();
@@ -703,9 +1022,19 @@ fn parse_raw_config(raw_config: RawConfig) -> (Bindings, HashMap<String, String>
     (bindings, settings, mapped_modifiers)
 }
 
-pub fn parse_modifiers(settings: &HashMap<String, String>, parameter: &str) -> Vec<Event> {
+pub fn parse_modifiers(
+    settings: &HashMap<String, String>,
+    parameter: &str,
+    aliases: &HashMap<String, String>,
+) -> Vec<Event> {
     match settings.get(parameter) {
-        Some(modifiers) => modifiers.split('-').filter_map(|m| parse_event_name(m)).collect(),
+        // Empty segments are how an intentionally empty list is written
+        // (`CUSTOM_MODIFIERS = ""`); parse_binding_input drops them too.
+        Some(modifiers) => modifiers
+            .split('-')
+            .filter(|m| !m.is_empty())
+            .filter_map(|m| parse_event_name(resolve_alias(m, aliases)))
+            .collect(),
         None => Vec::new(),
     }
 }

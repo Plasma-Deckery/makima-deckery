@@ -18,7 +18,7 @@ async fn launch_tasks_returns_modifiers() {
     let gaming_mode = Arc::new(Mutex::new(false));
     let (state_tx, _state_rx) = tokio::sync::mpsc::channel(8);
     let (ipc_tx, _) = tokio::sync::broadcast::channel(1);
-    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new_headless()));
+    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new()));
     let modifiers = launch_tasks(
         &registry,
         &mut tasks,
@@ -57,7 +57,7 @@ async fn no_config_files_sends_lifecycle_ready_and_no_device_error() {
 
     let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(8);
     let (ipc_tx, _) = tokio::sync::broadcast::channel(1);
-    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new_headless()));
+    let virt_dev = Arc::new(Mutex::new(VirtualDevices::new()));
     launch_tasks(
         &registry,
         &mut tasks,
@@ -100,9 +100,7 @@ fn make_registry_with_broken_base() -> std::sync::Arc<ConfigRegistry> {
 }
 
 fn make_registry_with_valid_base() -> std::sync::Arc<ConfigRegistry> {
-    use crate::config::Associations;
-    let mut c = Config::new_empty("Steam Deck".to_string());
-    c.associations = Associations::default();
+    let c = Config::new_empty("Steam Deck".to_string());
     ConfigRegistry::from_entries(vec![ConfigEntry {
         name:    "Steam Deck".to_string(),
         config:  Some(c),

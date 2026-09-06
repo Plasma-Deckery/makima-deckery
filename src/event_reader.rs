@@ -57,7 +57,9 @@ struct Settings {
 
 pub struct EventReader {
     registry: Arc<ConfigRegistry>,
-    device_name: String,
+    /// Name of the base config this reader was launched for — the registry key
+    /// used to resolve, not the kernel-reported device name.
+    base_name: String,
     /// Receiver for controller events from the reconnecting reader task.
     /// `ControllerEvent::Input` carries normal evdev events; `Reconnected`
     /// signals a transparent reconnect (EventReader must release held keys).
@@ -135,7 +137,7 @@ impl EventReader {
     pub fn new(
         base_config: Config,
         registry: Arc<ConfigRegistry>,
-        device_name: String,
+        base_name: String,
         virt_dev: Arc<Mutex<VirtualDevices>>,
         event_rx: mpsc::Receiver<ControllerEvent>,
         is_tablet: bool,
@@ -187,7 +189,7 @@ impl EventReader {
             .parse::<i32>()
             .expect("Invalid value for LSTICK_DEADZONE, please use an integer between 0 and 128.");
         let lstick_activation_modifiers: Vec<Event> =
-            parse_modifiers(&base_config.settings, "LSTICK_ACTIVATION_MODIFIERS");
+            parse_modifiers(&base_config.settings, "LSTICK_ACTIVATION_MODIFIERS", &base_config.aliases);
         let lstick = Stick {
             function: lstick_function,
             sensitivity: lstick_sensitivity,
@@ -210,7 +212,7 @@ impl EventReader {
             .parse::<i32>()
             .expect("Invalid value for RSTICK_DEADZONE, please use an integer between 0 and 128.");
         let rstick_activation_modifiers: Vec<Event> =
-            parse_modifiers(&base_config.settings, "RSTICK_ACTIVATION_MODIFIERS");
+            parse_modifiers(&base_config.settings, "RSTICK_ACTIVATION_MODIFIERS", &base_config.aliases);
         let rstick = Stick {
             function: rstick_function,
             sensitivity: rstick_sensitivity,
@@ -335,7 +337,7 @@ impl EventReader {
 
         Self {
             registry,
-            device_name,
+            base_name,
             event_rx: Mutex::new(event_rx),
             is_tablet,
             max_abs_wheel,
@@ -377,7 +379,7 @@ impl EventReader {
     }
 
     pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>, ipc_rx: broadcast::Receiver<String>, session: Option<TrackpadSession>) {
-        let name = self.device_name.clone();
+        let name = self.base_name.clone();
         let name = &name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
         let (state_tx, state_rx) = mpsc::channel(8);
@@ -1762,7 +1764,7 @@ impl EventReader {
             }
             // Polling fallback (sway, niri, x11): query on demand.
             _ => {
-                let known = self.registry.enabled_app_configs(&self.device_name);
+                let known = self.registry.window_class_modules();
                 get_active_window(&self.environment, &known).await
             }
         };
@@ -1775,12 +1777,12 @@ impl EventReader {
             let start = *active_layout;
             loop {
                 *active_layout = if *active_layout == 3 { 0 } else { *active_layout + 1 };
-                if self.registry.resolve(&self.device_name, &client, *active_layout).is_some() {
+                if self.registry.resolve(&self.base_name, &client, *active_layout).is_some() {
                     break;
                 }
                 if *active_layout == start {
                     // Full cycle completed with no valid config — give up and stay put.
-                    eprintln!("deckery: change_active_layout: no valid layout found for {:?}", self.device_name);
+                    eprintln!("deckery: change_active_layout: no valid layout found for {:?}", self.base_name);
                     break;
                 }
             }
@@ -1805,11 +1807,11 @@ impl EventReader {
                 }
                 // Polling fallback (sway, niri, x11): query on demand.
                 _ => {
-                    let known = self.registry.enabled_app_configs(&self.device_name);
+                    let known = self.registry.window_class_modules();
                     get_active_window(&self.environment, &known).await
                 }
             };
-            let resolved = self.registry.resolve(&self.device_name, &client, active_layout);
+            let resolved = self.registry.resolve(&self.base_name, &client, active_layout);
             match resolved {
                 Some(config) => { *self.current_config.lock().await = config; }
                 None => {
@@ -1888,15 +1890,11 @@ impl EventReader {
                 return;
             }
         };
-        let base_name = self.device_name.clone();
+        let base_name = self.base_name.clone();
         let config_stack = if config.name == base_name {
-            vec![base_name.clone()]
+            vec![base_name]
         } else {
-            let app_part = config.name
-                .strip_prefix(&format!("{}::", base_name))
-                .unwrap_or(&config.name)
-                .to_string();
-            vec![base_name, app_part]
+            vec![base_name, config.name.clone()]
         };
         let lpad_pos =                     *self.lpad.position.lock().await;
         let lpad_pressed = *self.lpad.pressed.lock().await;
@@ -2091,15 +2089,11 @@ impl EventReader {
                     let hk = match tokio::time::timeout(TIMEOUT, self.held_keys.lock()).await {
                         Ok(g) => g.clone(), Err(_) => continue,
                     };
-                    let base_name = self.device_name.clone();
+                    let base_name = self.base_name.clone();
                     let stack = if config.name == base_name {
-                        vec![base_name.clone()]
+                        vec![base_name]
                     } else {
-                        let app_part = config.name
-                            .strip_prefix(&format!("{}::", base_name))
-                            .unwrap_or(&config.name)
-                            .to_string();
-                        vec![base_name, app_part]
+                        vec![base_name, config.name.clone()]
                     };
                     let mut event_state = crate::state_export::build_state(
                         &config, &mods, layout, is_paused, is_gaming,
