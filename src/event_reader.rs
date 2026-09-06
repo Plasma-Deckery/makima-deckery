@@ -406,6 +406,14 @@ impl EventReader {
     async fn window_changed_loop(&self) {
         if let Server::Connected(s) = &self.environment.server {
             if s == "KDE" {
+                // Read the current focus once before waiting. The adapter pushes the
+                // already-focused window right after loading its KWin script, which
+                // happens long before this loop exists — and notify_waiters() keeps
+                // no permit for a waiter that has not registered yet, so that first
+                // push would be dropped. active_client still holds the value, so
+                // reading it here recovers it. This also covers device reconnects,
+                // where a fresh EventReader starts while the focus has not changed.
+                self.update_config().await;
                 loop {
                     self.window_changed.notified().await;
                     self.update_config().await;

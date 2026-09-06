@@ -25,12 +25,20 @@ use zbus::{interface, proxy, connection::Builder};
 // steam_detector decides what they mean in Rust.
 
 const KWIN_SCRIPT: &str = r#"
-workspace.windowActivated.connect(function(w) {
+function makimaSend(w) {
     var cls = (w && w.resourceClass) ? w.resourceClass : "";
     var cap = (w && w.caption)       ? w.caption       : "";
     var pid = (w && w.pid)           ? w.pid           : 0;
     callDBus("org.makima.watcher", "/watcher", "org.makima.watcher", "WindowActivated", cls, cap, pid);
-});
+}
+workspace.windowActivated.connect(makimaSend);
+// Push the currently focused window once, right here at load time. Without it
+// makima only ever learns about focus by *reacting* to a change, so after a
+// restart the focus state stays at its default — and every app-specific config
+// remains inactive until the user happens to switch windows.
+// `activeWindow` is the Plasma 6 name; on Plasma 5 it is undefined, which
+// makimaSend handles by sending empty strings (the default state anyway).
+makimaSend(workspace.activeWindow);
 "#;
 
 const PLUGIN_NAME: &str = "makima-watcher";
