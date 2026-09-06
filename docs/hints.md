@@ -339,23 +339,36 @@ The hook would go in `set_last_emitted`: on `value == 1`, compare the held
 buttons against `hints_resolved` with the same length-plus-subset rule, and on
 an exact match write the hint's label as `LastAction`. Read-only,
 `resolve_binding` untouched, emitted keys unchanged — invariant 2 survives.
-Deferred deliberately, to let the display side settle first.
+
+Deferred deliberately, to let the display side settle first. The display side has
+since landed, so this is now tracked as
+[deckery-hud#20](https://github.com/Plasma-Deckery/deckery-hud/issues/20).
 
 ## Related open items from the same discussion
 
 Not part of this design, but decided or deferred alongside it and easy to lose:
 
-- **`Ctrl+Shift+C` (copy last response) in `apps/Claude Desktop.toml`** — candidate
-  placements were `R1` + `···` or `L1-X`. It cannot be a hint (no button emits
-  `KEY_C`), so it needs a real binding. Unverified: it came from a web source that
-  was already wrong twice in this session. Must be tested before it is written.
-  Note that `···` is `BTN_BASE`, which is also the Gaming Mode double-click
-  trigger (`Steam Deck.toml:89`) — a double tap of the shortcut would toggle
-  Gaming Mode.
+- **Dropped:** `Ctrl+Shift+C` (copy last response) in `apps/Claude Desktop.toml`.
+  It cannot be a hint — no button emits `KEY_C` — so it would have needed a real
+  binding, and the shortcut itself came from a web source that was already wrong
+  twice. Both candidate placements were poor: `···` is `BTN_BASE`, which is also
+  the Gaming Mode double-click trigger (`Steam Deck.toml:89`), so a double tap
+  would toggle Gaming Mode. Not worth a binding.
 - **Closed:** `Ctrl+A`, zoom reset (`Ctrl+0`), and copy/paste are not needed —
   the latter is already covered by `L1-X` / `L1-Y` in the base config.
 - **Untested:** the startup-focus fix (`event_reader.rs:408` one-shot
   `update_config()` before the notify loop, plus the load-time push in the KWin
   script) has no regression test.
-- **Not closed:** the microsecond race between the KWin script's load-time push
-  and the first waiter, which `Notified::enable()` would close in ~3 lines.
+- **Closed:** the focus-notification race in `window_changed_loop`
+  ([`event_reader.rs:406`](../src/event_reader.rs)). The waiter used to be
+  registered only at the *top* of each iteration, so nothing was listening while
+  `update_config()` ran — and `notify_focus_change`
+  ([`compositor/mod.rs:52`](../src/compositor/mod.rs)) uses `notify_waiters()`,
+  which stores no permit, so a push into that gap was lost outright. The gap
+  spanned `registry.resolve()` (full merge plus `resolve_hints`) and
+  `write_state()`, i.e. **milliseconds, recurring on every iteration** — not
+  just at startup; two rapid window switches could drop the second.
+  Fixed with `Notified::enable()`: the future is pinned and enabled *before*
+  `active_client` is read, and re-armed *before* the work rather than after.
+  (An earlier revision of this document, and the commit message of `3ee9a9f`,
+  called this a microsecond race confined to startup. That was wrong.)

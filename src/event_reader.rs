@@ -408,16 +408,35 @@ impl EventReader {
     async fn window_changed_loop(&self) {
         if let Server::Connected(s) = &self.environment.server {
             if s == "KDE" {
+                // notify_waiters() keeps no permit (unlike notify_one()), so a push
+                // that arrives while nobody is registered is lost outright. Both
+                // guards below exist for that single reason.
+                //
+                // Guard 1 — register before the first read. enable() puts this
+                // future in the waiter list without awaiting it, closing the window
+                // between the read below and the first `.await` in the loop.
+                let mut notified = Box::pin(self.window_changed.notified());
+                notified.as_mut().enable();
+
                 // Read the current focus once before waiting. The adapter pushes the
                 // already-focused window right after loading its KWin script, which
-                // happens long before this loop exists — and notify_waiters() keeps
-                // no permit for a waiter that has not registered yet, so that first
-                // push would be dropped. active_client still holds the value, so
-                // reading it here recovers it. This also covers device reconnects,
-                // where a fresh EventReader starts while the focus has not changed.
+                // happens long before this loop exists, so that first push is gone.
+                // active_client still holds the value, so reading it here recovers
+                // it. This also covers device reconnects, where a fresh EventReader
+                // starts while the focus has not changed.
                 self.update_config().await;
+
                 loop {
-                    self.window_changed.notified().await;
+                    notified.as_mut().await;
+
+                    // Guard 2 — re-arm *before* the work, not after. update_config()
+                    // runs a full registry.resolve() plus write_state(), which is
+                    // milliseconds; re-arming afterwards would leave that entire span
+                    // unwatched on every iteration, so two quick window switches
+                    // could drop the second one.
+                    notified = Box::pin(self.window_changed.notified());
+                    notified.as_mut().enable();
+
                     self.update_config().await;
                 }
             }
