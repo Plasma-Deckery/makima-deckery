@@ -144,7 +144,7 @@ Dropping the filename convention made a new failure mode reachable: a `.toml` th
 
 ## IPC socket architecture
 
-The IPC socket (`/tmp/makima-control.sock`) is bound once in `main.rs` and broadcast via `tokio::sync::broadcast::Sender<String>` to all active `EventReader` instances. Each reader has its own `ipc_command_loop(rx)` that reads from the broadcast receiver.
+The IPC socket (`$XDG_RUNTIME_DIR/makima-control.sock`) is bound once in `main.rs` and broadcast via `tokio::sync::broadcast::Sender<String>` to all active `EventReader` instances. Each reader has its own `ipc_command_loop(rx)` that reads from the broadcast receiver.
 
 This replaces the old design where `EventReader` bound the socket itself — which caused a silent socket takeover bug in multi-device setups (the second reader stole the socket from the first, leaving the first device unable to receive IPC commands).
 

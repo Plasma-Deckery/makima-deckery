@@ -50,7 +50,7 @@ distrobox enter deckery -- cargo test
 - **State export** → `/tmp/makima-state.json` — all state needed for a real-time button preview HUD: active bindings, modifier context, currently held buttons, last executed action, and analog sensor values (sticks, trackpads, IMU)
 - **Trackpad MT translation** — both trackpads emulated as standard system touchpad devices, activating existing trackpad gesture recognition tools
 - **Lizard Mode suppression** — periodic hidraw heartbeat keeps the `hid-steam` kernel driver's built-in mouse/scroll fallback disabled without Steam running; configurable via `SUPPRESS_LIZARD_MODE`
-- **Pause / Resume IPC** — runtime control via Unix socket at `/tmp/makima-control.sock`
+- **Pause / Resume IPC** — runtime control via Unix socket at `$XDG_RUNTIME_DIR/makima-control.sock`
 - **Steam Deck keycodes** — `BTN_GRIPL/R/L2/R2` for the back paddles via patched `evdev` crate
 - **Unit test suite** — 250 tests covering resolver, state export, analog helpers, config parsing, trackpad routing, and haptic report encoding
 

@@ -115,8 +115,25 @@ async fn main() {
     {
         let ipc_tx = ipc_tx.clone();
         tokio::spawn(async move {
-            let _ = std::fs::remove_file("/tmp/makima-control.sock");
-            let listener = match UnixListener::bind("/tmp/makima-control.sock") {
+            // Bind in $XDG_RUNTIME_DIR (= /run/user/<uid>), not /tmp.
+            //
+            // /tmp is mode 1777, so any local process can create the socket
+            // name before we bind it. This socket accepts "pause", i.e. it can
+            // switch off input remapping — not something to leave squattable.
+            // The runtime dir is mode 0700 and per-user, which additionally
+            // lets deckery-auth-daemon address each user's instance separately
+            // (it scans /run/user/*/makima-control.sock); a single /tmp path
+            // cannot express that. It is also why the daemon can reach us at
+            // all: it runs with PrivateTmp=yes and sees an empty /tmp.
+            //
+            // No /tmp fallback on purpose — it would silently downgrade to the
+            // squattable path in exactly the situation where something is
+            // already unusual.
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+                .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+            let socket_path = format!("{runtime_dir}/makima-control.sock");
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = match UnixListener::bind(&socket_path) {
                 Ok(l) => l,
                 Err(e) => { eprintln!("deckery: IPC socket bind failed: {}", e); return; }
             };

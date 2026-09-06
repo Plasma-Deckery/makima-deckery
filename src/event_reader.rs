@@ -2080,6 +2080,12 @@ impl EventReader {
                 "pause" | "resume" | "gaming_mode enable" | "gaming_mode disable" => {
                     if cmd == "pause" || cmd == "resume" {
                         *self.paused.lock().await = cmd == "pause";
+                        // On pause: release all held output keys immediately so
+                        // nothing stays stuck while an external process (e.g.
+                        // deckery-auth-daemon) takes over the controller.
+                        if cmd == "pause" {
+                            self.release_all_held().await;
+                        }
                     } else {
                         // Route through the unified Gaming Mode channel.
                         // gaming_mode_set_loop applies the change,
