@@ -26,9 +26,8 @@ static BUTTON_MAP: &[(u16, usize, u8)] = &[
     (Key::BTN_TL2.code(),        8, 1 << 1),  // left  bumper 2 (SL)
     (Key::BTN_TR.code(),         8, 1 << 2),  // right bumper (R1)
     (Key::BTN_TL.code(),         8, 1 << 3),  // left  bumper (L1)
-    // Face buttons: hid-steam uses BTN_Y/B/X/A — evdev crate aliases:
-    //   BTN_A = BTN_SOUTH = 0x130, BTN_B = BTN_EAST = 0x131,
-    //   BTN_X = BTN_NORTH = 0x133, BTN_Y = BTN_WEST = 0x134
+    // Face buttons — direction names match physical position on Steam Deck:
+    //   Y = top (north), B = right (east), X = left (west), A = bottom (south).
     (Key::BTN_NORTH.code(),      8, 1 << 4),  // Y button (north position)
     (Key::BTN_EAST.code(),       8, 1 << 5),  // B button
     (Key::BTN_WEST.code(),       8, 1 << 6),  // X button (west position)
