@@ -29,9 +29,9 @@ static BUTTON_MAP: &[(u16, usize, u8)] = &[
     // Face buttons: hid-steam uses BTN_Y/B/X/A — evdev crate aliases:
     //   BTN_A = BTN_SOUTH = 0x130, BTN_B = BTN_EAST = 0x131,
     //   BTN_X = BTN_NORTH = 0x133, BTN_Y = BTN_WEST = 0x134
-    (Key::BTN_WEST.code(),       8, 1 << 4),  // Y button
+    (Key::BTN_NORTH.code(),      8, 1 << 4),  // Y button (north position)
     (Key::BTN_EAST.code(),       8, 1 << 5),  // B button
-    (Key::BTN_NORTH.code(),      8, 1 << 6),  // X button
+    (Key::BTN_WEST.code(),       8, 1 << 6),  // X button (west position)
     (Key::BTN_SOUTH.code(),      8, 1 << 7),  // A button
     (Key::BTN_DPAD_UP.code(),    9, 1 << 0),
     (Key::BTN_DPAD_RIGHT.code(), 9, 1 << 1),
