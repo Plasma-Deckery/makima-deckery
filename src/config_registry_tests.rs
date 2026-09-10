@@ -35,7 +35,7 @@ fn base(name: &str, device_names: &[&str]) -> Config {
 /// A module config: no `[device]`, optionally bound to a window class / layout.
 fn module(name: &str, window_class: Option<&str>, layout: u16) -> Config {
     let mut c = Config::new_empty(name.to_string());
-    c.module.match_window_class = window_class.map(str::to_string);
+    c.module.match_window_class = window_class.map(|s| vec![s.to_string()]);
     c.module.layout = layout;
     c
 }
@@ -148,7 +148,7 @@ fn window_class_modules_lists_only_class_bound_modules() {
     ]);
     let mods = r.window_class_modules();
     assert_eq!(mods.len(), 1);
-    assert_eq!(mods[0].module.match_window_class.as_deref(), Some("org.kde.konsole"));
+    assert_eq!(mods[0].module.match_window_class.as_deref(), Some(["org.kde.konsole".to_string()].as_slice()));
 }
 
 #[test]

@@ -12,7 +12,6 @@ use tokio::task::JoinHandle;
 use crate::compositor;
 use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle};
 use tokio_stream::StreamExt;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub enum Client {
@@ -172,51 +171,10 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
     )
     .unwrap();
 
-    // Config file watcher — reloads on any .toml change in the watched dirs.
-    // Watches the config dir directly, plus the parent dirs of any symlinked
-    // .toml files (e.g. files in a git repo). Watching parent dirs instead of
-    // individual files survives editor renames (sed -i, vim swapfiles, etc.)
-    // that would otherwise invalidate an inode-based per-file watch.
-    // Events are filtered to .toml files so unrelated files in those dirs are ignored.
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let mut watcher = RecommendedWatcher::new(
-        move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                use notify::EventKind::*;
-                match event.kind {
-                    Create(_) | Modify(_) | Remove(_) => {
-                        let is_toml = event.paths.iter().any(|p| {
-                            p.extension().and_then(|e| e.to_str()) == Some("toml")
-                        });
-                        if is_toml { let _ = config_tx.try_send(()); }
-                    }
-                    _ => {}
-                }
-            }
-        },
-        notify::Config::default(),
-    ).expect("Failed to create config file watcher");
-    watcher.watch(std::path::Path::new(&config_dir), RecursiveMode::NonRecursive)
-        .expect("Failed to watch config directory");
-    // Also watch parent dirs of symlink targets.
-    if let Ok(entries) = std::fs::read_dir(&config_dir) {
-        let mut extra_dirs: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-                if let Ok(real) = std::fs::canonicalize(&path) {
-                    if real != path {
-                        if let Some(parent) = real.parent() {
-                            extra_dirs.insert(parent.to_path_buf());
-                        }
-                    }
-                }
-            }
-        }
-        for dir in extra_dirs {
-            let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
-        }
-    }
+    // The registry owns all file-watching logic — it knows which directories it
+    // scans and watches them recursively.  Keep the handle alive for the loop.
+    let _config_watcher = registry.start_watcher(&config_dir, config_tx);
 
     loop {
         tokio::select! {

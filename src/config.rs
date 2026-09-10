@@ -253,8 +253,9 @@ impl DeviceDeclaration {
 pub struct ModuleMetadata {
     /// Only active when the named compositor is running.
     pub requires_compositor: Option<String>,
-    /// Applied when the focused window's class matches this string exactly.
-    pub match_window_class: Option<String>,
+    /// Applied when the focused window's class matches any of these strings.
+    /// Accepts a single string or a list: `match_window_class = ["firefox", "org.mozilla.firefox"]`.
+    pub match_window_class: Option<Vec<String>>,
     /// Applied only while this layout is active. Defaults to layout 0.
     pub layout: u16,
 }
@@ -431,7 +432,7 @@ pub struct RawDeviceDeclaration {
 #[derive(serde::Deserialize, Debug, Clone, Default)]
 pub struct RawModuleMetadata {
     pub requires_compositor: Option<String>,
-    pub match_window_class: Option<String>,
+    pub match_window_class: Option<Vec<String>>,
     #[serde(default)]
     pub layout: u16,
 }

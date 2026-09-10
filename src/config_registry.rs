@@ -20,9 +20,11 @@
 // be activated even if enabled = true.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use crate::config::Config;
 use crate::udev_monitor::Client;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -147,6 +149,87 @@ impl ConfigRegistry {
         *entries = new_entries;
     }
 
+    // ── File watching ─────────────────────────────────────────────────────────
+
+    /// Start a file watcher over the entire config directory tree.
+    ///
+    /// Returns a `RecommendedWatcher` handle — drop it to stop watching.
+    /// The `change_tx` channel receives a `()` unit whenever any `.toml` file
+    /// under `config_dir` (recursively) is created, modified, or removed.
+    ///
+    /// The registry owns this logic because it is the only component that knows
+    /// which directories it scans.  `udev_monitor` must not hardcode directory
+    /// names; it only receives the change signal and calls `reload()`.
+    ///
+    /// Symlink handling: inotify does not follow symlinks, so for every `.toml`
+    /// file that is a symlink (e.g. files in a git-worktree config repo) we also
+    /// watch the real parent directory.  This survives editor-rename workflows
+    /// (sed -i, vim swapfiles) that would otherwise invalidate an inode-based
+    /// per-file watch.
+    pub fn start_watcher(
+        &self,
+        config_dir: &str,
+        change_tx: tokio::sync::mpsc::Sender<()>,
+    ) -> RecommendedWatcher {
+        let mut watcher = RecommendedWatcher::new(
+            move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    use notify::EventKind::*;
+                    match event.kind {
+                        Create(_) | Modify(_) | Remove(_) => {
+                            let is_toml = event.paths.iter().any(|p| {
+                                p.extension().and_then(|e| e.to_str()) == Some("toml")
+                            });
+                            if is_toml { let _ = change_tx.try_send(()); }
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            notify::Config::default(),
+        ).expect("Failed to create config file watcher");
+
+        // Watch the entire config tree recursively — no hardcoded subdirectory
+        // names; any new subdirectory added in the future is covered automatically.
+        watcher
+            .watch(Path::new(config_dir), RecursiveMode::Recursive)
+            .expect("Failed to watch config directory");
+
+        // Also watch the real parent directories of any symlinked .toml files.
+        for dir in Self::symlink_target_parents(Path::new(config_dir)) {
+            let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+        }
+
+        watcher
+    }
+
+    /// Recursively collect the parent directories of every symlinked `.toml`
+    /// file found under `dir`.  Used by `start_watcher` to set up additional
+    /// inotify watches so that changes in git-worktree repos are detected.
+    fn symlink_target_parents(dir: &Path) -> HashSet<PathBuf> {
+        let mut out = HashSet::new();
+        Self::collect_symlink_parents(dir, &mut out);
+        out
+    }
+
+    fn collect_symlink_parents(dir: &Path, out: &mut HashSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::collect_symlink_parents(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                if let Ok(real) = std::fs::canonicalize(&path) {
+                    if real != path {
+                        if let Some(parent) = real.parent() {
+                            out.insert(parent.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Environment ───────────────────────────────────────────────────────────
 
     /// Record which compositor the session is running under. Modules declaring
@@ -231,7 +314,10 @@ impl ConfigRegistry {
             .filter(|c| c.module.layout == layout);
 
         let by_class = client_class.and_then(|class| {
-            candidates().find(|c| c.module.match_window_class.as_deref() == Some(class))
+            candidates().find(|c| {
+                c.module.match_window_class.as_deref()
+                    .is_some_and(|patterns| patterns.iter().any(|p| p == class))
+            })
         });
         let by_layout = candidates()
             .find(|c| c.module.match_window_class.is_none() && c.module.layout != 0);

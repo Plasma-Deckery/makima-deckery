@@ -8,7 +8,8 @@ use x11rb::protocol::xproto::{get_input_focus, get_property, Atom, AtomEnum};
 /// Returns `Client::Class(class, "")` if a loaded module declares this window
 /// class via `[module] match_window_class`, otherwise `Client::Default`.
 fn match_class(class: String, modules: &[Config]) -> Client {
-    if modules.iter().any(|m| m.module.match_window_class.as_deref() == Some(class.as_str())) {
+    if modules.iter().any(|m| m.module.match_window_class.as_deref()
+            .is_some_and(|patterns| patterns.iter().any(|p| p == class.as_str()))) {
         Client::Class(class, String::new(), None)
     } else {
         Client::Default
