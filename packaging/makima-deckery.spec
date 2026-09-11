@@ -1,5 +1,5 @@
 Name:           makima-deckery
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
@@ -91,6 +91,9 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Thu Sep 11 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 0.4.0-1
+- Minor version bump to 0.4.0
+
 * Sat Aug 15 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 0.3.0-1
 - Initial RPM packaging
 - Gaming Mode: automatic detection of Steam games, disables remapping while in-game
