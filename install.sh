@@ -31,11 +31,8 @@ fi
 
 # ── 2. Distrobox container + packages ────────────────────────────────────────
 distrobox create --name deckery --image archlinux:latest || true
-_PKG_STAMP="/var/cache/deckery-build-packages.stamp"
-_PKG_HASH="$(echo "$BUILD_PACKAGES" | md5sum | cut -d' ' -f1)"
-if [ "$(distrobox enter deckery -- cat "$_PKG_STAMP" 2>/dev/null)" != "$_PKG_HASH" ]; then
+if ! distrobox enter deckery -- pacman -Q $BUILD_PACKAGES &>/dev/null; then
     distrobox enter deckery -- sudo pacman -S --needed --noconfirm $BUILD_PACKAGES
-    echo "$_PKG_HASH" | distrobox enter deckery -- sudo tee "$_PKG_STAMP" > /dev/null
 fi
 
 # ── 3. Systemd user services (no sudo) ───────────────────────────────────────
