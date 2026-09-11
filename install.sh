@@ -31,7 +31,9 @@ fi
 
 # ── 2. Distrobox container + packages ────────────────────────────────────────
 distrobox create --name deckery --image archlinux:latest || true
-distrobox enter deckery -- sudo pacman -S --needed --noconfirm $BUILD_PACKAGES
+if ! distrobox enter deckery -- pacman -Q $BUILD_PACKAGES &>/dev/null; then
+    distrobox enter deckery -- sudo pacman -S --needed --noconfirm $BUILD_PACKAGES
+fi
 
 # ── 3. Systemd user services (no sudo) ───────────────────────────────────────
 SERVICE_DIR="$HOME/.config/systemd/user"
