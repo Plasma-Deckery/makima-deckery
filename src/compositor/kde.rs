@@ -39,6 +39,66 @@ workspace.windowActivated.connect(makimaSend);
 // `activeWindow` is the Plasma 6 name; on Plasma 5 it is undefined, which
 // makimaSend handles by sending empty strings (the default state anyway).
 makimaSend(workspace.activeWindow);
+
+// ── Activity window movement ──────────────────────────────────────────────────
+//
+// KWin has no built-in shortcut for "move focused window to next/previous
+// activity". These two shortcuts fill that gap. They wrap w.activities (Plasma
+// 6 API, mirrors w.desktops) and follow the activity list circularly.
+//
+// Invoked from deckery via:
+//   qdbus org.kde.kglobalaccel /component/kwin
+//         org.kde.kglobalaccel.Component.invokeShortcut
+//         'deckery-move-window-to-next-activity'
+function deckeryMoveWindowToActivity(delta) {
+    var w = workspace.activeWindow;
+    if (!w) return;
+    var acts = workspace.activities;
+    if (!acts || acts.length < 2) return;
+    var curr = workspace.currentActivity;
+    var idx = acts.indexOf(curr);
+    if (idx === -1) return;
+    var target = acts[(idx + delta + acts.length) % acts.length];
+    w.activities = [target];
+    workspace.currentActivity = target;
+    // Follow the window to its virtual desktop in the new activity.
+    // Without this KWin lands on whatever desktop was last active there.
+    if (w.desktops && w.desktops.length > 0) {
+        workspace.currentDesktop = w.desktops[0];
+    }
+}
+
+registerShortcut(
+    "deckery-move-window-to-next-activity",
+    "Move Window to Next Activity (Deckery)",
+    "",
+    function() { deckeryMoveWindowToActivity(1); }
+);
+
+registerShortcut(
+    "deckery-move-window-to-prev-activity",
+    "Move Window to Previous Activity (Deckery)",
+    "",
+    function() { deckeryMoveWindowToActivity(-1); }
+);
+
+// Move the focused window to the last virtual desktop and follow it there.
+registerShortcut(
+    "deckery-move-window-to-last-desktop",
+    "Move Window to Last Desktop (Deckery)",
+    "",
+    function() {
+        var w = workspace.activeWindow;
+        if (!w) return;
+        var desktops = workspace.desktops;
+        if (!desktops || desktops.length === 0) return;
+        var last = desktops[desktops.length - 1];
+        w.desktops = [last];
+        // Dynamic workspaces may have created a new desktop after the move,
+        // so follow the window to wherever it actually landed.
+        workspace.currentDesktop = w.desktops[0];
+    }
+);
 "#;
 
 const PLUGIN_NAME: &str = "makima-watcher";
