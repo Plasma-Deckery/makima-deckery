@@ -275,6 +275,56 @@ fn app_and_layout_modules_are_not_merged_into_base() {
 }
 
 #[test]
+fn trackpad_config_reaches_the_base_from_a_module() {
+    // The shipped trackpad config lives in its own module, and the base config
+    // carries no [trackpad] at all. merge_base() only inherits trackpad
+    // settings when both of its own sides are "disabled" — which an empty base
+    // happens to satisfy. Tightening that condition would silently leave both
+    // pads dead, hence this test.
+    let mut m = module("Steam Deck Trackpad", None, 0);
+    m.trackpad.right.mode = "mt-trackpad".to_string();
+    m.trackpad.combined_gesture_device = true;
+
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(m, true),
+    ]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert_eq!(cfg.trackpad.right.mode, "mt-trackpad");
+    assert!(cfg.trackpad.combined_gesture_device);
+}
+
+#[test]
+fn base_trackpad_config_wins_over_a_module() {
+    // The other direction: once the base declares a pad, the module must not
+    // take it back — an override of Steam Deck.toml has to stay in charge.
+    let mut b = base("Steam Deck", &["Steam Deck"]);
+    b.trackpad.right.mode = "trackball".to_string();
+    let mut m = module("Steam Deck Trackpad", None, 0);
+    m.trackpad.right.mode = "mt-trackpad".to_string();
+
+    let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert_eq!(cfg.trackpad.right.mode, "trackball");
+}
+
+#[test]
+fn settings_reach_the_base_from_a_module() {
+    // [settings] moved into Steam Deck Settings.toml, so stick mode and
+    // deadzones now arrive through the module merge rather than from the file
+    // that declares the device.
+    let mut m = module("Steam Deck Settings", None, 0);
+    m.settings.insert("RSTICK".to_string(), "cursor".to_string());
+
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(m, true),
+    ]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert_eq!(cfg.settings.get("RSTICK").map(String::as_str), Some("cursor"));
+}
+
+#[test]
 fn module_does_not_override_base_gaming_mode() {
     let mut b = base("Steam Deck", &["Steam Deck"]);
     b.gaming_mode_config.auto_detect_steam_games = false;
