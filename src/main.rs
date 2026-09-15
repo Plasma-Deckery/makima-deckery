@@ -10,6 +10,7 @@ mod kde_input_defaults;
 mod resume_watcher;
 mod steam_detector;
 mod mt_trackpad;
+mod preferences;
 mod resolver;
 mod scroll_pad;
 mod state_export;

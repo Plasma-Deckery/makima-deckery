@@ -28,6 +28,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use crate::config::{Config, Event};
+use crate::preferences::Preferences;
 use crate::udev_monitor::Client;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -63,6 +64,9 @@ pub struct ConfigSummary {
     pub kind:    &'static str,
     /// For modules: the base config the tray nests this one under.
     pub parent:  Option<String>,
+    /// Set when this module belongs to a set of mutually exclusive modules.
+    /// The tray draws such a set as radio buttons rather than checkboxes.
+    pub exclusive_group: Option<String>,
     pub enabled: bool,
     pub errors:  Vec<ConfigError>,
 }
@@ -93,6 +97,52 @@ fn parent_of(entries: &HashMap<String, ConfigEntry>, name: &str) -> Option<Strin
         .filter(|c| c.device.is_some())
         .map(|c| c.name.clone())
         .min()
+}
+
+/// Every module declaring the given exclusive group, whether enabled or not.
+fn group_members(entries: &HashMap<String, ConfigEntry>, group: &str) -> HashSet<String> {
+    entries.values()
+        .filter(|e| e.config.as_ref()
+            .and_then(|c| c.module.exclusive_group.as_deref()) == Some(group))
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+/// Stamp the user's stored choices onto freshly loaded entries.
+///
+/// Modules default to enabled, so only the deviations recorded in
+/// `preferences.toml` have to be replayed. For an exclusive group the recorded
+/// choice wins; without one — a fresh install, or a choice naming a module that
+/// has since been removed — the alphabetically first usable member is picked, so
+/// a group always has exactly one active member.
+fn apply_preferences(entries: &mut HashMap<String, ConfigEntry>, preferences: &Preferences) {
+    for entry in entries.values_mut() {
+        if entry.config.is_some() && preferences.is_disabled(&entry.name) {
+            entry.enabled = false;
+        }
+    }
+
+    let groups: HashSet<String> = entries.values()
+        .filter_map(|e| e.config.as_ref())
+        .filter_map(|c| c.module.exclusive_group.clone())
+        .collect();
+
+    for group in groups {
+        let members = group_members(entries, &group);
+        let usable_member = |name: &String| {
+            entries.get(name).is_some_and(|e| e.config.is_some())
+        };
+        let chosen = preferences.group_choice(&group)
+            .map(str::to_string)
+            .filter(|c| members.contains(c) && usable_member(c))
+            .or_else(|| members.iter().filter(|n| usable_member(n)).min().cloned());
+
+        for member in &members {
+            if let Some(e) = entries.get_mut(member) {
+                e.enabled = e.config.is_some() && Some(member) == chosen.as_ref();
+            }
+        }
+    }
 }
 
 // ── Config roots ──────────────────────────────────────────────────────────────
@@ -165,6 +215,9 @@ pub struct ConfigRegistry {
     /// Set once by `set_compositor()` after the session environment is resolved;
     /// until then no compositor-specific module is considered usable.
     compositor: Mutex<Option<String>>,
+    /// The user's activation choices, mirrored to `preferences.toml` on every
+    /// change. Held in memory so `reload()` can re-apply them without a read.
+    preferences: Mutex<Preferences>,
 }
 
 impl ConfigRegistry {
@@ -173,10 +226,14 @@ impl ConfigRegistry {
     /// Load all `.toml` files from both roots and their `apps/` subdirectories.
     /// Never panics — parse errors are stored as ConfigEntry with config: None.
     pub fn load(roots: ConfigRoots) -> Arc<Self> {
+        let preferences = Preferences::load(&roots.user);
+        let mut entries = Self::load_entries(&roots);
+        apply_preferences(&mut entries, &preferences);
         Arc::new(Self {
-            entries: Mutex::new(Self::load_entries(&roots)),
+            entries: Mutex::new(entries),
             roots,
             compositor: Mutex::new(None),
+            preferences: Mutex::new(preferences),
         })
     }
 
@@ -187,6 +244,7 @@ impl ConfigRegistry {
             roots: ConfigRoots { system: PathBuf::new(), user: PathBuf::new() },
             entries: Mutex::new(HashMap::new()),
             compositor: Mutex::new(None),
+            preferences: Mutex::new(Preferences::default()),
         })
     }
 
@@ -198,6 +256,7 @@ impl ConfigRegistry {
             roots: ConfigRoots { system: PathBuf::new(), user: PathBuf::new() },
             entries: Mutex::new(entries.into_iter().map(|e| (e.name.clone(), e)).collect()),
             compositor: Mutex::new(None),
+            preferences: Mutex::new(Preferences::default()),
         })
     }
 
@@ -206,24 +265,17 @@ impl ConfigRegistry {
     /// Replace all entries with freshly loaded ones.
     /// Called on SIGHUP / file-watcher event — in-place so all Arc holders
     /// (udev_monitor, EventReader) see the update automatically.
-    /// Preserves runtime-toggled `enabled` flags: if an entry existed before
-    /// and was disabled via IPC, it stays disabled after reload.
+    ///
+    /// Activation state comes from `preferences.toml`, re-read here rather than
+    /// carried forward from the old entries. It is the single source of truth:
+    /// if a reload and a restart could disagree about which modules are active,
+    /// the user would see their choice silently revert at the next boot.
     pub fn reload(&self) {
+        let preferences = Preferences::load(&self.roots.user);
         let mut new_entries = Self::load_entries(&self.roots);
-        let mut entries = self.entries.lock().unwrap();
-        for (name, old) in entries.iter() {
-            if let Some(new) = new_entries.get_mut(name) {
-                // Only carry over the runtime-toggled enabled flag when both
-                // the old AND new entry are valid (config: Some).
-                // - old broken → new fixed:   keep new default (enabled=true)
-                // - old valid  → new broken:  keep new default (enabled=false)
-                // - old valid  → new valid:   preserve user's IPC toggle
-                if old.config.is_some() && new.config.is_some() {
-                    new.enabled = old.enabled;
-                }
-            }
-        }
-        *entries = new_entries;
+        apply_preferences(&mut new_entries, &preferences);
+        *self.entries.lock().unwrap() = new_entries;
+        *self.preferences.lock().unwrap() = preferences;
     }
 
     // ── File watching ─────────────────────────────────────────────────────────
@@ -336,7 +388,7 @@ impl ConfigRegistry {
     }
 
     /// All usable base configs (those with a `[device]` section), each already
-    /// merged with the plain modules it pulls in via `[modules] include`.
+    /// merged with every enabled plain module.
     /// `launch_tasks()` iterates these declared targets to find physical devices.
     pub fn base_configs(&self) -> Vec<Config> {
         let compositor = self.compositor();
@@ -370,7 +422,7 @@ impl ConfigRegistry {
     /// the filename happens to resemble the `[device] names` entries.
     ///
     /// Merge order, lowest priority first:
-    ///   1. plain modules named in the base config's `[modules] include`
+    ///   1. every enabled plain module, alphabetically last one winning
     ///   2. the base config itself
     ///   3. the conditional module matching the current window class and layout
     ///
@@ -456,21 +508,47 @@ impl ConfigRegistry {
 
     // ── IPC API ───────────────────────────────────────────────────────────────
 
-    /// Set the enabled flag for one config entry.
+    /// Set the enabled flag for one config entry and persist the choice.
+    ///
     /// Returns true if the change was applied.
     /// Returns false if the name does not exist, or if `enabled = true` is
     /// requested for an entry that failed to parse (`config: None`) — a
     /// broken config cannot be activated regardless of the flag.
+    ///
+    /// Enabling a member of an exclusive group switches its siblings off in the
+    /// same step. The group is a single choice, so the tray never has to send
+    /// the deactivations itself and there is no window in which two members are
+    /// both live.
     pub fn set_enabled(&self, name: &str, enabled: bool) -> bool {
-        if let Some(entry) = self.entries.lock().unwrap().get_mut(name) {
-            if enabled && entry.config.is_none() {
-                return false;
-            }
-            entry.enabled = enabled;
-            true
-        } else {
-            false
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get(name) else { return false };
+        if enabled && entry.config.is_none() {
+            return false;
         }
+        let group = entry.config.as_ref().and_then(|c| c.module.exclusive_group.clone());
+
+        let mut preferences = self.preferences.lock().unwrap();
+        match (&group, enabled) {
+            (Some(group), true) => {
+                let siblings = group_members(&entries, group);
+                for sibling in &siblings {
+                    if let Some(e) = entries.get_mut(sibling) {
+                        e.enabled = sibling == name;
+                    }
+                }
+                preferences.set_group_choice(group, name, &siblings);
+            }
+            // Switching the chosen member off would leave the group with no
+            // active member at all. The tray draws radio buttons, which cannot
+            // express that, so the only way here is a hand-sent IPC command —
+            // honour it, and record it as a plain disable.
+            _ => {
+                entries.get_mut(name).unwrap().enabled = enabled;
+                preferences.set_disabled(name, !enabled);
+            }
+        }
+        preferences.save(&self.roots.user);
+        true
     }
 
     // ── State export ──────────────────────────────────────────────────────────
@@ -498,6 +576,8 @@ impl ConfigRegistry {
                 name:    e.name.clone(),
                 kind:    entry_kind(e),
                 parent:  parent_of(&entries, &e.name),
+                exclusive_group: e.config.as_ref()
+                    .and_then(|c| c.module.exclusive_group.clone()),
                 enabled: e.enabled,
                 errors:  e.errors.clone(),
             })
@@ -555,6 +635,11 @@ impl ConfigRegistry {
             for file in dir.flatten() {
                 let filename = file.file_name().into_string().unwrap_or_default();
                 if !filename.ends_with(".toml") || filename.starts_with('.') {
+                    continue;
+                }
+                // Sits next to the configs but is not one — it records which of
+                // them the user switched on.
+                if crate::preferences::is_preferences_file(&filename) {
                     continue;
                 }
 
@@ -731,23 +816,41 @@ fn gates_overlap(a: Option<&String>, b: Option<&String>) -> bool {
 /// The warning names both configs so the fix is obvious. It lands on the winner
 /// because that is the file whose binding is actually in effect.
 fn report_binding_conflicts(entries: &mut HashMap<String, ConfigEntry>) {
-    let mut modules: Vec<(String, Option<String>, HashSet<(Event, Vec<Event>)>)> = entries.values()
+    struct Module {
+        name:       String,
+        gate:       Option<String>,
+        group:      Option<String>,
+        combos:     HashSet<(Event, Vec<Event>)>,
+    }
+    let mut modules: Vec<Module> = entries.values()
         .filter_map(|e| e.config.as_ref())
         .filter(|c| is_plain_module(c))
-        .map(|c| (c.name.clone(), c.module.requires_compositor.clone(), bound_combos(c)))
+        .map(|c| Module {
+            name:   c.name.clone(),
+            gate:   c.module.requires_compositor.clone(),
+            group:  c.module.exclusive_group.clone(),
+            combos: bound_combos(c),
+        })
         .collect();
-    modules.sort_by(|a, b| a.0.cmp(&b.0));
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Alphabetical order is merge order, so anything later in this list wins
     // over what came before it.
-    for (i, (name, gate, combos)) in modules.iter().enumerate() {
+    for (i, module) in modules.iter().enumerate() {
+        let name = &module.name;
         let mut warnings: Vec<String> = Vec::new();
-        for (earlier_name, earlier_gate, earlier_combos) in &modules[..i] {
-            if !gates_overlap(gate.as_ref(), earlier_gate.as_ref()) {
+        for earlier in &modules[..i] {
+            if !gates_overlap(module.gate.as_ref(), earlier.gate.as_ref()) {
+                continue;
+            }
+            // Two members of the same exclusive group are never live together,
+            // so binding the same button in both is the point of the group —
+            // the same reasoning that exempts differently gated compositors.
+            if module.group.is_some() && module.group == earlier.group {
                 continue;
             }
             let mut shared: Vec<&(Event, Vec<Event>)> =
-                combos.intersection(earlier_combos).collect();
+                module.combos.intersection(&earlier.combos).collect();
             if shared.is_empty() {
                 continue;
             }
@@ -756,7 +859,7 @@ fn report_binding_conflicts(entries: &mut HashMap<String, ConfigEntry>) {
                 "overrides {} binding(s) from config {:?}: {} — \
                  both configs bind the same button, only this one takes effect",
                 shared.len(),
-                earlier_name,
+                earlier.name,
                 shared.iter()
                     .map(|(trigger, combo)| format!("{trigger:?}+{combo:?}"))
                     .collect::<Vec<_>>()

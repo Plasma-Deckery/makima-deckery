@@ -11,6 +11,7 @@ fn make_registry(entries: Vec<ConfigEntry>) -> Arc<ConfigRegistry> {
         roots: ConfigRoots { system: PathBuf::new(), user: PathBuf::new() },
         entries: Mutex::new(map),
         compositor: Mutex::new(None),
+        preferences: Mutex::new(crate::preferences::Preferences::default()),
     })
 }
 
@@ -793,6 +794,201 @@ fn a_missing_user_root_is_not_an_error() {
 
     let entries = ConfigRegistry::load_entries(&roots_at(&root));
     assert!(entries.contains_key("Steam Deck"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── Exclusive groups ──────────────────────────────────────────────────────────
+
+/// A module belonging to a set of mutually exclusive modules.
+fn grouped(name: &str, group: &str) -> Config {
+    let mut c = Config::new_empty(name.to_string());
+    c.module.exclusive_group = Some(group.to_string());
+    c
+}
+
+/// A registry whose preferences are written to a real (throwaway) user root, so
+/// `set_enabled` can persist without touching the running user's config.
+fn registry_with_user_root(entries: Vec<ConfigEntry>, user: &Path) -> Arc<ConfigRegistry> {
+    let map = entries.into_iter().map(|e| (e.name.clone(), e)).collect();
+    Arc::new(ConfigRegistry {
+        roots: ConfigRoots { system: PathBuf::new(), user: user.to_path_buf() },
+        entries: Mutex::new(map),
+        compositor: Mutex::new(None),
+        preferences: Mutex::new(Preferences::default()),
+    })
+}
+
+fn enabled_names(r: &ConfigRegistry) -> Vec<String> {
+    let mut names: Vec<String> = r.entries.lock().unwrap().values()
+        .filter(|e| e.enabled)
+        .map(|e| e.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn enabling_a_group_member_switches_its_siblings_off() {
+    let dir = scratch_dir("deckery-prefs-exclusive");
+    let r = registry_with_user_root(vec![
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), false),
+        wrap(grouped("Layout Grid",       "layout"), false),
+        wrap(module("Voice Control", None, 0), true),
+    ], &dir);
+
+    assert!(r.set_enabled("Layout Vertical", true));
+
+    assert_eq!(enabled_names(&r), vec!["Layout Vertical", "Voice Control"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_group_choice_survives_a_reload() {
+    let dir = scratch_dir("deckery-prefs-persist");
+    let r = registry_with_user_root(vec![
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), false),
+    ], &dir);
+
+    r.set_enabled("Layout Vertical", true);
+
+    let written = Preferences::load(&dir);
+    assert_eq!(written.group_choice("layout"), Some("Layout Vertical"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn disabling_a_module_is_recorded_as_a_preference() {
+    let dir = scratch_dir("deckery-prefs-disable");
+    let r = registry_with_user_root(vec![
+        wrap(module("Voice Control", None, 0), true),
+    ], &dir);
+
+    r.set_enabled("Voice Control", false);
+
+    assert_eq!(Preferences::load(&dir).modules.disabled, vec!["Voice Control".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_recorded_choice_is_restored_over_the_loaded_defaults() {
+    let mut entries: HashMap<String, ConfigEntry> = [
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    let mut prefs = Preferences::default();
+    prefs.set_group_choice("layout", "Layout Vertical", &HashSet::new());
+    apply_preferences(&mut entries, &prefs);
+
+    assert!(!entries["Layout Horizontal"].enabled);
+    assert!(entries["Layout Vertical"].enabled);
+}
+
+#[test]
+fn a_group_without_a_recorded_choice_activates_its_first_member() {
+    let mut entries: HashMap<String, ConfigEntry> = [
+        wrap(grouped("Layout Vertical", "layout"), true),
+        wrap(grouped("Layout Grid",     "layout"), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    apply_preferences(&mut entries, &Preferences::default());
+
+    assert!(entries["Layout Grid"].enabled);
+    assert!(!entries["Layout Vertical"].enabled);
+}
+
+#[test]
+fn a_choice_naming_a_removed_module_falls_back_to_the_first_member() {
+    let mut entries: HashMap<String, ConfigEntry> = [
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    let mut prefs = Preferences::default();
+    prefs.set_group_choice("layout", "Layout Diagonal", &HashSet::new());
+    apply_preferences(&mut entries, &prefs);
+
+    assert!(entries["Layout Horizontal"].enabled);
+    assert!(!entries["Layout Vertical"].enabled);
+}
+
+#[test]
+fn a_disabled_module_stays_disabled_after_reapplying_preferences() {
+    let mut entries: HashMap<String, ConfigEntry> = [
+        wrap(module("Voice Control", None, 0), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    let mut prefs = Preferences::default();
+    prefs.set_disabled("Voice Control", true);
+    apply_preferences(&mut entries, &prefs);
+
+    assert!(!entries["Voice Control"].enabled);
+}
+
+#[test]
+fn preferences_toml_is_not_discovered_as_a_config() {
+    let root = scratch_dir("deckery-prefs-not-a-config");
+    std::fs::write(root.join("Steam Deck.toml"), DECK).unwrap();
+    std::fs::write(root.join("preferences.toml"), "[modules]\ndisabled = []\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&roots_at(&root));
+
+    assert!(entries.contains_key("Steam Deck"));
+    assert!(!entries.contains_key("preferences"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn modules_in_the_same_exclusive_group_do_not_warn() {
+    let mut a = grouped("Layout Alpha", "layout");
+    let mut b = grouped("Layout Bravo", "layout");
+    a = with_binding(a, evdev::Key::BTN_DPAD_UP, evdev::Key::KEY_A);
+    b = with_binding(b, evdev::Key::BTN_DPAD_UP, evdev::Key::KEY_B);
+
+    let mut entries: HashMap<String, ConfigEntry> =
+        [wrap(a, true), wrap(b, true)].into_iter().map(|e| (e.name.clone(), e)).collect();
+    report_binding_conflicts(&mut entries);
+
+    assert!(warnings_of(&entries, "Layout Bravo").is_empty());
+}
+
+#[test]
+fn a_group_member_still_warns_about_an_ungrouped_module() {
+    let a = with_binding(module("Alpha", None, 0), evdev::Key::BTN_DPAD_UP, evdev::Key::KEY_A);
+    let b = with_binding(grouped("Bravo", "layout"), evdev::Key::BTN_DPAD_UP, evdev::Key::KEY_B);
+
+    let mut entries: HashMap<String, ConfigEntry> =
+        [wrap(a, true), wrap(b, true)].into_iter().map(|e| (e.name.clone(), e)).collect();
+    report_binding_conflicts(&mut entries);
+
+    assert_eq!(warnings_of(&entries, "Bravo").len(), 1);
+}
+
+#[test]
+fn a_group_choice_survives_a_restart() {
+    let root = scratch_dir("deckery-prefs-roundtrip");
+    std::fs::write(root.join("Steam Deck.toml"), DECK).unwrap();
+    for name in ["Layout Alpha", "Layout Bravo"] {
+        std::fs::write(
+            root.join(format!("{name}.toml")),
+            "[module]\nexclusive_group = \"layout\"\n",
+        ).unwrap();
+    }
+    // Both roots point at the same directory: preferences are written next to
+    // the configs, which is exactly the shape of a real user config dir.
+    let roots = ConfigRoots { system: root.clone(), user: root.clone() };
+
+    let first = ConfigRegistry::load(roots.clone());
+    assert!(first.set_enabled("Layout Bravo", true));
+
+    let second = ConfigRegistry::load(roots);
+    let entries = second.entries.lock().unwrap();
+    assert!(entries["Layout Bravo"].enabled);
+    assert!(!entries["Layout Alpha"].enabled);
+    drop(entries);
 
     let _ = std::fs::remove_dir_all(&root);
 }

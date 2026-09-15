@@ -11,6 +11,7 @@ fn summary(name: &str, kind: &'static str, parent: Option<&str>, enabled: bool) 
         name:    name.to_string(),
         kind,
         parent:  parent.map(str::to_string),
+        exclusive_group: None,
         enabled,
         errors:  vec![],
     }

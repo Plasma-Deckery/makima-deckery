@@ -113,6 +113,7 @@ pub(crate) fn build_json(
             "name":    e.name,
             "kind":    e.kind,
             "parent":  e.parent,
+            "exclusive_group": e.exclusive_group,
             "enabled": e.enabled,
             "status":  status,
             "errors":  e.errors.iter().map(|err| serde_json::json!({

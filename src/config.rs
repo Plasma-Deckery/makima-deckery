@@ -258,6 +258,9 @@ pub struct ModuleMetadata {
     pub match_window_class: Option<Vec<String>>,
     /// Applied only while this layout is active. Defaults to layout 0.
     pub layout: u16,
+    /// Name of a set of mutually exclusive modules. Activating one member
+    /// deactivates its siblings — see `ConfigRegistry::set_enabled`.
+    pub exclusive_group: Option<String>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -435,6 +438,7 @@ pub struct RawModuleMetadata {
     pub match_window_class: Option<Vec<String>>,
     #[serde(default)]
     pub layout: u16,
+    pub exclusive_group: Option<String>,
 }
 
 // ── RawConfig ─────────────────────────────────────────────────────────────────
@@ -563,6 +567,7 @@ impl Config {
             requires_compositor: raw_module.requires_compositor,
             match_window_class: raw_module.match_window_class,
             layout: raw_module.layout,
+            exclusive_group: raw_module.exclusive_group,
         };
         Self {
             name: file_name,
