@@ -5,10 +5,17 @@ use crate::udev_monitor::Client;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build a registry directly from a list of entries (bypasses the filesystem).
+///
+/// The user root is a throwaway directory rather than an empty path: a test that
+/// calls `set_enabled` persists preferences, and an empty root would resolve
+/// relative to the process's working directory — i.e. into the source tree.
 fn make_registry(entries: Vec<ConfigEntry>) -> Arc<ConfigRegistry> {
     let map = entries.into_iter().map(|e| (e.name.clone(), e)).collect();
     Arc::new(ConfigRegistry {
-        roots: ConfigRoots { system: PathBuf::new(), user: PathBuf::new() },
+        roots: ConfigRoots {
+            system: PathBuf::new(),
+            user:   std::env::temp_dir().join("deckery-test-registry"),
+        },
         entries: Mutex::new(map),
         compositor: Mutex::new(None),
         preferences: Mutex::new(crate::preferences::Preferences::default()),
