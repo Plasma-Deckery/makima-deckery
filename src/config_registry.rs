@@ -9,7 +9,11 @@
 //
 //   [device]  → base config; names the physical device it drives
 //   [module]  → activation conditions (window class, layout, compositor)
-//   [modules] → include list of plain modules merged into a base config
+//   neither   → plain module, merged into every base config
+//
+// Files are discovered by scanning two roots: the system config directory that
+// ships with the package, then the user's own, where a file of the same name
+// replaces the system version. Nothing has to list them.
 //
 // Runtime merging happens in resolve() at the point of use, so enabling or
 // disabling individual configs always takes effect immediately without a reload.
@@ -20,9 +24,10 @@
 // be activated even if enabled = true.
 
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use crate::config::Config;
+use crate::config::{Config, Event};
 use crate::udev_monitor::Client;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -54,9 +59,9 @@ pub struct ConfigEntry {
 pub struct ConfigSummary {
     pub name:    String,
     /// "base" (declares a device), "app" (matches a window class), "module"
-    /// (neither — only reachable through an include), or "unknown" (unparsed).
+    /// (neither — applies wherever it is merged), or "unknown" (unparsed).
     pub kind:    &'static str,
-    /// For modules: the config whose `[modules] include` pulls this one in.
+    /// For modules: the base config the tray nests this one under.
     pub parent:  Option<String>,
     pub enabled: bool,
     pub errors:  Vec<ConfigError>,
@@ -71,19 +76,88 @@ fn entry_kind(entry: &ConfigEntry) -> &'static str {
     }
 }
 
-/// The config that includes `name`, if any. A module included by more than one
-/// base reports the first match; nesting a module under two bases at once is
-/// not something the tray can draw, and not something any config does today.
+/// The base config a plain module is displayed under.
+///
+/// Since auto-discovery replaced the include list there is no declared
+/// relationship any more — every plain module applies to every base config. The
+/// tray still draws a tree, so it needs one name: the alphabetically first base.
+/// That is exact while a single device is configured, which is the only shape
+/// the tray was ever able to draw.
 fn parent_of(entries: &HashMap<String, ConfigEntry>, name: &str) -> Option<String> {
+    let module = entries.get(name)?.config.as_ref()?;
+    if !is_plain_module(module) {
+        return None;
+    }
     entries.values()
         .filter_map(|e| e.config.as_ref())
-        .find(|c| c.module_includes.iter().any(|i| i == name))
+        .filter(|c| c.device.is_some())
         .map(|c| c.name.clone())
+        .min()
+}
+
+// ── Config roots ──────────────────────────────────────────────────────────────
+
+/// The two directories configs are read from.
+///
+/// System configs ship with the package and are never written to. User configs
+/// are the user's own: a file there replaces the system file of the same name
+/// wholesale, which is what makes a surgical override possible without forking
+/// the whole config set.
+#[derive(Debug, Clone)]
+pub struct ConfigRoots {
+    pub system: PathBuf,
+    pub user:   PathBuf,
+}
+
+impl ConfigRoots {
+    /// Resolve both roots from the environment.
+    ///
+    /// User root: `DECKERY_CONFIG` (canonical) or `MAKIMA_CONFIG` (legacy name,
+    /// kept for hand-edited service overrides), else `~/.config/deckery`.
+    ///
+    /// System root: `DECKERY_SYSTEM_CONFIG`, else the git-install checkout, else
+    /// the packaged path. The checkout wins when both exist — somebody with a
+    /// working copy is running from it, and silently preferring the RPM's copy
+    /// would make their edits appear to do nothing.
+    pub fn resolve() -> Self {
+        let home = user_home();
+        let user = env::var("DECKERY_CONFIG")
+            .or_else(|_| env::var("MAKIMA_CONFIG"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(format!("{home}/.config/deckery")));
+
+        let checkout = PathBuf::from(format!("{home}/.local/share/deckery/deckery/configs"));
+        let system = match env::var("DECKERY_SYSTEM_CONFIG") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) if checkout.is_dir() => checkout,
+            Err(_) => PathBuf::from("/usr/share/deckery/configs"),
+        };
+
+        Self { system, user }
+    }
+}
+
+/// The invoking user's home directory. Under `sudo` the process sees `/root`
+/// while the configs that matter belong to the real user, so `SUDO_USER` wins
+/// in that one case.
+fn user_home() -> String {
+    match env::var("HOME") {
+        Ok(home) if home == "/root" => match env::var("SUDO_USER") {
+            Ok(sudo_user) => format!("/home/{sudo_user}"),
+            _ => home,
+        },
+        Ok(home) => home,
+        _ => "/root".to_string(),
+    }
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
 pub struct ConfigRegistry {
+    /// Where entries are loaded from. Fixed for the lifetime of the process;
+    /// `reload()` and the file watcher both read it instead of being handed a
+    /// path by callers that would have to agree on it.
+    roots: ConfigRoots,
     /// Keyed by config name (= file base name).
     entries: Mutex<HashMap<String, ConfigEntry>>,
     /// Name of the running compositor, as reported by XDG_CURRENT_DESKTOP
@@ -96,11 +170,12 @@ pub struct ConfigRegistry {
 impl ConfigRegistry {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    /// Load all `.toml` files from `config_dir` and its `apps/` subdirectory.
+    /// Load all `.toml` files from both roots and their `apps/` subdirectories.
     /// Never panics — parse errors are stored as ConfigEntry with config: None.
-    pub fn load(config_dir: &str) -> Arc<Self> {
+    pub fn load(roots: ConfigRoots) -> Arc<Self> {
         Arc::new(Self {
-            entries: Mutex::new(Self::load_entries(config_dir)),
+            entries: Mutex::new(Self::load_entries(&roots)),
+            roots,
             compositor: Mutex::new(None),
         })
     }
@@ -109,6 +184,7 @@ impl ConfigRegistry {
     #[cfg(test)]
     pub(crate) fn empty() -> Arc<Self> {
         Arc::new(Self {
+            roots: ConfigRoots { system: PathBuf::new(), user: PathBuf::new() },
             entries: Mutex::new(HashMap::new()),
             compositor: Mutex::new(None),
         })
@@ -119,6 +195,7 @@ impl ConfigRegistry {
     #[cfg(test)]
     pub(crate) fn from_entries(entries: Vec<ConfigEntry>) -> Arc<Self> {
         Arc::new(Self {
+            roots: ConfigRoots { system: PathBuf::new(), user: PathBuf::new() },
             entries: Mutex::new(entries.into_iter().map(|e| (e.name.clone(), e)).collect()),
             compositor: Mutex::new(None),
         })
@@ -131,8 +208,8 @@ impl ConfigRegistry {
     /// (udev_monitor, EventReader) see the update automatically.
     /// Preserves runtime-toggled `enabled` flags: if an entry existed before
     /// and was disabled via IPC, it stays disabled after reload.
-    pub fn reload(&self, config_dir: &str) {
-        let mut new_entries = Self::load_entries(config_dir);
+    pub fn reload(&self) {
+        let mut new_entries = Self::load_entries(&self.roots);
         let mut entries = self.entries.lock().unwrap();
         for (name, old) in entries.iter() {
             if let Some(new) = new_entries.get_mut(name) {
@@ -151,11 +228,11 @@ impl ConfigRegistry {
 
     // ── File watching ─────────────────────────────────────────────────────────
 
-    /// Start a file watcher over the entire config directory tree.
+    /// Start a file watcher over both config directory trees.
     ///
     /// Returns a `RecommendedWatcher` handle — drop it to stop watching.
     /// The `change_tx` channel receives a `()` unit whenever any `.toml` file
-    /// under `config_dir` (recursively) is created, modified, or removed.
+    /// under either root (recursively) is created, modified, or removed.
     ///
     /// The registry owns this logic because it is the only component that knows
     /// which directories it scans.  `udev_monitor` must not hardcode directory
@@ -168,7 +245,6 @@ impl ConfigRegistry {
     /// per-file watch.
     pub fn start_watcher(
         &self,
-        config_dir: &str,
         change_tx: tokio::sync::mpsc::Sender<()>,
     ) -> RecommendedWatcher {
         let mut watcher = RecommendedWatcher::new(
@@ -189,15 +265,23 @@ impl ConfigRegistry {
             notify::Config::default(),
         ).expect("Failed to create config file watcher");
 
-        // Watch the entire config tree recursively — no hardcoded subdirectory
-        // names; any new subdirectory added in the future is covered automatically.
-        watcher
-            .watch(Path::new(config_dir), RecursiveMode::Recursive)
-            .expect("Failed to watch config directory");
-
-        // Also watch the real parent directories of any symlinked .toml files.
-        for dir in Self::symlink_target_parents(Path::new(config_dir)) {
-            let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+        // Watch both trees recursively — no hardcoded subdirectory names; any
+        // new subdirectory added in the future is covered automatically.
+        //
+        // A missing directory is not fatal: the user root exists only once the
+        // user has actually overridden something, which most never do.
+        for root in [&self.roots.system, &self.roots.user] {
+            if !root.is_dir() {
+                continue;
+            }
+            if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+                eprintln!("deckery: cannot watch config dir {root:?}: {e}");
+                continue;
+            }
+            // Also watch the real parent directories of any symlinked .toml files.
+            for dir in Self::symlink_target_parents(root) {
+                let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+            }
         }
 
         watcher
@@ -260,7 +344,7 @@ impl ConfigRegistry {
         entries.values()
             .filter_map(|e| usable(e, compositor.as_deref()))
             .filter(|c| c.device.is_some())
-            .map(|c| with_includes(&entries, c, compositor.as_deref()))
+            .map(|c| with_modules(&entries, c, compositor.as_deref()))
             .collect()
     }
 
@@ -300,7 +384,7 @@ impl ConfigRegistry {
 
         let base_raw = usable(entries.get(base_name)?, compositor)
             .filter(|c| c.device.is_some())?;
-        let base = with_includes(&entries, base_raw, compositor);
+        let base = with_modules(&entries, base_raw, compositor);
 
         let client_class = match client {
             Client::Class(class, _, _) => Some(class.as_str()),
@@ -348,7 +432,7 @@ impl ConfigRegistry {
         for base_entry in entries.values() {
             let Some(base_raw) = usable(base_entry, compositor).filter(|c| c.device.is_some())
             else { continue };
-            let base = with_includes(&entries, base_raw, compositor);
+            let base = with_modules(&entries, base_raw, compositor);
             // The base alone, plus each module merged onto it — an app override
             // can move a key, so a hint may be fine in one stack and dead in another.
             let mut stacks: Vec<Config> = vec![base.clone()];
@@ -443,21 +527,21 @@ impl ConfigRegistry {
         self.compositor.lock().unwrap().clone()
     }
 
-    fn load_entries(config_dir: &str) -> HashMap<String, ConfigEntry> {
+    fn load_entries(roots: &ConfigRoots) -> HashMap<String, ConfigEntry> {
         let mut map = HashMap::new();
-        // Scan both the root config dir and the `apps/` subdirectory.
-        let dirs_to_scan: Vec<std::path::PathBuf> = {
-            let root = std::path::PathBuf::from(config_dir);
-            let apps = root.join("apps");
-            let mut v = vec![root];
-            if apps.is_dir() { v.push(apps); }
-            v
-        };
+        // System first, user second: entries are keyed by config name, so a user
+        // file of the same name simply overwrites the system entry as it is read.
+        // Within each root, the `apps/` subdirectory is scanned alongside it.
+        let dirs_to_scan: Vec<PathBuf> = [&roots.system, &roots.user]
+            .into_iter()
+            .flat_map(|root| [root.clone(), root.join("apps")])
+            .filter(|dir| dir.is_dir())
+            .collect();
 
         // Aliases are declared on the base config's [device] block but apply to
         // every file, so they must be known before the first file is parsed:
         // parse_event_name resolves names the moment a binding is read.
-        let aliases = collect_aliases(config_dir);
+        let aliases = collect_aliases(roots);
 
         for scan_dir in dirs_to_scan {
             let dir = match std::fs::read_dir(&scan_dir) {
@@ -497,15 +581,8 @@ impl ConfigRegistry {
             }
         }
 
-        // Inclusion is only knowable once every file has been read.
-        for name in orphan_configs(&map) {
-            eprintln!(
-                "deckery: config {:?} is never applied — it declares no [device], \
-                 no [module] match_window_class or layout, and no config includes \
-                 it via [modules] include",
-                name
-            );
-        }
+        // Only knowable once every file has been read.
+        report_binding_conflicts(&mut map);
 
         map
     }
@@ -513,14 +590,24 @@ impl ConfigRegistry {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
-/// Button aliases from every base config in the directory root. Modules and app
+/// Button aliases from every base config in either root. Modules and app
 /// overrides live in `apps/` or carry no `[device]` block, so they contribute
 /// nothing — the names belong to the hardware, and only a base config names it.
-fn collect_aliases(config_dir: &str) -> HashMap<String, String> {
+///
+/// Read system-first so a user base config redefining an alias wins, matching
+/// how the entries themselves are layered.
+fn collect_aliases(roots: &ConfigRoots) -> HashMap<String, String> {
     let mut aliases = HashMap::new();
+    for root in [&roots.system, &roots.user] {
+        collect_aliases_from(root, &mut aliases);
+    }
+    aliases
+}
+
+fn collect_aliases_from(config_dir: &Path, aliases: &mut HashMap<String, String>) {
     let dir = match std::fs::read_dir(config_dir) {
         Ok(d) => d,
-        Err(_) => return aliases,
+        Err(_) => return,
     };
     for file in dir.flatten() {
         let filename = file.file_name().into_string().unwrap_or_default();
@@ -545,37 +632,12 @@ fn collect_aliases(config_dir: &str) -> HashMap<String, String> {
             }
         }
     }
-    aliases
 }
 
 /// The config of an entry that may take part in resolution: enabled, parsed
 /// successfully, and — if it declares `requires_compositor` — matching the
 /// compositor this session is running under. Every query funnels through here
 /// so "usable" means exactly one thing across the registry.
-/// Names of configs that no code path can reach: not a base config, not
-/// activated by a window class or a layout, and not pulled in by anyone.
-/// Dropping the `::` convention made this state reachable by accident — a file
-/// that used to bind by its name now binds to nothing at all, silently.
-pub(crate) fn orphan_configs(entries: &HashMap<String, ConfigEntry>) -> Vec<String> {
-    let included: HashSet<&str> = entries.values()
-        .filter_map(|e| e.config.as_ref())
-        .flat_map(|c| c.module_includes.iter().map(String::as_str))
-        .collect();
-
-    let mut orphans: Vec<String> = entries.values()
-        .filter_map(|e| e.config.as_ref())
-        .filter(|c| {
-            c.device.is_none()
-                && c.module.match_window_class.is_none()
-                && c.module.layout == 0
-                && !included.contains(c.name.as_str())
-        })
-        .map(|c| c.name.clone())
-        .collect();
-    orphans.sort();
-    orphans
-}
-
 fn usable<'a>(entry: &'a ConfigEntry, compositor: Option<&str>) -> Option<&'a Config> {
     let config = entry.config.as_ref().filter(|_| entry.enabled)?;
     match config.module.requires_compositor.as_deref() {
@@ -584,54 +646,130 @@ fn usable<'a>(entry: &'a ConfigEntry, compositor: Option<&str>) -> Option<&'a Co
     }
 }
 
-/// Apply the plain modules a config pulls in via `[modules] include`.
+/// A config that applies wherever it is merged: it names no device, matches no
+/// window class, and belongs to no layout but the base one. These are the files
+/// auto-discovery pulls in — everything else is activated by a condition.
+fn is_plain_module(config: &Config) -> bool {
+    config.device.is_none()
+        && config.module.match_window_class.is_none()
+        && config.module.layout == 0
+}
+
+/// Merge every usable plain module into `config`.
 ///
-/// Includes are the *lowest* priority layer: the including config's own
-/// bindings win over anything a module provides, and later includes win over
-/// earlier ones. An include that resolves to no usable entry is skipped rather
-/// than failing the whole config — a module gated behind a `requires_compositor`
-/// this session does not satisfy is simply absent.
-fn with_includes(
+/// Modules are the *lowest* priority layer: the base config's own bindings win
+/// over anything a module provides. Among modules the alphabetically later name
+/// wins. That rule is arbitrary but deterministic, and it is not meant to be
+/// used — two modules claiming one binding is a config bug, reported at load
+/// time by `report_binding_conflicts()` instead of being settled quietly here.
+fn with_modules(
     entries: &HashMap<String, ConfigEntry>,
     config: &Config,
     compositor: Option<&str>,
 ) -> Config {
-    if config.module_includes.is_empty() {
+    let mut modules: Vec<&Config> = entries.values()
+        .filter_map(|e| usable(e, compositor))
+        .filter(|c| is_plain_module(c))
+        .collect();
+    if modules.is_empty() {
         return config.clone();
     }
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
+
     // merge_base lets `self` win over its argument, so building the stack
-    // back-to-front is what makes later includes outrank earlier ones.
+    // back-to-front is what makes later modules outrank earlier ones.
     let mut stack = Config::new_empty(config.name.clone());
-    for name in config.module_includes.iter().rev() {
-        match entries.get(name) {
-            // A module the user disabled, or one gated behind a compositor this
-            // session does not run, is absent by design. Only a name matching no
-            // file at all is a mistake worth reporting — folding the two together
-            // buries the typo in per-switch noise.
-            Some(entry) => {
-                if let Some(module) = usable(entry, compositor) {
-                    stack.merge_base(module);
-                }
-            }
-            None => eprintln!(
-                "deckery: config {:?}: included module {:?} does not exist",
-                config.name, name
-            ),
-        }
+    for module in modules.iter().rev() {
+        stack.merge_base(module);
     }
 
     let mut merged = config.clone();
     merged.merge_base(&stack);
     // merge_base treats its argument as the device-level authority and copies
     // Gaming Mode wholesale from it. Here the roles are reversed — plain modules
-    // describe no hardware — so the including config keeps its own.
+    // describe no hardware — so the base config keeps its own.
     merged.gaming_mode_config = config.gaming_mode_config.clone();
     // merge_base also records pre-merge bindings so state_export can tell "own"
-    // from "inherited". Includes are part of what this config *is*, not an
+    // from "inherited". Modules are part of what this config *is*, not an
     // override on top of it; resolve() sets the marker again if a conditional
     // module applies.
     merged.override_bindings = None;
     merged
+}
+
+/// Every button combination a config binds, whatever the binding type.
+fn bound_combos(config: &Config) -> HashSet<(Event, Vec<Event>)> {
+    let b = &config.bindings;
+    let mut out = HashSet::new();
+    for (trigger, combos) in &b.remap {
+        out.extend(combos.keys().map(|combo| (*trigger, combo.clone())));
+    }
+    for (trigger, combos) in &b.commands {
+        out.extend(combos.keys().map(|combo| (*trigger, combo.clone())));
+    }
+    for (trigger, combos) in &b.movements {
+        out.extend(combos.keys().map(|combo| (*trigger, combo.clone())));
+    }
+    out
+}
+
+/// Two modules can only collide if they can be active at the same time. Ones
+/// gated to different compositors never are — KDE and Hyprland modules binding
+/// the same button is the normal case, not a mistake.
+fn gates_overlap(a: Option<&String>, b: Option<&String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+/// Attach a warning to every plain module that takes a binding away from
+/// another one.
+///
+/// The merge order settles the collision deterministically, but silently: the
+/// losing binding simply never fires, and nothing about the two files says why.
+/// The warning names both configs so the fix is obvious. It lands on the winner
+/// because that is the file whose binding is actually in effect.
+fn report_binding_conflicts(entries: &mut HashMap<String, ConfigEntry>) {
+    let mut modules: Vec<(String, Option<String>, HashSet<(Event, Vec<Event>)>)> = entries.values()
+        .filter_map(|e| e.config.as_ref())
+        .filter(|c| is_plain_module(c))
+        .map(|c| (c.name.clone(), c.module.requires_compositor.clone(), bound_combos(c)))
+        .collect();
+    modules.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Alphabetical order is merge order, so anything later in this list wins
+    // over what came before it.
+    for (i, (name, gate, combos)) in modules.iter().enumerate() {
+        let mut warnings: Vec<String> = Vec::new();
+        for (earlier_name, earlier_gate, earlier_combos) in &modules[..i] {
+            if !gates_overlap(gate.as_ref(), earlier_gate.as_ref()) {
+                continue;
+            }
+            let mut shared: Vec<&(Event, Vec<Event>)> =
+                combos.intersection(earlier_combos).collect();
+            if shared.is_empty() {
+                continue;
+            }
+            shared.sort();
+            warnings.push(format!(
+                "overrides {} binding(s) from config {:?}: {} — \
+                 both configs bind the same button, only this one takes effect",
+                shared.len(),
+                earlier_name,
+                shared.iter()
+                    .map(|(trigger, combo)| format!("{trigger:?}+{combo:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        for message in warnings {
+            eprintln!("deckery: config {name:?}: {message}");
+            if let Some(entry) = entries.get_mut(name) {
+                entry.errors.push(ConfigError { severity: "warning", message });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

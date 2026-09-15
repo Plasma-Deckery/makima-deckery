@@ -30,7 +30,6 @@ fn config_with(name: &str, bindings: Bindings) -> Config {
         gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: HashMap::new(),
     }
 }
@@ -229,7 +228,6 @@ fn parse_raw_config_populates_while_gaming_for_remap() {
         gaming_mode: None,
         device: None,
         module: Default::default(),
-        modules: Default::default(),
     };
     let (bindings, _, _) = parse_raw_config(raw, &HashMap::new());
     let btn_south = Event::Key(Key::BTN_SOUTH);
@@ -269,7 +267,6 @@ fn parse_raw_config_populates_while_gaming_for_command() {
         gaming_mode: None,
         device: None,
         module: Default::default(),
-        modules: Default::default(),
     };
     let (bindings, _, _) = parse_raw_config(raw, &HashMap::new());
     let btn_mode = Event::Key(Key::BTN_MODE);
@@ -350,7 +347,6 @@ fn raw_with_remap(remap: HashMap<String, RemapValue>) -> RawConfig {
         gaming_mode: None,
         device: None,
         module: Default::default(),
-        modules: Default::default(),
     }
 }
 

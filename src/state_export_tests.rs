@@ -44,7 +44,6 @@ fn make_config(
         gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: Default::default(),
     }
 }
@@ -577,7 +576,6 @@ fn override_remap_hides_base_command() {
             gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: Default::default(),
         }
     };
@@ -600,7 +598,6 @@ fn override_remap_hides_base_command() {
             gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: Default::default(),
         }
     };
@@ -655,7 +652,6 @@ fn override_clears_base_label() {
         gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: Default::default(),
     };
 
@@ -673,7 +669,6 @@ fn override_clears_base_label() {
         gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: Default::default(),
     };
 
@@ -719,7 +714,6 @@ fn override_label_replaces_base_label() {
         gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: Default::default(),
     };
 
@@ -739,7 +733,6 @@ fn override_label_replaces_base_label() {
         gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: Default::default(),
     };
 
@@ -816,7 +809,6 @@ fn origin_override_vs_base() {
         gaming_mode_config: Default::default(),
         device: None,
         module: Default::default(),
-        module_includes: Vec::new(),
         aliases: Default::default(),
     };
 

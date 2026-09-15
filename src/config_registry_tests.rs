@@ -8,6 +8,7 @@ use crate::udev_monitor::Client;
 fn make_registry(entries: Vec<ConfigEntry>) -> Arc<ConfigRegistry> {
     let map = entries.into_iter().map(|e| (e.name.clone(), e)).collect();
     Arc::new(ConfigRegistry {
+        roots: ConfigRoots { system: PathBuf::new(), user: PathBuf::new() },
         entries: Mutex::new(map),
         compositor: Mutex::new(None),
     })
@@ -194,12 +195,11 @@ fn unconditional_module_visible_regardless_of_compositor() {
     assert_eq!(r.window_class_modules().len(), 1);
 }
 
-// ── [modules] include ─────────────────────────────────────────────────────────
+// ── Automatic module merging ──────────────────────────────────────────────────
 
 #[test]
-fn included_module_bindings_are_merged_into_base() {
-    let mut b = base("Steam Deck", &["Steam Deck"]);
-    b.module_includes = vec!["gestures".into()];
+fn plain_module_bindings_are_merged_into_base() {
+    let b = base("Steam Deck", &["Steam Deck"]);
     let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
 
     let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
@@ -208,9 +208,8 @@ fn included_module_bindings_are_merged_into_base() {
 }
 
 #[test]
-fn base_binding_wins_over_included_module() {
-    let mut b = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
-    b.module_includes = vec!["gestures".into()];
+fn base_binding_wins_over_module() {
+    let b = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
     let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
 
     let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
@@ -219,42 +218,65 @@ fn base_binding_wins_over_included_module() {
 }
 
 #[test]
-fn later_include_wins_over_earlier() {
-    let mut b = base("Steam Deck", &["Steam Deck"]);
-    b.module_includes = vec!["first".into(), "second".into()];
-    let first  = with_binding(module("first",  None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
-    let second = with_binding(module("second", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+fn alphabetically_last_module_wins_over_earlier_one() {
+    // Colliding bindings are a config bug, reported by report_binding_conflicts.
+    // Order is fixed alphabetically so the outcome is at least deterministic,
+    // and the warning lands on the config that actually took effect.
+    let first  = with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let second = with_binding(module("bbb", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
 
-    let r = make_registry(vec![wrap(b, true), wrap(first, true), wrap(second, true)]);
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(first, true),
+        wrap(second, true),
+    ]);
     let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
 }
 
 #[test]
-fn missing_include_is_skipped_not_fatal() {
-    let mut b = base("Steam Deck", &["Steam Deck"]);
-    b.module_includes = vec!["does-not-exist".into()];
-    let r = make_registry(vec![wrap(b, true)]);
-    assert!(r.resolve("Steam Deck", &Client::Default, 0).is_some());
-}
-
-#[test]
-fn include_gated_by_compositor_is_skipped() {
-    let mut b = base("Steam Deck", &["Steam Deck"]);
-    b.module_includes = vec!["kde-only".into()];
+fn module_gated_to_another_compositor_is_not_merged() {
     let mut m = with_binding(module("kde-only", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     m.module.requires_compositor = Some("KDE".into());
 
-    let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(m, true),
+    ]);
     r.set_compositor(Some("Hyprland".into()));
     let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
     assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 }
 
 #[test]
-fn included_module_does_not_override_base_gaming_mode() {
+fn disabled_module_is_not_merged() {
+    let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(m, false),
+    ]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+}
+
+#[test]
+fn app_and_layout_modules_are_not_merged_into_base() {
+    let app    = with_binding(module("konsole", Some("org.kde.konsole"), 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let layout = with_binding(module("layer2", None, 2), evdev::Key::BTN_NORTH, evdev::Key::KEY_B);
+
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(app, true),
+        wrap(layout, true),
+    ]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+    assert!(!has_binding(&cfg, evdev::Key::BTN_NORTH, evdev::Key::KEY_B));
+}
+
+#[test]
+fn module_does_not_override_base_gaming_mode() {
     let mut b = base("Steam Deck", &["Steam Deck"]);
-    b.module_includes = vec!["gestures".into()];
     b.gaming_mode_config.auto_detect_steam_games = false;
 
     let r = make_registry(vec![wrap(b, true), wrap(module("gestures", None, 0), true)]);
@@ -458,11 +480,9 @@ fn snapshot_reports_kind_per_entry() {
 }
 
 #[test]
-fn snapshot_reports_including_config_as_parent() {
-    let mut deck = base("Steam Deck", &["Steam Deck"]);
-    deck.module_includes = vec!["Voice Control".to_string()];
+fn snapshot_nests_plain_modules_under_the_base_config() {
     let r = make_registry(vec![
-        wrap(deck, true),
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap(module("Voice Control", None, 0), true),
         wrap(module("Konsole", Some("org.kde.konsole"), 0), true),
     ]);
@@ -551,32 +571,69 @@ fn base_config_error_cleared_after_entry_replaced() {
     assert!(r.base_config_error().is_none());
 }
 
-// ── orphan_configs ────────────────────────────────────────────────────────────
+// ── Binding conflicts ─────────────────────────────────────────────────────────
 
 fn map_of(configs: Vec<Config>) -> HashMap<String, ConfigEntry> {
     configs.into_iter().map(|c| (c.name.clone(), wrap(c, true))).collect()
 }
 
-#[test]
-fn orphan_configs_flags_unreachable_module() {
-    let m = map_of(vec![
-        base("Steam Deck", &["Steam Deck"]),
-        module("stray", None, 0),
-    ]);
-    assert_eq!(orphan_configs(&m), vec!["stray".to_string()]);
+fn warnings_of(entries: &HashMap<String, ConfigEntry>, name: &str) -> Vec<String> {
+    entries[name].errors.iter()
+        .filter(|e| e.severity == "warning")
+        .map(|e| e.message.clone())
+        .collect()
 }
 
 #[test]
-fn orphan_configs_ignores_reachable_entries() {
-    let mut b = base("Steam Deck", &["Steam Deck"]);
-    b.module_includes = vec!["kde-gestures".to_string()];
-    let m = map_of(vec![
-        b,
-        module("kde-gestures", None, 0),   // reachable via include
-        module("konsole", Some("org.kde.konsole"), 0), // reachable via window class
-        module("layout-two", None, 2),     // reachable via layout
+fn colliding_modules_warn_on_the_losing_config() {
+    let mut m = map_of(vec![
+        with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
+        with_binding(module("bbb", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
     ]);
-    assert!(orphan_configs(&m).is_empty());
+    report_binding_conflicts(&mut m);
+
+    assert!(warnings_of(&m, "aaa").is_empty());
+    let bbb = warnings_of(&m, "bbb");
+    assert_eq!(bbb.len(), 1);
+    assert!(bbb[0].contains("aaa"), "warning must name the config it collides with: {}", bbb[0]);
+}
+
+#[test]
+fn distinct_bindings_do_not_warn() {
+    let mut m = map_of(vec![
+        with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
+        with_binding(module("bbb", None, 0), evdev::Key::BTN_NORTH, evdev::Key::KEY_B),
+    ]);
+    report_binding_conflicts(&mut m);
+    assert!(warnings_of(&m, "bbb").is_empty());
+}
+
+#[test]
+fn modules_gated_to_different_compositors_do_not_warn() {
+    // KDE and Hyprland modules never load together, so identical bindings in
+    // both are the intended translation of one gesture, not a conflict.
+    let mut kde = with_binding(module("KDE Desktop", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    kde.module.requires_compositor = Some("KDE".into());
+    let mut hypr = with_binding(module("Hyprland Desktop", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    hypr.module.requires_compositor = Some("Hyprland".into());
+
+    let mut m = map_of(vec![kde, hypr]);
+    report_binding_conflicts(&mut m);
+    assert!(warnings_of(&m, "KDE Desktop").is_empty());
+    assert!(warnings_of(&m, "Hyprland Desktop").is_empty());
+}
+
+#[test]
+fn base_and_app_configs_are_exempt_from_conflict_reporting() {
+    // Only plain modules stack on top of each other; a base config is expected
+    // to override its modules, and an app config only applies to its window.
+    let mut m = map_of(vec![
+        with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
+        with_binding(module("konsole", Some("org.kde.konsole"), 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
+        with_binding(module("zzz", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_C),
+    ]);
+    report_binding_conflicts(&mut m);
+    assert!(warnings_of(&m, "zzz").is_empty());
 }
 
 // ── Alias collection ──────────────────────────────────────────────────────────
@@ -586,9 +643,7 @@ fn orphan_configs_ignores_reachable_entries() {
 /// substituted name and never point at the entry that needs fixing.
 #[test]
 fn collect_aliases_drops_entries_pointing_at_unknown_events() {
-    let dir = std::env::temp_dir().join("deckery_alias_collect_test");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("deckery_alias_collect_test");
     std::fs::write(dir.join("Steam Deck.toml"), r#"
 [device]
 class = "hid-steam"
@@ -596,7 +651,7 @@ names = ["Steam Deck"]
 aliases = { L1 = "BTN_TL", Broken = "BTN_TYPO" }
 "#).unwrap();
 
-    let aliases = collect_aliases(dir.to_str().unwrap());
+    let aliases = collect_aliases(&roots_at(&dir));
 
     assert_eq!(aliases.get("L1").map(String::as_str), Some("BTN_TL"));
     assert!(!aliases.contains_key("Broken"), "alias with unknown target must be dropped");
@@ -607,9 +662,7 @@ aliases = { L1 = "BTN_TL", Broken = "BTN_TYPO" }
 /// Aliases come from base configs in the directory root; a module contributes none.
 #[test]
 fn collect_aliases_reads_every_root_file() {
-    let dir = std::env::temp_dir().join("deckery_alias_collect_root_test");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("deckery_alias_collect_root_test");
     std::fs::write(dir.join("Steam Deck.toml"), r#"
 [device]
 class = "hid-steam"
@@ -618,9 +671,78 @@ aliases = { A = "BTN_SOUTH" }
 "#).unwrap();
     std::fs::write(dir.join("kde-desktop.toml"), "[module]\nrequires_compositor = \"KDE\"\n").unwrap();
 
-    let aliases = collect_aliases(dir.to_str().unwrap());
+    let aliases = collect_aliases(&roots_at(&dir));
     assert_eq!(aliases.len(), 1);
     assert_eq!(aliases.get("A").map(String::as_str), Some("BTN_SOUTH"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Two-root discovery ────────────────────────────────────────────────────────
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Roots where only the system dir exists — the shape of a fresh install.
+fn roots_at(system: &Path) -> ConfigRoots {
+    ConfigRoots { system: system.to_path_buf(), user: system.join("nonexistent-user-root") }
+}
+
+const DECK: &str = r#"
+[device]
+class = "hid-steam"
+names = ["Steam Deck"]
+"#;
+
+#[test]
+fn every_toml_in_both_roots_is_discovered_without_being_listed() {
+    let root = scratch_dir("deckery_discovery_test");
+    let system = root.join("system");
+    let user   = root.join("user");
+    std::fs::create_dir_all(system.join("apps")).unwrap();
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(system.join("Steam Deck.toml"), DECK).unwrap();
+    std::fs::write(system.join("KDE Desktop.toml"), "[module]\n").unwrap();
+    std::fs::write(system.join("apps/Konsole.toml"), "[module]\nmatch_window_class = [\"org.kde.konsole\"]\n").unwrap();
+    std::fs::write(user.join("My Module.toml"), "[module]\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&ConfigRoots { system, user });
+    let mut names: Vec<&String> = entries.keys().collect();
+    names.sort();
+    assert_eq!(names, vec!["KDE Desktop", "Konsole", "My Module", "Steam Deck"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn user_file_replaces_the_system_file_of_the_same_name() {
+    let root = scratch_dir("deckery_override_test");
+    let system = root.join("system");
+    let user   = root.join("user");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(system.join("KDE Desktop.toml"), "[module]\nrequires_compositor = \"KDE\"\n").unwrap();
+    std::fs::write(user.join("KDE Desktop.toml"), "[module]\nrequires_compositor = \"Hyprland\"\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&ConfigRoots { system, user });
+    assert_eq!(entries.len(), 1);
+    let config = entries["KDE Desktop"].config.as_ref().unwrap();
+    assert_eq!(config.module.requires_compositor.as_deref(), Some("Hyprland"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_missing_user_root_is_not_an_error() {
+    let root = scratch_dir("deckery_no_user_root_test");
+    std::fs::write(root.join("Steam Deck.toml"), DECK).unwrap();
+
+    let entries = ConfigRegistry::load_entries(&roots_at(&root));
+    assert!(entries.contains_key("Steam Deck"));
+
+    let _ = std::fs::remove_dir_all(&root);
 }

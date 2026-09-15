@@ -13,24 +13,21 @@ This dual source of truth made runtime enable/disable of individual configs impo
 
 ## How a config declares what it is
 
-A config declares its role through its **content**, never through its filename. All `.toml` files in the config directory and its `apps/` subdirectory are loaded into the registry as equals; what distinguishes them is which sections they carry.
+A config declares its role through its **content**, never through its filename. All `.toml` files in the config directories and their `apps/` subdirectories are loaded into the registry as equals; what distinguishes them is which sections they carry.
 
 | Section | Role |
 |---|---|
 | `[device]` | **Base config** — names the physical device it drives |
 | `[module]` | **Conditional module** — activation conditions (window class, layout, compositor) |
-| `[modules] include` | **Composition** — plain modules merged into this config |
+| neither | **Plain module** — merged into every base config |
 
-A file with none of these is a *plain module*: inert on its own, usable only by being named in someone else's `include` list.
+There is no include list. A plain module applies by existing in a config directory, which means adding a feature is dropping in a file and removing it is deleting one — no second place to keep in sync.
 
 ```toml
 # Steam Deck.toml — a base config
 [device]
 class = "hid-steam"                       # or "evdev"
 names = ["Steam Deck", "Valve Software"]  # substring-matched against the evdev name
-
-[modules]
-include = ["kde-gestures", "media-keys"]  # later entries outrank earlier ones
 ```
 
 ```toml
@@ -43,11 +40,25 @@ requires_compositor = "KDE"               # optional gate
 
 `names` entries are matched as substrings against the kernel-reported evdev device name, so one base config covers every naming variant of the same hardware.
 
+## The two roots
+
+`ConfigRoots::resolve()` picks the two directories that are scanned, in this order:
+
+| Root | Where |
+|---|---|
+| system | `$DECKERY_SYSTEM_CONFIG`, else `~/.local/share/deckery/deckery/configs` if that checkout exists, else `/usr/share/deckery/configs` |
+| user | `$DECKERY_CONFIG`, else `$MAKIMA_CONFIG`, else `~/.config/deckery` |
+
+Entries are keyed by file base name and the system root is read first, so a user file of the same name **replaces** the system one outright. That is the entire override mechanism: nothing is copied at install time, and an update to a shipped config reaches every user who has not overridden that specific file.
+
+Only the system root has to exist. The user root stays absent until someone writes an override, and a missing one is not an error.
+
 ## Architecture
 
 ```
 main.rs
-  → ConfigRegistry::load(config_dir)     // read disk, parse, validate
+  → ConfigRoots::resolve()               // system + user config directory
+  → ConfigRegistry::load(roots)          // read disk, parse, validate
   → Arc<ConfigRegistry>                  // shared via clone — one instance
   → udev_monitor::start_monitoring_udev(registry, ..., ipc_tx)
       → registry.set_compositor(...)      // once, after the environment is resolved
@@ -87,11 +98,11 @@ Files that fail to parse are stored with `config: None`. They appear in `state.j
 
 | Method | Used by | Purpose |
 |---|---|---|
-| `load(config_dir) -> Arc<Self>` | `main.rs` | Create registry from disk at startup |
-| `reload(config_dir)` | `udev_monitor` | In-place update on file-watcher event — preserves runtime enabled flags |
+| `load(roots) -> Arc<Self>` | `main.rs` | Create registry from both roots at startup |
+| `reload()` | `udev_monitor` | In-place update on file-watcher event — preserves runtime enabled flags |
 | `set_compositor(Option<String>)` | `udev_monitor` | Record the session compositor; gates `requires_compositor` modules |
 | `any_device_matches(evdev_name) -> bool` | `udev_monitor` | Is this evdev node claimed by a base config? |
-| `base_configs() -> Vec<Config>` | `udev_monitor` | Declared device targets, includes already merged |
+| `base_configs() -> Vec<Config>` | `udev_monitor` | Declared device targets, plain modules already merged |
 | `window_class_modules() -> Vec<Config>` | `active_client` | Modules that declare a `match_window_class` |
 | `resolve(base_name, client, layout) -> Option<Config>` | `EventReader` | Merged active config for the current window |
 | `set_enabled(name, bool)` | `EventReader` IPC | Toggle config on/off |
@@ -108,16 +119,16 @@ Every query filters entries through the same predicate: the entry must be `enabl
 
 Merge order, lowest priority first:
 
-1. **Plain modules** named in the base config's `[modules] include`. Later entries in the list outrank earlier ones.
+1. **Every usable plain module**, sorted by name. The alphabetically last one outranks the earlier ones.
 2. **The base config** — the usable entry with that name, which must have a `[device]` section.
 3. **The conditional module** matching the current window class and layout. Exact window-class match wins; otherwise a layout-only module (`layout != 0`, no `match_window_class`) is used.
 
 Returns `None` when the name identifies no usable base config, or when a layout other than 0 is requested and no module covers it. The latter is deliberate: it lets `change_active_layout()` skip unpopulated layout slots instead of cycling into an empty one.
 
-Two asymmetries are worth knowing about, since both are load-bearing in `with_includes()`:
+Two asymmetries are worth knowing about, since both are load-bearing in `with_modules()`:
 
-- `merge_base()` lets `self` win over its argument, so the include stack is built **back to front** — that is what makes later includes outrank earlier ones.
-- `merge_base()` treats its argument as the *device-level authority* and copies `gaming_mode_config` from it wholesale. With includes the roles are reversed (plain modules describe no hardware), so the including config's Gaming Mode settings are restored after the merge.
+- `merge_base()` lets `self` win over its argument, so the module stack is built **back to front** — that is what makes the alphabetically last module outrank the earlier ones.
+- `merge_base()` treats its argument as the *device-level authority* and copies `gaming_mode_config` from it wholesale. Here the roles are reversed (plain modules describe no hardware), so the base config's Gaming Mode settings are restored after the merge.
 
 ## reload() and enabled flag preservation
 
@@ -138,9 +149,13 @@ Configs that fail to parse:
 - Cannot be activated even via `set_enabled(true)` — every query filters `config: None` entries
 - Are automatically re-enabled when the file is fixed and the watcher triggers a reload
 
-## Orphan configs
+## Binding conflicts
 
-Dropping the filename convention made a new failure mode reachable: a `.toml` that binds to nothing. `orphan_configs()` runs once after loading and warns for every config that declares no `[device]`, no `[module] match_window_class` and no layout, and that no other config pulls in via `[modules] include`. Such a file parses cleanly and is simply never applied — without the warning that would be silent.
+Plain modules all stack onto the same base config, so two of them binding the same button is a config bug: one silently wins and the other's binding is never reachable. There is deliberately **no priority field** to resolve this — a priority field would make the collision legitimate and hide the mistake instead of showing it.
+
+Instead `report_binding_conflicts()` runs once after loading, walks the modules in name order, and for each one compares its bound `(trigger, combo)` pairs against every module that comes before it. An overlap produces a `warning` on the module that *wins*, naming the one it shadows. The warning reaches `state.json`, so the tray shows the config yellow rather than the collision being visible only in the journal.
+
+Modules gated to different compositors are excluded: `KDE Desktop` and `Hyprland Desktop` never load together, so binding the same button in both is the intended translation of one gesture, not a conflict. Base configs and app overrides are excluded too — they are *meant* to override the modules under them.
 
 ## IPC socket architecture
 
@@ -164,4 +179,4 @@ Names are plain filenames — there is no naming convention to decode.
 
 ## Tests
 
-`src/config_registry_tests.rs` covers: `any_device_matches`, `base_configs`, `window_class_modules`, `requires_compositor` gating, `[modules] include` merge order and Gaming Mode preservation, `resolve` (keyed on config name, window-class match, layout-only fallback, empty-layout `None`, disabled entry filtered, no base config), `set_enabled`, `snapshot`, and `base_config_error`.
+`src/config_registry_tests.rs` covers: `any_device_matches`, `base_configs`, `window_class_modules`, `requires_compositor` gating, automatic module merging (merge order and Gaming Mode preservation), binding-conflict warnings, two-root discovery and override, `resolve` (keyed on config name, window-class match, layout-only fallback, empty-layout `None`, disabled entry filtered, no base config), `set_enabled`, `snapshot`, and `base_config_error`.

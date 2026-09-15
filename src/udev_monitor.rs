@@ -107,7 +107,7 @@ fn lizard_cfg_from_base(base: Option<crate::config::Config>) -> Option<LizardMod
     LizardModeSuppression::from_setting(setting)
 }
 
-pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: String, mut tasks: Vec<JoinHandle<()>>, gaming_mode: Arc<Mutex<bool>>, state_tx: StateWriterHandle, ipc_tx: broadcast::Sender<String>) {
+pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec<JoinHandle<()>>, gaming_mode: Arc<Mutex<bool>>, state_tx: StateWriterHandle, ipc_tx: broadcast::Sender<String>) {
     let environment = set_environment();
     // Modules gated by `[module] requires_compositor` can only be judged once
     // the session environment is known, which is later than registry load time.
@@ -174,7 +174,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<()>(1);
     // The registry owns all file-watching logic — it knows which directories it
     // scans and watches them recursively.  Keep the handle alive for the loop.
-    let _config_watcher = registry.start_watcher(&config_dir, config_tx);
+    let _config_watcher = registry.start_watcher(config_tx);
 
     loop {
         tokio::select! {
@@ -213,7 +213,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, config_dir: St
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 println!("---------------------\n\nConfig changed, reloading...\n");
                 let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
-                registry.reload(&config_dir);
+                registry.reload();
                 let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(registry.snapshot()));
                 report_base_config_error(&registry, &state_tx);
                 release_held_modifiers(&virt_dev, &prev_modifiers).await;

@@ -416,7 +416,7 @@ impl GamingModeConfig {
     }
 }
 
-// ── Raw TOML types for [device] / [module] / [modules] ───────────────────────
+// ── Raw TOML types for [device] / [module] ───────────────────────────────────
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct RawDeviceDeclaration {
@@ -435,12 +435,6 @@ pub struct RawModuleMetadata {
     pub match_window_class: Option<Vec<String>>,
     #[serde(default)]
     pub layout: u16,
-}
-
-#[derive(serde::Deserialize, Debug, Clone, Default)]
-pub struct RawModuleIncludes {
-    #[serde(default)]
-    pub include: Vec<String>,
 }
 
 // ── RawConfig ─────────────────────────────────────────────────────────────────
@@ -468,8 +462,6 @@ pub struct RawConfig {
     pub device: Option<RawDeviceDeclaration>,
     #[serde(default)]
     pub module: RawModuleMetadata,
-    #[serde(default)]
-    pub modules: RawModuleIncludes,
 }
 
 #[derive(Debug, Clone)]
@@ -494,8 +486,6 @@ pub struct Config {
     pub device: Option<DeviceDeclaration>,
     /// Module-level metadata — activation conditions for non-base configs.
     pub module: ModuleMetadata,
-    /// Names of plain modules to merge in, from `[modules] include = [...]`.
-    pub module_includes: Vec<String>,
     /// Button aliases in effect while this file was parsed, kept so settings
     /// read later at runtime (`LSTICK_ACTIVATION_MODIFIERS`) resolve the same way.
     pub aliases: HashMap<String, String>,
@@ -552,7 +542,6 @@ impl Config {
         let raw_gaming_mode = raw_config.gaming_mode.clone();
         let raw_device      = raw_config.device.clone();
         let raw_module      = raw_config.module.clone();
-        let raw_modules     = raw_config.modules.clone();
         let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config, aliases);
         let trackpad = TrackpadConfig {
             left: parse_trackpad_side(raw_trackpad.left.as_ref()),
@@ -585,7 +574,6 @@ impl Config {
             gaming_mode_config,
             device,
             module,
-            module_includes: raw_modules.include,
             aliases: aliases.clone(),
         }
     }
@@ -601,7 +589,6 @@ impl Config {
             gaming_mode_config: Default::default(),
             device: None,
             module: Default::default(),
-            module_includes: Vec::new(),
             aliases: Default::default(),
         }
     }
