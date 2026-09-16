@@ -218,6 +218,28 @@ pub struct ConfigRegistry {
     /// The user's activation choices, mirrored to `preferences.toml` on every
     /// change. Held in memory so `reload()` can re-apply them without a read.
     preferences: Mutex<Preferences>,
+    /// Memoised `resolve()` results.
+    ///
+    /// `resolve()` runs on every key press, and rebuilding its answer means
+    /// scanning every entry, sorting the plain modules and merging the whole
+    /// stack — none of which depends on the key that was pressed. The answer
+    /// only changes when the entries, the activation flags or the compositor
+    /// change, so it is computed once per distinct question and dropped whole
+    /// at those three points.
+    ///
+    /// `None` is cached too: "this base has no config for that layout" is the
+    /// answer `change_active_layout` probes for in a loop.
+    resolved: Mutex<HashMap<ResolveKey, Option<Arc<Config>>>>,
+}
+
+/// What a resolved config depends on. The other two fields of `Client::Class`
+/// are ignored by `resolve`, so they are left out rather than splitting the
+/// cache on values that cannot change the answer.
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct ResolveKey {
+    base_name: String,
+    window_class: Option<String>,
+    layout: u16,
 }
 
 impl ConfigRegistry {
@@ -226,6 +248,9 @@ impl ConfigRegistry {
     /// Load all `.toml` files from both roots and their `apps/` subdirectories.
     /// Never panics — parse errors are stored as ConfigEntry with config: None.
     pub fn load(roots: ConfigRoots) -> Arc<Self> {
+        // Before the first read, not on every one: seeding is a no-op once the
+        // user has their own copy.
+        crate::preferences::seed_from(&roots.system, &roots.user);
         let preferences = Preferences::load(&roots.user);
         let mut entries = Self::load_entries(&roots);
         apply_preferences(&mut entries, &preferences);
@@ -234,6 +259,7 @@ impl ConfigRegistry {
             roots,
             compositor: Mutex::new(None),
             preferences: Mutex::new(preferences),
+            resolved: Mutex::new(HashMap::new()),
         })
     }
 
@@ -245,6 +271,7 @@ impl ConfigRegistry {
             entries: Mutex::new(HashMap::new()),
             compositor: Mutex::new(None),
             preferences: Mutex::new(Preferences::default()),
+            resolved: Mutex::new(HashMap::new()),
         })
     }
 
@@ -257,6 +284,7 @@ impl ConfigRegistry {
             entries: Mutex::new(entries.into_iter().map(|e| (e.name.clone(), e)).collect()),
             compositor: Mutex::new(None),
             preferences: Mutex::new(Preferences::default()),
+            resolved: Mutex::new(HashMap::new()),
         })
     }
 
@@ -276,6 +304,18 @@ impl ConfigRegistry {
         apply_preferences(&mut new_entries, &preferences);
         *self.entries.lock().unwrap() = new_entries;
         *self.preferences.lock().unwrap() = preferences;
+        self.invalidate_resolved();
+    }
+
+    /// Drop every memoised `resolve()` answer.
+    ///
+    /// Called wherever an input to `resolve` changes: the entries, their enabled
+    /// flags, or the compositor. Dropping the whole map rather than the affected
+    /// keys is deliberate — a single module can appear in every resolved config,
+    /// so working out which entries a change invalidates costs more than the
+    /// handful of rebuilds it would save.
+    fn invalidate_resolved(&self) {
+        self.resolved.lock().unwrap().clear();
     }
 
     // ── File watching ─────────────────────────────────────────────────────────
@@ -305,8 +345,15 @@ impl ConfigRegistry {
                     use notify::EventKind::*;
                     match event.kind {
                         Create(_) | Modify(_) | Remove(_) => {
+                            // preferences.toml is deliberately not watched. It is
+                            // written by this process on every IPC toggle, and the
+                            // resulting event would reload every config just to
+                            // re-read what we had just written. It only ever
+                            // changes through IPC, so there is nothing to observe.
                             let is_toml = event.paths.iter().any(|p| {
                                 p.extension().and_then(|e| e.to_str()) == Some("toml")
+                                    && p.file_name().and_then(|n| n.to_str())
+                                        .is_some_and(|n| !crate::preferences::is_preferences_file(n))
                             });
                             if is_toml { let _ = change_tx.try_send(()); }
                         }
@@ -373,6 +420,8 @@ impl ConfigRegistry {
     /// from this point on. Called once, after the environment is resolved.
     pub fn set_compositor(&self, name: Option<String>) {
         *self.compositor.lock().unwrap() = name;
+        // Gating decides which modules are usable, so every answer changes.
+        self.invalidate_resolved();
     }
 
     // ── Query API (udev_monitor) ─────────────────────────────────────────────
@@ -429,7 +478,50 @@ impl ConfigRegistry {
     /// Returns None when `base_name` names no usable base config, or when a
     /// layout other than 0 is requested and no module covers it — the latter is
     /// what lets `change_active_layout()` skip unpopulated layout slots.
-    pub fn resolve(&self, base_name: &str, client: &Client, layout: u16) -> Option<Config> {
+    /// The result is memoised — see the `resolved` field. Callers get an `Arc`
+    /// because this runs per key press and the config holds several maps that
+    /// would otherwise be deep-copied each time.
+    pub fn resolve(&self, base_name: &str, client: &Client, layout: u16) -> Option<Arc<Config>> {
+        let key = ResolveKey {
+            base_name: base_name.to_string(),
+            window_class: match client {
+                // A class no module claims resolves exactly like no class at all,
+                // so it is folded into the same key. Without this the cache would
+                // grow by one full merged config for every window the user has
+                // ever focused, all of them identical.
+                Client::Class(class, _, _) if self.claims_window_class(class) => {
+                    Some(class.clone())
+                }
+                _ => None,
+            },
+            layout,
+        };
+        if let Some(hit) = self.resolved.lock().unwrap().get(&key) {
+            return hit.clone();
+        }
+        let answer = self.resolve_uncached(base_name, client, layout).map(Arc::new);
+        self.resolved.lock().unwrap().insert(key, answer.clone());
+        answer
+    }
+
+    /// Does any usable module name this window class?
+    ///
+    /// Deliberately ignores the layout, unlike the lookup in `resolve_uncached`:
+    /// a class claimed for some other layout is still worth keying on, and being
+    /// generous here only costs a cache entry, whereas being too narrow would
+    /// serve one window's override to another.
+    fn claims_window_class(&self, class: &str) -> bool {
+        let compositor = self.compositor();
+        self.entries.lock().unwrap()
+            .values()
+            .filter_map(|e| usable(e, compositor.as_deref()))
+            .any(|c| c.module.match_window_class.as_deref()
+                .is_some_and(|patterns| patterns.iter().any(|p| p == class)))
+    }
+
+    /// Build a resolved config from scratch. Everything expensive lives here;
+    /// `resolve` is what keeps it from running more than once per question.
+    fn resolve_uncached(&self, base_name: &str, client: &Client, layout: u16) -> Option<Config> {
         let compositor = self.compositor();
         let compositor = compositor.as_deref();
         let entries = self.entries.lock().unwrap();
@@ -516,37 +608,45 @@ impl ConfigRegistry {
     /// broken config cannot be activated regardless of the flag.
     ///
     /// Enabling a member of an exclusive group switches its siblings off in the
-    /// same step. The group is a single choice, so the tray never has to send
-    /// the deactivations itself and there is no window in which two members are
-    /// both live.
+    /// same step. The group is a single choice, so the tray only ever sends the
+    /// activation — the deactivations happen here, which is what keeps them from
+    /// racing the activation over IPC.
+    ///
+    /// Returns false for `enabled = false` on a group member. A group resolves to
+    /// exactly one active member by definition, so "off" is not a state it can
+    /// hold: the request has no valid outcome and saying so beats storing a
+    /// preference that the next `apply_preferences` would overrule.
     pub fn set_enabled(&self, name: &str, enabled: bool) -> bool {
-        let mut entries = self.entries.lock().unwrap();
-        let Some(entry) = entries.get(name) else { return false };
-        if enabled && entry.config.is_none() {
-            return false;
-        }
-        let group = entry.config.as_ref().and_then(|c| c.module.exclusive_group.clone());
+        // Both locks are dropped before the file is written. resolve() needs
+        // `entries` and runs on the input path, so it must not wait on disk.
+        let preferences = {
+            let mut entries = self.entries.lock().unwrap();
+            let Some(entry) = entries.get(name) else { return false };
+            if enabled && entry.config.is_none() {
+                return false;
+            }
+            let group = entry.config.as_ref().and_then(|c| c.module.exclusive_group.clone());
 
-        let mut preferences = self.preferences.lock().unwrap();
-        match (&group, enabled) {
-            (Some(group), true) => {
-                let siblings = group_members(&entries, group);
-                for sibling in &siblings {
-                    if let Some(e) = entries.get_mut(sibling) {
-                        e.enabled = sibling == name;
+            let mut preferences = self.preferences.lock().unwrap();
+            match (&group, enabled) {
+                (Some(group), true) => {
+                    let siblings = group_members(&entries, group);
+                    for sibling in &siblings {
+                        if let Some(e) = entries.get_mut(sibling) {
+                            e.enabled = sibling == name;
+                        }
                     }
+                    preferences.set_group_choice(group, name, &siblings);
                 }
-                preferences.set_group_choice(group, name, &siblings);
+                (Some(_), false) => return false,
+                _ => {
+                    entries.get_mut(name).unwrap().enabled = enabled;
+                    preferences.set_disabled(name, !enabled);
+                }
             }
-            // Switching the chosen member off would leave the group with no
-            // active member at all. The tray draws radio buttons, which cannot
-            // express that, so the only way here is a hand-sent IPC command —
-            // honour it, and record it as a plain disable.
-            _ => {
-                entries.get_mut(name).unwrap().enabled = enabled;
-                preferences.set_disabled(name, !enabled);
-            }
-        }
+            preferences.clone()
+        };
+        self.invalidate_resolved();
         preferences.save(&self.roots.user);
         true
     }

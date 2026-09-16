@@ -19,6 +19,7 @@ fn make_registry(entries: Vec<ConfigEntry>) -> Arc<ConfigRegistry> {
         entries: Mutex::new(map),
         compositor: Mutex::new(None),
         preferences: Mutex::new(crate::preferences::Preferences::default()),
+        resolved: Mutex::new(HashMap::new()),
     })
 }
 
@@ -823,6 +824,7 @@ fn registry_with_user_root(entries: Vec<ConfigEntry>, user: &Path) -> Arc<Config
         entries: Mutex::new(map),
         compositor: Mutex::new(None),
         preferences: Mutex::new(Preferences::default()),
+        resolved: Mutex::new(HashMap::new()),
     })
 }
 
@@ -848,6 +850,23 @@ fn enabling_a_group_member_switches_its_siblings_off() {
     assert!(r.set_enabled("Layout Vertical", true));
 
     assert_eq!(enabled_names(&r), vec!["Layout Vertical", "Voice Control"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_group_member_cannot_be_switched_off() {
+    let dir = scratch_dir("deckery-prefs-no-disable");
+    let r = registry_with_user_root(vec![
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), false),
+    ], &dir);
+
+    // A group holds exactly one active member, so there is no state to move to.
+    assert!(!r.set_enabled("Layout Horizontal", false));
+    assert_eq!(enabled_names(&r), vec!["Layout Horizontal"]);
+
+    // And nothing is recorded, so no later apply_preferences has to overrule it.
+    assert!(Preferences::load(&dir).modules.disabled.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -949,6 +968,44 @@ fn preferences_toml_is_not_discovered_as_a_config() {
 }
 
 #[test]
+fn the_shipped_preferences_template_is_copied_on_first_start() {
+    let system = scratch_dir("deckery-seed-system");
+    let user = scratch_dir("deckery-seed-user");
+    std::fs::write(
+        system.join("preferences.toml"),
+        "[exclusive_groups]\nlayout = \"Layout Horizontal\"\n",
+    ).unwrap();
+
+    crate::preferences::seed_from(&system, &user);
+
+    assert_eq!(Preferences::load(&user).group_choice("layout"), Some("Layout Horizontal"));
+    let _ = std::fs::remove_dir_all(&system);
+    let _ = std::fs::remove_dir_all(&user);
+}
+
+#[test]
+fn seeding_never_overwrites_an_existing_choice() {
+    let system = scratch_dir("deckery-seed-keep-system");
+    let user = scratch_dir("deckery-seed-keep-user");
+    std::fs::write(
+        system.join("preferences.toml"),
+        "[exclusive_groups]\nlayout = \"Layout Horizontal\"\n",
+    ).unwrap();
+    // The user has since picked something else. An update ships a new template;
+    // their choice has to win, or every update would reset the tray.
+    std::fs::write(
+        user.join("preferences.toml"),
+        "[exclusive_groups]\nlayout = \"Layout Grid\"\n",
+    ).unwrap();
+
+    crate::preferences::seed_from(&system, &user);
+
+    assert_eq!(Preferences::load(&user).group_choice("layout"), Some("Layout Grid"));
+    let _ = std::fs::remove_dir_all(&system);
+    let _ = std::fs::remove_dir_all(&user);
+}
+
+#[test]
 fn modules_in_the_same_exclusive_group_do_not_warn() {
     let mut a = grouped("Layout Alpha", "layout");
     let mut b = grouped("Layout Bravo", "layout");
@@ -998,4 +1055,124 @@ fn a_group_choice_survives_a_restart() {
     drop(entries);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── Resolve cache ─────────────────────────────────────────────────────────────
+//
+// resolve() memoises its answer because it runs on every key press. That is only
+// safe while every input change drops the memo, so each test here changes one
+// input and asserts the *next* resolve sees it. A stale cache would be silent:
+// bindings would keep working, just the old ones.
+
+#[test]
+fn resolving_twice_returns_the_same_instance() {
+    let b = base("Steam Deck", &["Steam Deck"]);
+    let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
+
+    let first  = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let second = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+
+    // Same allocation, not merely equal — the second call did no work.
+    assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn a_toggle_is_visible_to_the_next_resolve() {
+    let dir = scratch_dir("deckery-cache-toggle");
+    let b = base("Steam Deck", &["Steam Deck"]);
+    let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let r = registry_with_user_root(vec![wrap(b, true), wrap(m, true)], &dir);
+
+    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+                        evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+
+    assert!(r.set_enabled("gestures", false));
+
+    assert!(!has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+                         evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_compositor_change_is_visible_to_the_next_resolve() {
+    let b = base("Steam Deck", &["Steam Deck"]);
+    let mut m = with_binding(module("kde only", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    m.module.requires_compositor = Some("KDE".to_string());
+    let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
+
+    r.set_compositor(Some("Hyprland".to_string()));
+    assert!(!has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+                         evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+
+    r.set_compositor(Some("KDE".to_string()));
+    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+                        evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+}
+
+#[test]
+fn the_cache_distinguishes_window_class_and_layout() {
+    let b = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let app = with_binding(module("konsole", Some("org.kde.konsole"), 0),
+                           evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let r = make_registry(vec![wrap(b, true), wrap(app, true)]);
+
+    // Same base, same layout — only the focused window differs. Keying the cache
+    // on the base alone would serve the app override to every other window.
+    let focused = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
+    let plain   = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+
+    assert!(has_binding(&focused, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+    assert!(has_binding(&plain,   evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
+}
+
+#[test]
+fn a_reload_is_visible_to_the_next_resolve() {
+    // The other invalidation tests drive the registry through its API. This one
+    // goes through the disk, because reload() is the path SIGHUP and the file
+    // watcher take — the two triggers that come from outside the process.
+    let root = scratch_dir("deckery-cache-reload");
+    let system = root.join("system");
+    let user   = root.join("user");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(system.join("Steam Deck.toml"), DECK).unwrap();
+    std::fs::write(system.join("gestures.toml"),
+        "[module]\n\n[remap]\nBTN_SOUTH = [\"KEY_A\"]\n").unwrap();
+
+    let r = ConfigRegistry::load(ConfigRoots { system: system.clone(), user });
+    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+                        evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+
+    std::fs::write(system.join("gestures.toml"),
+        "[module]\n\n[remap]\nBTN_SOUTH = [\"KEY_B\"]\n").unwrap();
+    r.reload();
+
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
+    assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn unclaimed_window_classes_share_one_cache_entry() {
+    let b = base("Steam Deck", &["Steam Deck"]);
+    let app = module("konsole", Some("org.kde.konsole"), 0);
+    let r = make_registry(vec![wrap(b, true), wrap(app, true)]);
+
+    // Neither class is claimed by a module, so both resolve to the same config
+    // as no focused window at all — and must not each occupy the cache.
+    let plain   = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let firefox = r.resolve("Steam Deck", &class("firefox"), 0).unwrap();
+    let mail    = r.resolve("Steam Deck", &class("thunderbird"), 0).unwrap();
+    assert!(Arc::ptr_eq(&plain, &firefox));
+    assert!(Arc::ptr_eq(&plain, &mail));
+
+    // A claimed class keeps its own entry — folding it in would hand Konsole's
+    // override to every other window.
+    let konsole = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
+    assert!(!Arc::ptr_eq(&plain, &konsole));
+
+    assert_eq!(r.resolved.lock().unwrap().len(), 2);
 }

@@ -49,6 +49,41 @@ pub fn is_preferences_file(file_name: &str) -> bool {
     file_name == FILE_NAME
 }
 
+/// Copy the shipped preferences template into the user root, once.
+///
+/// The shipped configs carry a `preferences.toml` holding the exclusive-group
+/// defaults. It has to reach the user directory because a group falls back to
+/// its alphabetically first member otherwise, and alphabetical order cannot know
+/// which member is the intended default.
+///
+/// Doing it here rather than in `install.sh` is what makes it install-method
+/// independent: an RPM never runs that script, and its `%post` runs as root
+/// without knowing whose home directory to write to. The first start of the user
+/// service knows both.
+///
+/// Returns without doing anything if the user already has a copy — from that
+/// point the file is theirs, and an update must not reset their choices.
+pub fn seed_from(system_root: &Path, user_root: &Path) {
+    let target = path_in(user_root);
+    if target.exists() {
+        return;
+    }
+    let source = path_in(system_root);
+    if !source.exists() {
+        // Running against a config tree that predates the template, or a bare
+        // test root. The group fallback still yields a usable session.
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(user_root) {
+        eprintln!("deckery: cannot create {user_root:?}: {e}");
+        return;
+    }
+    match std::fs::copy(&source, &target) {
+        Ok(_) => eprintln!("deckery: seeded {target:?} from {source:?}"),
+        Err(e) => eprintln!("deckery: cannot seed {target:?}: {e}"),
+    }
+}
+
 impl Preferences {
     /// Read the file, falling back to defaults when it is missing or broken.
     ///
@@ -68,19 +103,34 @@ impl Preferences {
         }
     }
 
+    /// Write the file, replacing it atomically.
+    ///
+    /// Written to a sibling temporary file and renamed into place, the same way
+    /// state.json is written. A plain write truncates first, so a crash in that
+    /// window would not cost the last toggle but every recorded one — and this is
+    /// the one file the user cannot reconstruct from what is on disk.
     pub fn save(&self, user_root: &Path) {
         let path = path_in(user_root);
         if let Err(e) = std::fs::create_dir_all(user_root) {
             eprintln!("deckery: cannot create {user_root:?}: {e}");
             return;
         }
-        match toml::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(e) = std::fs::write(&path, text) {
-                    eprintln!("deckery: cannot write {path:?}: {e}");
-                }
+        let text = match toml::to_string_pretty(self) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("deckery: cannot serialise preferences: {e}");
+                return;
             }
-            Err(e) => eprintln!("deckery: cannot serialise preferences: {e}"),
+        };
+        // Same directory as the target: rename is only atomic within a filesystem.
+        let tmp = path.with_extension("toml.tmp");
+        if let Err(e) = std::fs::write(&tmp, text) {
+            eprintln!("deckery: cannot write {tmp:?}: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            eprintln!("deckery: cannot replace {path:?}: {e}");
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 

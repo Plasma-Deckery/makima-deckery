@@ -99,7 +99,10 @@ pub struct EventReader {
     emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>>,
     device_is_connected: Arc<Mutex<bool>>,
     active_layout: Arc<Mutex<u16>>,
-    current_config: Arc<Mutex<Config>>,
+    /// Held as an `Arc` because it is cloned out of the mutex on every event so
+    /// the lock is not carried into the conversion — a deep copy there would put
+    /// the whole merged config on the per-keypress path.
+    current_config: Arc<Mutex<Arc<Config>>>,
     environment: Environment,
     settings: Settings,
     active_client: Arc<Mutex<Client>>,
@@ -172,7 +175,8 @@ impl EventReader {
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(base_config.clone()));
+        let current_config: Arc<Mutex<Arc<Config>>> =
+            Arc::new(Mutex::new(Arc::new(base_config.clone())));
 
         let lstick_function = base_config.settings
             .get("LSTICK")

@@ -138,3 +138,37 @@ fn kind_and_parent_are_serialised() {
     assert_eq!(by("Firefox")["kind"], "app");
     assert!(by("Firefox")["parent"].is_null());
 }
+
+#[test]
+fn identical_state_serialises_identically() {
+    // flush() skips the write when the document matches the last one, which is
+    // what keeps a key press that changed nothing observable off the disk. That
+    // only works while build_json is deterministic — in particular the errors
+    // map, which is a HashMap here and would serialise in a different order on
+    // every call if serde_json were built with `preserve_order`.
+    let mut errors = HashMap::new();
+    for id in ["zulu", "alpha", "mike", "bravo"] {
+        errors.insert(id.to_string(), ErrorEntry {
+            message:  format!("{id} failed"),
+            severity: "error",
+        });
+    }
+    let configs = vec![
+        summary("Steam Deck", "base", None, true),
+        summary("KDE Desktop", "module", Some("Steam Deck"), true),
+    ];
+
+    let first  = build_json(&lifecycle_ready(), &errors, &None, &configs);
+    let second = build_json(&lifecycle_ready(), &errors, &None, &configs);
+    assert_eq!(first, second);
+}
+
+#[test]
+fn a_changed_field_changes_the_document() {
+    // The other half of the dedup contract: a real change must not be skipped.
+    let before = build_json(&lifecycle_ready(), &no_errors(), &None,
+                            &vec![summary("KDE Desktop", "module", None, true)]);
+    let after  = build_json(&lifecycle_ready(), &no_errors(), &None,
+                            &vec![summary("KDE Desktop", "module", None, false)]);
+    assert_ne!(before, after);
+}

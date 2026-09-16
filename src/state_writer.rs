@@ -62,24 +62,46 @@ pub fn spawn_state_writer() -> StateWriterHandle {
         let mut event_state: Option<serde_json::Value> = None;
         let mut configs: Vec<ConfigSummary> = Vec::new();
 
+        // The last bytes actually written. State is reported on every key press,
+        // but most presses change nothing a reader can see — re-writing the same
+        // document would be pure disk traffic on the input path.
+        let mut written = String::new();
+
         // Write the initial "starting" state before any command arrives so the
         // tray sees a non-stale file the moment makima boots.
-        flush(&lifecycle, &errors, &event_state, &configs);
+        flush(&lifecycle, &errors, &event_state, &configs, &mut written);
 
         while let Some(cmd) = rx.recv().await {
-            match cmd {
-                StateCommand::SetLifecycle(lc)          => { lifecycle    = lc; }
-                StateCommand::SetEventState(es)          => { event_state  = es; }
-                StateCommand::SetLoadedConfigs(c)        => { configs      = c; }
-                StateCommand::SetError { id, message, severity } => {
-                    errors.insert(id, ErrorEntry { message, severity });
-                }
-                StateCommand::ClearError { id }         => { errors.remove(&id); }
+            apply(cmd, &mut lifecycle, &mut errors, &mut event_state, &mut configs);
+            // Anything already queued belongs to the same moment. A burst has one
+            // outcome, and the states in between are ones no reader would have
+            // observed anyway. Draining does not delay anything: this only takes
+            // messages that had already arrived.
+            while let Ok(next) = rx.try_recv() {
+                apply(next, &mut lifecycle, &mut errors, &mut event_state, &mut configs);
             }
-            flush(&lifecycle, &errors, &event_state, &configs);
+            flush(&lifecycle, &errors, &event_state, &configs, &mut written);
         }
     });
     tx
+}
+
+fn apply(
+    cmd:         StateCommand,
+    lifecycle:   &mut AppLifecycle,
+    errors:      &mut HashMap<String, ErrorEntry>,
+    event_state: &mut Option<serde_json::Value>,
+    configs:     &mut Vec<ConfigSummary>,
+) {
+    match cmd {
+        StateCommand::SetLifecycle(lc)    => { *lifecycle   = lc; }
+        StateCommand::SetEventState(es)   => { *event_state = es; }
+        StateCommand::SetLoadedConfigs(c) => { *configs     = c; }
+        StateCommand::SetError { id, message, severity } => {
+            errors.insert(id, ErrorEntry { message, severity });
+        }
+        StateCommand::ClearError { id }   => { errors.remove(&id); }
+    }
 }
 
 // ── Private writer ────────────────────────────────────────────────────────────
@@ -141,17 +163,25 @@ pub(crate) fn build_json(
     serde_json::to_string_pretty(&state).unwrap_or_default()
 }
 
+/// Write the state file, unless it would be byte-identical to the last write.
+///
+/// `written` carries the previous contents and is updated on every successful
+/// write. It starts empty, so the first flush always happens.
 fn flush(
     lifecycle:   &AppLifecycle,
     errors:      &HashMap<String, ErrorEntry>,
     event_state: &Option<serde_json::Value>,
     configs:     &[ConfigSummary],
+    written:     &mut String,
 ) {
     let json  = build_json(lifecycle, errors, event_state, configs);
+    if json.is_empty() || json == *written {
+        return;
+    }
     let tmp   = "/tmp/makima-state.json.tmp";
     let final_ = "/tmp/makima-state.json";
-    if !json.is_empty() && std::fs::write(tmp, &json).is_ok() {
-        let _ = std::fs::rename(tmp, final_);
+    if std::fs::write(tmp, &json).is_ok() && std::fs::rename(tmp, final_).is_ok() {
+        *written = json;
     }
 }
 
