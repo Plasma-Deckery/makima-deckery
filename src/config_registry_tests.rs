@@ -281,15 +281,58 @@ fn among_user_modules_the_alphabet_still_decides() {
 }
 
 #[test]
-fn the_base_config_still_outranks_a_user_module() {
-    // The root rule reorders modules among themselves; it does not promote one
-    // above the config that describes the device.
+fn a_user_module_outranks_the_shipped_base_config() {
+    // The bindings somebody wants to change are declared in the base config, so
+    // the root rule would buy nothing if it stopped below it.
     let b    = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     let mine = with_binding(module("Mine", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
 
     let r = make_registry(vec![wrap(b, true), wrap_user(mine, true)]);
     let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
+}
+
+#[test]
+fn the_users_own_base_config_outranks_their_modules() {
+    // Both files are the user's, so nothing is being worked around any more and
+    // the more specific statement — the one naming the device — wins.
+    let b    = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mine = with_binding(module("Mine", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+
+    let r = make_registry(vec![wrap_user(b, true), wrap_user(mine, true)]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+}
+
+#[test]
+fn a_user_module_keeps_what_the_base_config_is() {
+    // The user's modules are merged on top of the base, so the result is built
+    // from a file that declares no hardware. What it *is* must survive that.
+    let mut b = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    b.aliases.insert("A".into(), "BTN_SOUTH".into());
+    let mine = with_binding(module("Mine", None, 0), evdev::Key::BTN_NORTH, evdev::Key::KEY_B);
+
+    let r = make_registry(vec![wrap(b, true), wrap_user(mine, true)]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert_eq!(cfg.name, "Steam Deck");
+    assert!(cfg.device.is_some(), "the resolved config must still name its device");
+    assert_eq!(cfg.aliases.get("A").map(String::as_str), Some("BTN_SOUTH"));
+    // And the base's own bindings are still there where nothing displaced them.
+    assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
+    assert!(has_binding(&cfg, evdev::Key::BTN_NORTH, evdev::Key::KEY_B));
+}
+
+#[test]
+fn a_user_module_does_not_take_over_gaming_mode() {
+    // Same reasoning as for a shipped module: Gaming Mode is device-level, and
+    // the base config is its sole authority whoever wrote the module.
+    let mut b = base("Steam Deck", &["Steam Deck"]);
+    b.gaming_mode_config.auto_detect_steam_games = false;
+    let mine = module("Mine", None, 0);
+
+    let r = make_registry(vec![wrap(b, true), wrap_user(mine, true)]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert!(!cfg.gaming_mode_config.auto_detect_steam_games);
 }
 
 #[test]

@@ -891,14 +891,24 @@ fn is_plain_module(config: &Config) -> bool {
 
 /// Merge every usable plain module into `config`.
 ///
-/// Modules are the *lowest* priority layer: the base config's own bindings win
-/// over anything a module provides. Among modules a file from the user's
-/// directory outranks every shipped one — that is what makes a small hand-written
-/// module a patch on the shipped set rather than a coin toss against it. Within
-/// one directory the alphabetically later name wins. That tie-break is arbitrary
-/// but deterministic, and it is not meant to be used — two shipped modules
-/// claiming one binding is a config bug, reported at load time by
+/// Configs are layered by who wrote them, not by what kind of file they are:
+///
+/// ```text
+///   shipped modules  <  shipped base config  <  the user's own files
+/// ```
+///
+/// Within one of those layers the alphabetically later name wins. That tie-break
+/// is arbitrary but deterministic, and it is not meant to be used — two shipped
+/// modules claiming one binding is a config bug, reported at load time by
 /// `report_binding_conflicts()` instead of being settled quietly here.
+///
+/// The user's modules sit *above* the shipped base config rather than under it,
+/// and that is deliberate: the bindings somebody most wants to change — what A
+/// does, what the paddles do — are declared in the base config, and having to
+/// adopt the whole file to move one of them is the trade the root rule exists to
+/// avoid. When the base config is itself the user's, it keeps the last word: at
+/// that point nothing distinguishes the two, and the base config is the more
+/// specific statement.
 fn with_modules(
     entries: &HashMap<String, ConfigEntry>,
     config: &Config,
@@ -913,15 +923,39 @@ fn with_modules(
     }
     modules.sort_by(|(a_user, a), (b_user, b)| a_user.cmp(b_user).then(a.name.cmp(&b.name)));
 
-    // merge_base lets `self` win over its argument, so building the stack
+    let base_from_user = entries.get(&config.name).is_some_and(|e| e.from_user);
+    // Everything goes under the base config when the base config is the user's
+    // own, so there is nothing to lift above it.
+    let split = if base_from_user {
+        modules.len()
+    } else {
+        modules.iter().position(|(from_user, _)| *from_user).unwrap_or(modules.len())
+    };
+    let (below, above) = modules.split_at(split);
+
+    // merge_base lets `self` win over its argument, so building a stack
     // back-to-front is what makes later modules outrank earlier ones.
     let mut stack = Config::new_empty(config.name.clone());
-    for (_, module) in modules.iter().rev() {
+    for (_, module) in below.iter().rev() {
         stack.merge_base(module);
     }
 
     let mut merged = config.clone();
     merged.merge_base(&stack);
+
+    if !above.is_empty() {
+        let mut top = Config::new_empty(config.name.clone());
+        for (_, module) in above.iter().rev() {
+            top.merge_base(module);
+        }
+        top.merge_base(&merged);
+        // merge_base carries bindings, settings and the trackpad across, but not
+        // what the config *is* — and `top` started life as an empty shell.
+        top.device  = merged.device.clone();
+        top.aliases = merged.aliases.clone();
+        top.module  = merged.module.clone();
+        merged = top;
+    }
     // merge_base treats its argument as the device-level authority and copies
     // Gaming Mode wholesale from it. Here the roles are reversed — plain modules
     // describe no hardware — so the base config keeps its own.
