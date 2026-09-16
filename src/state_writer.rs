@@ -11,10 +11,13 @@
 //   errors      — keyed by id; any module can set / clear independently.
 //   event_state — the per-event snapshot produced by EventReader (context,
 //                 bindings, trackpads, …).  None when no device is active.
+//   config_roots — the two directories configs are read from. Fixed for the
+//                 process lifetime, published so the tray can offer to open
+//                 either one without re-implementing ConfigRoots::resolve().
 
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use crate::config_registry::ConfigSummary;
+use crate::config_registry::{ConfigRoots, ConfigSummary};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -48,6 +51,9 @@ pub enum StateCommand {
     ClearError { id: String },
     /// Full snapshot of the config registry — sent whenever the registry changes.
     SetLoadedConfigs(Vec<ConfigSummary>),
+    /// The directories configs were read from. Sent once at startup; the roots
+    /// are resolved before the registry loads and never change afterwards.
+    SetConfigRoots(ConfigRoots),
 }
 
 // ── Spawner ───────────────────────────────────────────────────────────────────
@@ -61,6 +67,7 @@ pub fn spawn_state_writer() -> StateWriterHandle {
         let mut errors: HashMap<String, ErrorEntry> = HashMap::new();
         let mut event_state: Option<serde_json::Value> = None;
         let mut configs: Vec<ConfigSummary> = Vec::new();
+        let mut roots: Option<ConfigRoots> = None;
 
         // The last bytes actually written. State is reported on every key press,
         // but most presses change nothing a reader can see — re-writing the same
@@ -69,18 +76,18 @@ pub fn spawn_state_writer() -> StateWriterHandle {
 
         // Write the initial "starting" state before any command arrives so the
         // tray sees a non-stale file the moment makima boots.
-        flush(&lifecycle, &errors, &event_state, &configs, &mut written);
+        flush(&lifecycle, &errors, &event_state, &configs, &roots, &mut written);
 
         while let Some(cmd) = rx.recv().await {
-            apply(cmd, &mut lifecycle, &mut errors, &mut event_state, &mut configs);
+            apply(cmd, &mut lifecycle, &mut errors, &mut event_state, &mut configs, &mut roots);
             // Anything already queued belongs to the same moment. A burst has one
             // outcome, and the states in between are ones no reader would have
             // observed anyway. Draining does not delay anything: this only takes
             // messages that had already arrived.
             while let Ok(next) = rx.try_recv() {
-                apply(next, &mut lifecycle, &mut errors, &mut event_state, &mut configs);
+                apply(next, &mut lifecycle, &mut errors, &mut event_state, &mut configs, &mut roots);
             }
-            flush(&lifecycle, &errors, &event_state, &configs, &mut written);
+            flush(&lifecycle, &errors, &event_state, &configs, &roots, &mut written);
         }
     });
     tx
@@ -92,11 +99,13 @@ fn apply(
     errors:      &mut HashMap<String, ErrorEntry>,
     event_state: &mut Option<serde_json::Value>,
     configs:     &mut Vec<ConfigSummary>,
+    roots:       &mut Option<ConfigRoots>,
 ) {
     match cmd {
         StateCommand::SetLifecycle(lc)    => { *lifecycle   = lc; }
         StateCommand::SetEventState(es)   => { *event_state = es; }
         StateCommand::SetLoadedConfigs(c) => { *configs     = c; }
+        StateCommand::SetConfigRoots(r)   => { *roots       = Some(r); }
         StateCommand::SetError { id, message, severity } => {
             errors.insert(id, ErrorEntry { message, severity });
         }
@@ -113,6 +122,7 @@ pub(crate) fn build_json(
     errors:      &HashMap<String, ErrorEntry>,
     event_state: &Option<serde_json::Value>,
     configs:     &[ConfigSummary],
+    roots:       &Option<ConfigRoots>,
 ) -> String {
     let lifecycle_str = match lifecycle {
         AppLifecycle::Starting       => "starting",
@@ -145,10 +155,21 @@ pub(crate) fn build_json(
         })
     }).collect();
 
+    // Absent until the startup command arrives. The tray hides the folder items
+    // rather than guessing a path it would then fail to open.
+    let roots_json = match roots {
+        Some(r) => serde_json::json!({
+            "system": r.system.to_string_lossy(),
+            "user":   r.user.to_string_lossy(),
+        }),
+        None => serde_json::Value::Null,
+    };
+
     let mut state = serde_json::json!({
-        "lifecycle": lifecycle_str,
-        "errors":    errors_json,
-        "configs":   configs_json,
+        "lifecycle":    lifecycle_str,
+        "errors":       errors_json,
+        "configs":      configs_json,
+        "config_roots": roots_json,
     });
 
     // Merge the event-reader snapshot fields at the top level (context,
@@ -172,9 +193,10 @@ fn flush(
     errors:      &HashMap<String, ErrorEntry>,
     event_state: &Option<serde_json::Value>,
     configs:     &[ConfigSummary],
+    roots:       &Option<ConfigRoots>,
     written:     &mut String,
 ) {
-    let json  = build_json(lifecycle, errors, event_state, configs);
+    let json  = build_json(lifecycle, errors, event_state, configs, roots);
     if json.is_empty() || json == *written {
         return;
     }

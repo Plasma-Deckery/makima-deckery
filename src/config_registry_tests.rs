@@ -1176,3 +1176,85 @@ fn unclaimed_window_classes_share_one_cache_entry() {
 
     assert_eq!(r.resolved.lock().unwrap().len(), 2);
 }
+
+// ── User-directory README ─────────────────────────────────────────────────────
+
+fn readme_roots(name: &str) -> (PathBuf, ConfigRoots) {
+    let root   = scratch_dir(name);
+    let system = root.join("system");
+    let user   = root.join("user");
+    std::fs::create_dir_all(&system).unwrap();
+    (root, ConfigRoots { system, user })
+}
+
+#[test]
+fn readme_is_copied_into_a_user_root_that_does_not_exist_yet() {
+    let (root, roots) = readme_roots("deckery_readme_fresh");
+    std::fs::write(roots.system.join(README_NAME), "the rules").unwrap();
+
+    refresh_readme(&roots);
+
+    assert_eq!(std::fs::read_to_string(roots.user.join(README_NAME)).unwrap(), "the rules");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn readme_is_overwritten_when_it_went_stale() {
+    // The whole point of copying it on every start rather than seeding it once:
+    // a description of the override rules has to describe the current ones.
+    let (root, roots) = readme_roots("deckery_readme_stale");
+    std::fs::create_dir_all(&roots.user).unwrap();
+    std::fs::write(roots.system.join(README_NAME), "the new rules").unwrap();
+    std::fs::write(roots.user.join(README_NAME), "last year's rules").unwrap();
+
+    refresh_readme(&roots);
+
+    assert_eq!(std::fs::read_to_string(roots.user.join(README_NAME)).unwrap(), "the new rules");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_unchanged_readme_is_not_rewritten() {
+    // Rewriting identical bytes would bump the mtime on every single start, for
+    // every watcher looking at that directory, to change nothing.
+    let (root, roots) = readme_roots("deckery_readme_unchanged");
+    std::fs::create_dir_all(&roots.user).unwrap();
+    std::fs::write(roots.system.join(README_NAME), "the rules").unwrap();
+    let target = roots.user.join(README_NAME);
+    std::fs::write(&target, "the rules").unwrap();
+    let before = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    refresh_readme(&roots);
+
+    assert_eq!(std::fs::metadata(&target).unwrap().modified().unwrap(), before);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_missing_shipped_readme_is_not_an_error() {
+    // Running against a config tree that predates the README, or a test root.
+    let (root, roots) = readme_roots("deckery_readme_absent");
+
+    refresh_readme(&roots);
+
+    assert!(!roots.user.join(README_NAME).exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_readme_is_not_mistaken_for_a_config() {
+    // It lives in the same directory as the configs and must stay invisible to
+    // the scan — the tray would otherwise show it as a broken entry.
+    let root = scratch_dir("deckery_readme_not_a_config");
+    let system = root.join("system");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::write(system.join("Steam Deck.toml"), DECK).unwrap();
+    std::fs::write(system.join(README_NAME), "# not a config").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&roots_at(&system));
+    let names: Vec<&String> = entries.keys().collect();
+    assert_eq!(names, vec!["Steam Deck"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

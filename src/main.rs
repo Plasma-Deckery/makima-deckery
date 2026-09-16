@@ -87,6 +87,9 @@ async fn main() {
     // Publish initial config list so the tray sees all configs on startup,
     // even before any device is connected.
     let _ = state_tx.try_send(state_writer::StateCommand::SetLoadedConfigs(registry.snapshot()));
+    // Where those configs came from — the tray offers both folders for opening.
+    let _ = state_tx.try_send(
+        state_writer::StateCommand::SetConfigRoots(registry.roots().clone()));
     // A broken base config is a global failure — escalate to a top-level error
     // so the tray shows red, not just a per-config marker in the submenu.
     udev_monitor::report_base_config_error(&registry, &state_tx);

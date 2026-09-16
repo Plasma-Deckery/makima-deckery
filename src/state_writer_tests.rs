@@ -19,7 +19,7 @@ fn summary(name: &str, kind: &'static str, parent: Option<&str>, enabled: bool) 
 
 #[test]
 fn lifecycle_starting_serialises() {
-    let json = build_json(&lifecycle_starting(), &no_errors(), &None, &no_configs());
+    let json = build_json(&lifecycle_starting(), &no_errors(), &None, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["lifecycle"], "starting");
     assert!(v["errors"].as_object().unwrap().is_empty());
@@ -27,14 +27,14 @@ fn lifecycle_starting_serialises() {
 
 #[test]
 fn lifecycle_ready_serialises() {
-    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &no_configs());
+    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["lifecycle"], "ready");
 }
 
 #[test]
 fn lifecycle_reinitializing_serialises() {
-    let json = build_json(&AppLifecycle::Reinitializing, &no_errors(), &None, &no_configs());
+    let json = build_json(&AppLifecycle::Reinitializing, &no_errors(), &None, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["lifecycle"], "reinitializing");
 }
@@ -46,7 +46,7 @@ fn set_error_appears_in_json() {
         message:  "no matching device found".to_string(),
         severity: "error",
     });
-    let json = build_json(&lifecycle_ready(), &errors, &None, &no_configs());
+    let json = build_json(&lifecycle_ready(), &errors, &None, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["errors"]["no_device"]["severity"], "error");
     assert!(v["errors"]["no_device"]["message"].as_str().unwrap().contains("device"));
@@ -61,7 +61,7 @@ fn base_config_error_appears_in_json() {
         message:  "TOML error in \"Steam Deck\": expected `.`, `=`".to_string(),
         severity: "error",
     });
-    let json = build_json(&lifecycle_ready(), &errors, &None, &no_configs());
+    let json = build_json(&lifecycle_ready(), &errors, &None, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["errors"]["base_config"]["severity"], "error");
     assert!(v["errors"]["base_config"]["message"].as_str().unwrap().contains("TOML error"));
@@ -70,7 +70,7 @@ fn base_config_error_appears_in_json() {
 #[test]
 fn clear_error_removes_from_json() {
     let errors = no_errors();
-    let json = build_json(&lifecycle_ready(), &errors, &None, &no_configs());
+    let json = build_json(&lifecycle_ready(), &errors, &None, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(v["errors"].as_object().unwrap().is_empty());
 }
@@ -81,7 +81,7 @@ fn event_state_merged_at_top_level() {
         "context": { "paused": false },
         "bindings": {},
     }));
-    let json = build_json(&lifecycle_ready(), &no_errors(), &event_state, &no_configs());
+    let json = build_json(&lifecycle_ready(), &no_errors(), &event_state, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(v["context"].is_object());
     assert!(v["bindings"].is_object());
@@ -90,7 +90,7 @@ fn event_state_merged_at_top_level() {
 
 #[test]
 fn event_state_none_omits_device_fields() {
-    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &no_configs());
+    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(v.get("context").is_none());
     assert!(v.get("bindings").is_none());
@@ -98,7 +98,7 @@ fn event_state_none_omits_device_fields() {
 
 #[test]
 fn configs_always_present_in_json() {
-    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &no_configs());
+    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &no_configs(), &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(v["configs"].is_array());
 }
@@ -109,7 +109,7 @@ fn loaded_configs_appear_with_enabled_flag() {
         summary("Steam Deck", "base", None, true),
         summary("Firefox", "app", None, false),
     ];
-    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &configs);
+    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &configs, &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     let arr = v["configs"].as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -127,7 +127,7 @@ fn kind_and_parent_are_serialised() {
         summary("KDE Desktop", "module", Some("Steam Deck"), true),
         summary("Firefox",     "app",    None,               true),
     ];
-    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &configs);
+    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &configs, &None);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     let arr = v["configs"].as_array().unwrap();
     let by = |n: &str| arr.iter().find(|e| e["name"] == n).unwrap().clone();
@@ -137,6 +137,27 @@ fn kind_and_parent_are_serialised() {
     assert_eq!(by("KDE Desktop")["parent"], "Steam Deck");
     assert_eq!(by("Firefox")["kind"], "app");
     assert!(by("Firefox")["parent"].is_null());
+}
+
+#[test]
+fn config_roots_are_null_until_reported() {
+    // The tray keys its two folder items off this field, and an item that opens
+    // a guessed path is worse than no item at all.
+    let json = build_json(&lifecycle_starting(), &no_errors(), &None, &no_configs(), &None);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(v["config_roots"].is_null());
+}
+
+#[test]
+fn config_roots_are_serialised() {
+    let roots = Some(crate::config_registry::ConfigRoots {
+        system: std::path::PathBuf::from("/usr/share/deckery/configs"),
+        user:   std::path::PathBuf::from("/home/u/.config/deckery"),
+    });
+    let json = build_json(&lifecycle_ready(), &no_errors(), &None, &no_configs(), &roots);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["config_roots"]["system"], "/usr/share/deckery/configs");
+    assert_eq!(v["config_roots"]["user"],   "/home/u/.config/deckery");
 }
 
 #[test]
@@ -158,8 +179,8 @@ fn identical_state_serialises_identically() {
         summary("KDE Desktop", "module", Some("Steam Deck"), true),
     ];
 
-    let first  = build_json(&lifecycle_ready(), &errors, &None, &configs);
-    let second = build_json(&lifecycle_ready(), &errors, &None, &configs);
+    let first  = build_json(&lifecycle_ready(), &errors, &None, &configs, &None);
+    let second = build_json(&lifecycle_ready(), &errors, &None, &configs, &None);
     assert_eq!(first, second);
 }
 
@@ -167,8 +188,8 @@ fn identical_state_serialises_identically() {
 fn a_changed_field_changes_the_document() {
     // The other half of the dedup contract: a real change must not be skipped.
     let before = build_json(&lifecycle_ready(), &no_errors(), &None,
-                            &vec![summary("KDE Desktop", "module", None, true)]);
+                            &vec![summary("KDE Desktop", "module", None, true)], &None);
     let after  = build_json(&lifecycle_ready(), &no_errors(), &None,
-                            &vec![summary("KDE Desktop", "module", None, false)]);
+                            &vec![summary("KDE Desktop", "module", None, false)], &None);
     assert_ne!(before, after);
 }

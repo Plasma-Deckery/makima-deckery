@@ -187,6 +187,40 @@ impl ConfigRoots {
     }
 }
 
+/// Name of the explainer copied into the user's config directory.
+pub const README_NAME: &str = "README.md";
+
+/// Refresh the README that explains the user's config directory from within it.
+///
+/// Unlike `preferences.toml` this is documentation, not state, so it is copied
+/// on **every** start rather than seeded once: a description of the override
+/// rules that still describes last year's rules is worse than none at all. It
+/// is also the one thing an update writes into the user directory — which is
+/// safe precisely because nothing the user wrote can be in it.
+///
+/// Skipped when the contents already match, so the common case touches no mtime
+/// and wakes no file watcher. `.md` is not `.toml`, so the config watcher would
+/// ignore it either way; this keeps other watchers out of it too.
+fn refresh_readme(roots: &ConfigRoots) {
+    let source = roots.system.join(README_NAME);
+    let target = roots.user.join(README_NAME);
+    let Ok(shipped) = std::fs::read(&source) else {
+        // A config tree that predates the README, or a bare test root.
+        return;
+    };
+    if std::fs::read(&target).is_ok_and(|current| current == shipped) {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&roots.user) {
+        eprintln!("deckery: cannot create {:?}: {e}", roots.user);
+        return;
+    }
+    match std::fs::write(&target, &shipped) {
+        Ok(()) => eprintln!("deckery: refreshed {target:?}"),
+        Err(e) => eprintln!("deckery: cannot write {target:?}: {e}"),
+    }
+}
+
 /// The invoking user's home directory. Under `sudo` the process sees `/root`
 /// while the configs that matter belong to the real user, so `SUDO_USER` wins
 /// in that one case.
@@ -251,6 +285,7 @@ impl ConfigRegistry {
         // Before the first read, not on every one: seeding is a no-op once the
         // user has their own copy.
         crate::preferences::seed_from(&roots.system, &roots.user);
+        refresh_readme(&roots);
         let preferences = Preferences::load(&roots.user);
         let mut entries = Self::load_entries(&roots);
         apply_preferences(&mut entries, &preferences);
@@ -261,6 +296,11 @@ impl ConfigRegistry {
             preferences: Mutex::new(preferences),
             resolved: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The directories this registry reads from. Fixed for its lifetime.
+    pub fn roots(&self) -> &ConfigRoots {
+        &self.roots
     }
 
     /// Empty registry.
