@@ -96,6 +96,7 @@ fn make_registry_with_broken_base() -> std::sync::Arc<ConfigRegistry> {
         config:  None,
         enabled: false,
         errors:  vec![ConfigError { severity: "error", message: "TOML parse error".into() }],
+        from_user: false,
     }])
 }
 
@@ -106,6 +107,7 @@ fn make_registry_with_valid_base() -> std::sync::Arc<ConfigRegistry> {
         config:  Some(c),
         enabled: true,
         errors:  vec![],
+        from_user: false,
     }])
 }
 

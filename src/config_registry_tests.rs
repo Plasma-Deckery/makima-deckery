@@ -29,7 +29,13 @@ fn wrap(config: Config, enabled: bool) -> ConfigEntry {
         config: Some(config),
         enabled,
         errors: vec![],
+        from_user: false,
     }
+}
+
+/// Same, but read from the user's config directory rather than the shipped one.
+fn wrap_user(config: Config, enabled: bool) -> ConfigEntry {
+    ConfigEntry { from_user: true, ..wrap(config, enabled) }
 }
 
 /// A base config declaring a `[device]` section.
@@ -73,6 +79,7 @@ fn broken_entry(name: &str) -> ConfigEntry {
         config: None,
         enabled: true,
         errors: vec![ConfigError { severity: "error", message: "parse failed".into() }],
+        from_user: false,
     }
 }
 
@@ -241,6 +248,48 @@ fn alphabetically_last_module_wins_over_earlier_one() {
     ]);
     let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
+}
+
+#[test]
+fn a_user_module_wins_over_an_alphabetically_later_shipped_one() {
+    // The point of the rule: a small hand-written file patches the shipped set
+    // without its author having to find a name that sorts last.
+    let shipped = with_binding(module("zzz Shipped", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mine    = with_binding(module("aaa Mine",    None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(shipped, true),
+        wrap_user(mine, true),
+    ]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
+}
+
+#[test]
+fn among_user_modules_the_alphabet_still_decides() {
+    let first  = with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let second = with_binding(module("bbb", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap_user(first, true),
+        wrap_user(second, true),
+    ]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
+}
+
+#[test]
+fn the_base_config_still_outranks_a_user_module() {
+    // The root rule reorders modules among themselves; it does not promote one
+    // above the config that describes the device.
+    let b    = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mine = with_binding(module("Mine", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+
+    let r = make_registry(vec![wrap(b, true), wrap_user(mine, true)]);
+    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 }
 
 #[test]
@@ -610,6 +659,7 @@ fn base_config_error_ignores_warning_severity() {
             config:  None,
             enabled: false,
             errors:  vec![ConfigError { severity: "warning", message: "unknown key".into() }],
+            from_user: false,
         },
     ]);
     assert!(r.base_config_error().is_none());
@@ -655,6 +705,35 @@ fn colliding_modules_warn_on_the_losing_config() {
     let bbb = warnings_of(&m, "bbb");
     assert_eq!(bbb.len(), 1);
     assert!(bbb[0].contains("aaa"), "warning must name the config it collides with: {}", bbb[0]);
+}
+
+#[test]
+fn a_user_module_overriding_a_shipped_one_does_not_warn() {
+    // Deliberate, and the only way to change one binding without adopting the
+    // whole file it came in — warning about it would train the user to ignore
+    // the warnings that do mean something.
+    let shipped = with_binding(module("Steam Deck Buttons", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mine    = with_binding(module("My Tweaks",          None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let mut m: HashMap<String, ConfigEntry> = [
+        (shipped.name.clone(), wrap(shipped, true)),
+        (mine.name.clone(),    wrap_user(mine, true)),
+    ].into_iter().collect();
+    report_binding_conflicts(&mut m);
+
+    assert!(warnings_of(&m, "My Tweaks").is_empty());
+    assert!(warnings_of(&m, "Steam Deck Buttons").is_empty());
+}
+
+#[test]
+fn two_user_modules_colliding_still_warn() {
+    // Same root, so nothing says which of them the user meant to win.
+    let mut m: HashMap<String, ConfigEntry> = [
+        with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
+        with_binding(module("bbb", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
+    ].into_iter().map(|c| (c.name.clone(), wrap_user(c, true))).collect();
+    report_binding_conflicts(&mut m);
+
+    assert_eq!(warnings_of(&m, "bbb").len(), 1);
 }
 
 #[test]
@@ -791,6 +870,45 @@ fn user_file_replaces_the_system_file_of_the_same_name() {
     assert_eq!(entries.len(), 1);
     let config = entries["KDE Desktop"].config.as_ref().unwrap();
     assert_eq!(config.module.requires_compositor.as_deref(), Some("Hyprland"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_root_a_file_came_from_is_recorded() {
+    // The one thing a file's location decides — everything else follows from
+    // its contents.
+    let root = scratch_dir("deckery_from_user_test");
+    let system = root.join("system");
+    let user   = root.join("user");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::create_dir_all(user.join("apps")).unwrap();
+    std::fs::write(system.join("KDE Desktop.toml"), "[module]\n").unwrap();
+    std::fs::write(user.join("My Module.toml"), "[module]\n").unwrap();
+    std::fs::write(user.join("apps/Konsole.toml"),
+                   "[module]\nmatch_window_class = [\"org.kde.konsole\"]\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&ConfigRoots { system, user });
+    assert!(!entries["KDE Desktop"].from_user);
+    assert!(entries["My Module"].from_user);
+    // The `apps/` subdirectory belongs to the root above it.
+    assert!(entries["Konsole"].from_user);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_user_file_replacing_a_system_one_counts_as_the_users() {
+    let root = scratch_dir("deckery_override_root_test");
+    let system = root.join("system");
+    let user   = root.join("user");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(system.join("KDE Desktop.toml"), "[module]\n").unwrap();
+    std::fs::write(user.join("KDE Desktop.toml"), "[module]\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&ConfigRoots { system, user });
+    assert!(entries["KDE Desktop"].from_user);
 
     let _ = std::fs::remove_dir_all(&root);
 }

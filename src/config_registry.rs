@@ -50,6 +50,12 @@ pub struct ConfigEntry {
     /// Runtime toggle — can be flipped via IPC without touching the file.
     /// A disabled entry (or one with config: None) is never returned by resolve().
     pub enabled: bool,
+    /// True when the file was read from the user's config directory rather than
+    /// the shipped one. The only thing a file's location decides: a user module
+    /// outranks every shipped module when the two bind the same button, so a
+    /// small file dropped into `~/.config/deckery/` patches the shipped set
+    /// without having to replace a whole file to do it.
+    pub from_user: bool,
     /// Validation errors and warnings collected at load time.
     pub errors:  Vec<ConfigError>,
 }
@@ -752,10 +758,12 @@ impl ConfigRegistry {
         // System first, user second: entries are keyed by config name, so a user
         // file of the same name simply overwrites the system entry as it is read.
         // Within each root, the `apps/` subdirectory is scanned alongside it.
-        let dirs_to_scan: Vec<PathBuf> = [&roots.system, &roots.user]
+        let dirs_to_scan: Vec<(PathBuf, bool)> = [(&roots.system, false), (&roots.user, true)]
             .into_iter()
-            .flat_map(|root| [root.clone(), root.join("apps")])
-            .filter(|dir| dir.is_dir())
+            .flat_map(|(root, from_user)| {
+                [(root.clone(), from_user), (root.join("apps"), from_user)]
+            })
+            .filter(|(dir, _)| dir.is_dir())
             .collect();
 
         // Aliases are declared on the base config's [device] block but apply to
@@ -763,7 +771,7 @@ impl ConfigRegistry {
         // parse_event_name resolves names the moment a binding is read.
         let aliases = collect_aliases(roots);
 
-        for scan_dir in dirs_to_scan {
+        for (scan_dir, from_user) in dirs_to_scan {
             let dir = match std::fs::read_dir(&scan_dir) {
                 Ok(d)  => d,
                 Err(e) => {
@@ -802,6 +810,7 @@ impl ConfigRegistry {
                     config: config_opt,
                     enabled,
                     errors,
+                    from_user,
                 });
             }
         }
@@ -883,28 +892,31 @@ fn is_plain_module(config: &Config) -> bool {
 /// Merge every usable plain module into `config`.
 ///
 /// Modules are the *lowest* priority layer: the base config's own bindings win
-/// over anything a module provides. Among modules the alphabetically later name
-/// wins. That rule is arbitrary but deterministic, and it is not meant to be
-/// used — two modules claiming one binding is a config bug, reported at load
-/// time by `report_binding_conflicts()` instead of being settled quietly here.
+/// over anything a module provides. Among modules a file from the user's
+/// directory outranks every shipped one — that is what makes a small hand-written
+/// module a patch on the shipped set rather than a coin toss against it. Within
+/// one directory the alphabetically later name wins. That tie-break is arbitrary
+/// but deterministic, and it is not meant to be used — two shipped modules
+/// claiming one binding is a config bug, reported at load time by
+/// `report_binding_conflicts()` instead of being settled quietly here.
 fn with_modules(
     entries: &HashMap<String, ConfigEntry>,
     config: &Config,
     compositor: Option<&str>,
 ) -> Config {
-    let mut modules: Vec<&Config> = entries.values()
-        .filter_map(|e| usable(e, compositor))
-        .filter(|c| is_plain_module(c))
+    let mut modules: Vec<(bool, &Config)> = entries.values()
+        .filter_map(|e| Some((e.from_user, usable(e, compositor)?)))
+        .filter(|(_, c)| is_plain_module(c))
         .collect();
     if modules.is_empty() {
         return config.clone();
     }
-    modules.sort_by(|a, b| a.name.cmp(&b.name));
+    modules.sort_by(|(a_user, a), (b_user, b)| a_user.cmp(b_user).then(a.name.cmp(&b.name)));
 
     // merge_base lets `self` win over its argument, so building the stack
     // back-to-front is what makes later modules outrank earlier ones.
     let mut stack = Config::new_empty(config.name.clone());
-    for module in modules.iter().rev() {
+    for (_, module) in modules.iter().rev() {
         stack.merge_base(module);
     }
 
@@ -955,32 +967,43 @@ fn gates_overlap(a: Option<&String>, b: Option<&String>) -> bool {
 /// losing binding simply never fires, and nothing about the two files says why.
 /// The warning names both configs so the fix is obvious. It lands on the winner
 /// because that is the file whose binding is actually in effect.
+///
+/// A user module beating a shipped one is exempt: that is not an accident but
+/// the supported way to change a single binding without adopting the whole file
+/// it came in.
 fn report_binding_conflicts(entries: &mut HashMap<String, ConfigEntry>) {
     struct Module {
         name:       String,
         gate:       Option<String>,
         group:      Option<String>,
+        from_user:  bool,
         combos:     HashSet<(Event, Vec<Event>)>,
     }
     let mut modules: Vec<Module> = entries.values()
-        .filter_map(|e| e.config.as_ref())
-        .filter(|c| is_plain_module(c))
-        .map(|c| Module {
+        .filter_map(|e| Some((e.from_user, e.config.as_ref()?)))
+        .filter(|(_, c)| is_plain_module(c))
+        .map(|(from_user, c)| Module {
             name:   c.name.clone(),
             gate:   c.module.requires_compositor.clone(),
             group:  c.module.exclusive_group.clone(),
+            from_user,
             combos: bound_combos(c),
         })
         .collect();
-    modules.sort_by(|a, b| a.name.cmp(&b.name));
+    modules.sort_by(|a, b| a.from_user.cmp(&b.from_user).then(a.name.cmp(&b.name)));
 
-    // Alphabetical order is merge order, so anything later in this list wins
-    // over what came before it.
+    // This is merge order, so anything later in this list wins over what came
+    // before it.
     for (i, module) in modules.iter().enumerate() {
         let name = &module.name;
         let mut warnings: Vec<String> = Vec::new();
         for earlier in &modules[..i] {
             if !gates_overlap(module.gate.as_ref(), earlier.gate.as_ref()) {
+                continue;
+            }
+            // The deliberate case: a file in the user's directory taking a
+            // binding off a shipped one is the patch mechanism working.
+            if module.from_user && !earlier.from_user {
                 continue;
             }
             // Two members of the same exclusive group are never live together,
