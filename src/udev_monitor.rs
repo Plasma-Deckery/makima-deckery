@@ -468,17 +468,20 @@ pub async fn launch_tasks(
                 severity: "error",
             });
         } else {
+            // The file name has nothing to do with this: a base config is
+            // matched to hardware through `[device] names`, which is a list of
+            // substrings tested against the evdev name. Saying otherwise sends
+            // people renaming files that were never the problem.
             println!(
                 "No matching devices found.\n\
-                 Note: for Steam Deck / Steam Controller, name the config file \
-                 \"Steam Deck.toml\" — makima normalises all kernel-reported name \
-                 variants to that canonical name automatically.\n\
-                 For other devices, the config file name must match the evdev device \
-                 name as reported by 'evtest'.\n"
+                 Note: a base config finds its device through the `names` list in \
+                 its [device] section — each entry is matched as a substring of \
+                 the evdev device name reported by 'evtest'. The config's file \
+                 name plays no part in it.\n"
             );
             let _ = state_tx.try_send(StateCommand::SetError {
                 id:       "no_device".to_string(),
-                message:  "No matching device found — for Steam Deck use \"Steam Deck.toml\"; for other devices check evdev name matches config file name".to_string(),
+                message:  "No matching device found — check that [device] names in the base config matches the evdev device name from 'evtest'".to_string(),
                 severity: "error",
             });
         }

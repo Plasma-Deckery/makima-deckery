@@ -24,7 +24,7 @@ A config declares its role through its **content**, never through its filename. 
 There is no include list. A plain module applies by existing in a config directory, which means adding a feature is dropping in a file and removing it is deleting one — no second place to keep in sync.
 
 ```toml
-# Steam Deck.toml — a base config
+# Steam Deck Base.toml — a base config
 [device]
 class = "hid-steam"                       # or "evdev"
 names = ["Steam Deck", "Valve Software"]  # substring-matched against the evdev name
