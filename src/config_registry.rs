@@ -120,7 +120,8 @@ fn group_members(entries: &HashMap<String, ConfigEntry>, group: &str) -> HashSet
 /// `preferences.toml` have to be replayed. For an exclusive group the recorded
 /// choice wins; without one — a fresh install, or a choice naming a module that
 /// has since been removed — the alphabetically first usable member is picked, so
-/// a group always has exactly one active member.
+/// a group has exactly one active member unless the whole group is switched off,
+/// in which case none of its members are.
 fn apply_preferences(entries: &mut HashMap<String, ConfigEntry>, preferences: &Preferences) {
     for entry in entries.values_mut() {
         if entry.config.is_some() && preferences.is_disabled(&entry.name) {
@@ -138,10 +139,14 @@ fn apply_preferences(entries: &mut HashMap<String, ConfigEntry>, preferences: &P
         let usable_member = |name: &String| {
             entries.get(name).is_some_and(|e| e.config.is_some())
         };
-        let chosen = preferences.group_choice(&group)
-            .map(str::to_string)
-            .filter(|c| members.contains(c) && usable_member(c))
-            .or_else(|| members.iter().filter(|n| usable_member(n)).min().cloned());
+        let chosen = if preferences.is_group_disabled(&group) {
+            None
+        } else {
+            preferences.group_choice(&group)
+                .map(str::to_string)
+                .filter(|c| members.contains(c) && usable_member(c))
+                .or_else(|| members.iter().filter(|n| usable_member(n)).min().cloned())
+        };
 
         for member in &members {
             if let Some(e) = entries.get_mut(member) {
@@ -658,10 +663,11 @@ impl ConfigRegistry {
     /// activation — the deactivations happen here, which is what keeps them from
     /// racing the activation over IPC.
     ///
-    /// Returns false for `enabled = false` on a group member. A group resolves to
-    /// exactly one active member by definition, so "off" is not a state it can
-    /// hold: the request has no valid outcome and saying so beats storing a
-    /// preference that the next `apply_preferences` would overrule.
+    /// Switching the *active* member of a group off switches the whole group off
+    /// — that is the only state in which a group member can be off while the
+    /// group still remembers it. Doing that on an already inactive member is a
+    /// no-op: the click says nothing the group does not already reflect, and
+    /// taking the whole group down over it would be a surprise.
     pub fn set_enabled(&self, name: &str, enabled: bool) -> bool {
         // Both locks are dropped before the file is written. resolve() needs
         // `entries` and runs on the input path, so it must not wait on disk.
@@ -672,6 +678,7 @@ impl ConfigRegistry {
                 return false;
             }
             let group = entry.config.as_ref().and_then(|c| c.module.exclusive_group.clone());
+            let was_enabled = entry.enabled;
 
             let mut preferences = self.preferences.lock().unwrap();
             match (&group, enabled) {
@@ -684,11 +691,66 @@ impl ConfigRegistry {
                     }
                     preferences.set_group_choice(group, name, &siblings);
                 }
-                (Some(_), false) => return false,
+                (Some(group), false) => {
+                    if !was_enabled {
+                        return true;
+                    }
+                    let group = group.clone();
+                    for member in group_members(&entries, &group) {
+                        if let Some(e) = entries.get_mut(&member) {
+                            e.enabled = false;
+                        }
+                    }
+                    preferences.set_group_disabled(&group, true);
+                }
                 _ => {
                     entries.get_mut(name).unwrap().enabled = enabled;
                     preferences.set_disabled(name, !enabled);
                 }
+            }
+            preferences.clone()
+        };
+        self.invalidate_resolved();
+        preferences.save(&self.roots.user);
+        true
+    }
+
+    /// Switch a whole exclusive group on or off and persist the choice.
+    ///
+    /// Returns false if no loaded config declares that group.
+    ///
+    /// Switching on restores the remembered member, falling back to the
+    /// alphabetically first usable one — the same rule `apply_preferences` uses,
+    /// so a restart lands on the member the click just produced.
+    pub fn set_group_enabled(&self, group: &str, enabled: bool) -> bool {
+        let preferences = {
+            let mut entries = self.entries.lock().unwrap();
+            let members = group_members(&entries, group);
+            if members.is_empty() {
+                return false;
+            }
+            let mut preferences = self.preferences.lock().unwrap();
+
+            let usable = |name: &String| entries.get(name).is_some_and(|e| e.config.is_some());
+            let chosen = enabled
+                .then(|| {
+                    preferences.group_choice(group)
+                        .map(str::to_string)
+                        .filter(|c| members.contains(c) && usable(c))
+                        .or_else(|| members.iter().filter(|n| usable(n)).min().cloned())
+                })
+                .flatten();
+
+            for member in &members {
+                if let Some(e) = entries.get_mut(member) {
+                    e.enabled = Some(member) == chosen.as_ref();
+                }
+            }
+            match &chosen {
+                Some(name) => preferences.set_group_choice(group, name, &members),
+                // Also covers "on, but every member is broken": nothing can be
+                // activated, so the stored state has to stay off.
+                None => preferences.set_group_disabled(group, true),
             }
             preferences.clone()
         };

@@ -2138,6 +2138,24 @@ impl EventReader {
                 "analog-state-export on" | "analog-state-export off" => {
                     *self.analog_state_export.lock().await = cmd == "analog-state-export on";
                 }
+                _ if cmd.starts_with("config group enable ")
+                    || cmd.starts_with("config group disable ") => {
+                    let enabling = cmd.starts_with("config group enable ");
+                    let group = if enabling {
+                        cmd.trim_start_matches("config group enable ").trim()
+                    } else {
+                        cmd.trim_start_matches("config group disable ").trim()
+                    };
+                    if !self.registry.set_group_enabled(group, enabling) {
+                        eprintln!("deckery: IPC config group enable/disable: no group named {:?}", group);
+                        continue;
+                    }
+                    eprintln!("deckery: IPC config group {}: {:?}",
+                        if enabling { "enable" } else { "disable" }, group);
+                    let _ = self.state_tx.send(
+                        StateCommand::SetLoadedConfigs(self.registry.snapshot())
+                    ).await;
+                }
                 _ if cmd.starts_with("config enable ") || cmd.starts_with("config disable ") => {
                     let enabling = cmd.starts_with("config enable ");
                     let name = if enabling {

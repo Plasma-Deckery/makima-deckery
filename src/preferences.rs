@@ -11,12 +11,20 @@
 //     [exclusive_groups]
 //     kde-desktop-layout = "KDE Desktop Layout Horizontal"
 //
+//     [groups]
+//     disabled = ["voice-control-language"]
+//
 //     [modules]
 //     disabled = ["Voice Control"]
 //
 // Only deviations from the default are recorded. A module absent from
 // `disabled` is enabled, which keeps the file small and makes a newly shipped
 // module active without the user having to opt in.
+//
+// A group listed in `groups.disabled` has no active member at all. Its entry in
+// `exclusive_groups` is kept while it is off: that is the choice to restore when
+// it is switched back on, and dropping it would silently reset the user to the
+// alphabetically first member.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,7 +36,15 @@ pub struct Preferences {
     #[serde(default)]
     pub exclusive_groups: HashMap<String, String>,
     #[serde(default)]
+    pub groups: GroupPreferences,
+    #[serde(default)]
     pub modules: ModulePreferences,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct GroupPreferences {
+    #[serde(default)]
+    pub disabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -149,12 +165,33 @@ impl Preferences {
     /// Record the winner of an exclusive group. Siblings are not listed as
     /// disabled — the group entry already says everything, and duplicating it
     /// would let the two halves of the file disagree.
+    ///
+    /// Picking a member also switches the group on: there is no reading of
+    /// "activate this one" that leaves the group off.
     pub fn set_group_choice(&mut self, group: &str, name: &str, siblings: &HashSet<String>) {
         self.exclusive_groups.insert(group.to_string(), name.to_string());
         self.modules.disabled.retain(|n| !siblings.contains(n));
+        self.set_group_disabled(group, false);
     }
 
     pub fn group_choice(&self, group: &str) -> Option<&str> {
         self.exclusive_groups.get(group).map(String::as_str)
+    }
+
+    pub fn is_group_disabled(&self, group: &str) -> bool {
+        self.groups.disabled.iter().any(|g| g == group)
+    }
+
+    /// Switch a whole group off, or back on.
+    ///
+    /// The recorded member choice is deliberately left alone: switching a group
+    /// off is not the same as forgetting which member was picked, and keeping it
+    /// is what lets switching back on land where the user left it.
+    pub fn set_group_disabled(&mut self, group: &str, disabled: bool) {
+        self.groups.disabled.retain(|g| g != group);
+        if disabled {
+            self.groups.disabled.push(group.to_string());
+        }
+        self.groups.disabled.sort();
     }
 }

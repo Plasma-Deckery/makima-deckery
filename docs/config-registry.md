@@ -134,9 +134,16 @@ Two asymmetries are worth knowing about, since both are load-bearing in `with_mo
 
 A module can declare `[module] exclusive_group = "name"`. Enabling one member switches its siblings off inside the same `set_enabled()` call, so there is never a moment in which two members are both live and the tray does not have to send the deactivations itself.
 
-`apply_preferences()` guarantees the other half: after every load, each group has exactly one enabled member. The stored choice wins; if there is none — a fresh install — or it names a module that has since been removed or fails to parse, the alphabetically first usable member is picked. There is deliberately **no `default = true` flag**: two files could both claim it, and the file that shipped the default could not be told from the user's choice. Shipped groups are instead named so the intended default sorts first.
+`apply_preferences()` guarantees the other half: after every load, each group has exactly one enabled member — unless the group as a whole is switched off, in which case it has none. The stored choice wins; if there is none — a fresh install — or it names a module that has since been removed or fails to parse, the alphabetically first usable member is picked. There is deliberately **no `default = true` flag**: two files could both claim it, and the file that shipped the default could not be told from the user's choice. Shipped groups are instead named so the intended default sorts first.
 
-Switching the chosen member *off* is possible, but only by hand over IPC — radio buttons cannot express it. It is honoured and recorded as a plain disable, leaving the group empty until something is selected.
+### Switching a whole group off
+
+`set_group_enabled(group, false)` — IPC `config group disable <slug>` — leaves every member inactive and records the group in `[groups] disabled`. The member choice in `[exclusive_groups]` is deliberately **not** cleared: off is a state of the group, not the absence of a decision, and dropping the choice would silently reset the user to the alphabetically first member when they switch it back on.
+
+Two things follow from that split:
+
+- **state.json needs no new field.** A group with no enabled member *is* a group switched off, and that is the only part a client can act on. The remembered choice is not client state.
+- **`set_enabled(member, false)` is not a plain disable.** Switching the *active* member off is read as switching the group off — the only state in which a member can be inactive while the group still remembers it. On an already inactive member it is a no-op: the click says nothing the group does not already reflect, and taking the whole group down over it would be a surprise.
 
 ## preferences.toml
 
@@ -145,6 +152,9 @@ Activation state is not configuration. The module `.toml` files say what a modul
 ```toml
 [exclusive_groups]
 kde-desktop-layout = "KDE Desktop Layout Vertical"
+
+[groups]
+disabled = []
 
 [modules]
 disabled = ["Voice Control"]

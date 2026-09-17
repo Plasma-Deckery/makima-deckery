@@ -1015,19 +1015,104 @@ fn enabling_a_group_member_switches_its_siblings_off() {
 }
 
 #[test]
-fn a_group_member_cannot_be_switched_off() {
+fn switching_the_active_member_off_switches_the_group_off() {
     let dir = scratch_dir("deckery-prefs-no-disable");
     let r = registry_with_user_root(vec![
         wrap(grouped("Layout Horizontal", "layout"), true),
         wrap(grouped("Layout Vertical",   "layout"), false),
     ], &dir);
 
-    // A group holds exactly one active member, so there is no state to move to.
-    assert!(!r.set_enabled("Layout Horizontal", false));
-    assert_eq!(enabled_names(&r), vec!["Layout Horizontal"]);
+    assert!(r.set_enabled("Layout Horizontal", false));
+    assert!(enabled_names(&r).is_empty());
 
-    // And nothing is recorded, so no later apply_preferences has to overrule it.
-    assert!(Preferences::load(&dir).modules.disabled.is_empty());
+    // Recorded as a group state, not as two disabled modules: the members are
+    // off because the group is, and a later apply_preferences must read it so.
+    let written = Preferences::load(&dir);
+    assert_eq!(written.groups.disabled, vec!["layout"]);
+    assert!(written.modules.disabled.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn switching_an_inactive_member_off_does_nothing() {
+    let dir = scratch_dir("deckery-prefs-inactive-off");
+    let r = registry_with_user_root(vec![
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), false),
+    ], &dir);
+
+    // It is already off. Taking the whole group down over a click that said
+    // nothing new would be a surprise.
+    assert!(r.set_enabled("Layout Vertical", false));
+    assert_eq!(enabled_names(&r), vec!["Layout Horizontal"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_disabled_group_stays_off_across_a_reload() {
+    let dir = scratch_dir("deckery-prefs-group-off");
+    let r = registry_with_user_root(vec![
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), false),
+    ], &dir);
+
+    assert!(r.set_group_enabled("layout", false));
+    assert!(enabled_names(&r).is_empty());
+
+    // What a restart does: fresh entries, all defaulting to enabled, stamped
+    // with the file that was just written.
+    let mut fresh: HashMap<String, ConfigEntry> = [
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+    apply_preferences(&mut fresh, &Preferences::load(&dir));
+
+    assert!(fresh.values().all(|e| !e.enabled));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn switching_a_group_back_on_restores_the_remembered_member() {
+    let dir = scratch_dir("deckery-prefs-group-back-on");
+    let r = registry_with_user_root(vec![
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), false),
+    ], &dir);
+
+    r.set_enabled("Layout Vertical", true);
+    r.set_group_enabled("layout", false);
+    assert!(enabled_names(&r).is_empty());
+
+    // Not "Layout Grid"-style alphabetical reset: the choice outlives the off state.
+    assert!(r.set_group_enabled("layout", true));
+    assert_eq!(enabled_names(&r), vec!["Layout Vertical"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn picking_a_member_switches_a_disabled_group_back_on() {
+    let dir = scratch_dir("deckery-prefs-group-revive");
+    let r = registry_with_user_root(vec![
+        wrap(grouped("Layout Horizontal", "layout"), true),
+        wrap(grouped("Layout Vertical",   "layout"), false),
+    ], &dir);
+
+    r.set_group_enabled("layout", false);
+    assert!(r.set_enabled("Layout Vertical", true));
+
+    assert_eq!(enabled_names(&r), vec!["Layout Vertical"]);
+    assert!(Preferences::load(&dir).groups.disabled.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unknown_group_cannot_be_switched() {
+    let dir = scratch_dir("deckery-prefs-group-unknown");
+    let r = registry_with_user_root(vec![
+        wrap(grouped("Layout Horizontal", "layout"), true),
+    ], &dir);
+
+    assert!(!r.set_group_enabled("nonexistent", false));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
