@@ -669,6 +669,19 @@ impl Config {
 
         self.bindings = merged;
 
+        // Both halves of the modifier set have to come across, not just the
+        // declared one. `default` is what the parser derived from the combos of
+        // *that* file, so it is exactly as load-bearing as the bindings just
+        // merged above — a config that inherits `L1-X` without inheriting "L1 is
+        // a modifier" holds a binding that can never fire. Leaving `default`
+        // behind used to empty the set whenever the merge ran into an
+        // `new_empty` shell, which is how one user module could silence every
+        // combo the base config declares.
+        for key in &base.mapped_modifiers.default {
+            if !self.mapped_modifiers.default.contains(key) {
+                self.mapped_modifiers.default.push(*key);
+            }
+        }
         for key in &base.mapped_modifiers.custom {
             if !self.mapped_modifiers.custom.contains(key) {
                 self.mapped_modifiers.custom.push(*key);

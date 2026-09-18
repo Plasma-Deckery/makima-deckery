@@ -266,6 +266,59 @@ fn a_user_module_wins_over_an_alphabetically_later_shipped_one() {
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
 }
 
+/// Declare *trigger* a layer modifier of this config, the way the parser does
+/// for every combo it reads. The other helpers here build through
+/// `Config::new_empty` and leave the set empty, which is precisely why a merge
+/// that dropped it went unnoticed for so long.
+fn with_modifier(mut c: Config, trigger: evdev::Key) -> Config {
+    c.mapped_modifiers.default.push(Event::Key(trigger));
+    c.mapped_modifiers.all.push(Event::Key(trigger));
+    c
+}
+
+#[test]
+fn a_user_module_does_not_strip_the_bases_modifiers() {
+    // The user's modules merge on top of the base, which means the merge starts
+    // from an empty shell — and everything the base config knows has to survive
+    // the trip. L1 not surviving it turns every L1-combo into a dead binding,
+    // triggered by nothing more than a one-line file in ~/.config/deckery.
+    let b = with_modifier(base("Steam Deck Base", &["Steam Deck"]), evdev::Key::BTN_TL);
+    let r = make_registry(vec![
+        wrap(b, true),
+        wrap_user(module("My Tweaks", None, 0), true),
+    ]);
+    let cfg = r.resolve("Steam Deck Base", &Client::Default, 0).unwrap();
+    assert!(cfg.mapped_modifiers.all.contains(&Event::Key(evdev::Key::BTN_TL)),
+            "base modifier lost: {:?}", cfg.mapped_modifiers);
+}
+
+#[test]
+fn a_module_brings_its_own_modifiers_along() {
+    // A module is free to introduce a modifier the base config never uses. Its
+    // bindings are merged either way, so without the modifier they would load
+    // and then never fire.
+    let m = with_modifier(module("KDE Desktop", None, 0), evdev::Key::BTN_TR);
+    let r = make_registry(vec![
+        wrap(base("Steam Deck Base", &["Steam Deck"]), true),
+        wrap(m, true),
+    ]);
+    let cfg = r.resolve("Steam Deck Base", &Client::Default, 0).unwrap();
+    assert!(cfg.mapped_modifiers.all.contains(&Event::Key(evdev::Key::BTN_TR)),
+            "module modifier lost: {:?}", cfg.mapped_modifiers);
+}
+
+#[test]
+fn an_app_override_keeps_the_modifiers_of_the_config_below_it() {
+    let b = with_modifier(base("Steam Deck Base", &["Steam Deck"]), evdev::Key::BTN_TL);
+    let r = make_registry(vec![
+        wrap(b, true),
+        wrap(module("Firefox", Some("firefox"), 0), true),
+    ]);
+    let cfg = r.resolve("Steam Deck Base", &class("firefox"), 0).unwrap();
+    assert!(cfg.mapped_modifiers.all.contains(&Event::Key(evdev::Key::BTN_TL)),
+            "base modifier lost under an app override: {:?}", cfg.mapped_modifiers);
+}
+
 #[test]
 fn among_user_modules_the_alphabet_still_decides() {
     let first  = with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
