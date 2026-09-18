@@ -266,6 +266,41 @@ fn a_user_module_wins_over_an_alphabetically_later_shipped_one() {
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
 }
 
+#[test]
+fn two_base_configs_claiming_one_controller_are_reported() {
+    // The leftover case: an old copy of the base config under a retired name.
+    // Still valid, still names the same hardware, and whichever of the two ends
+    // up driving the controller is down to HashMap order.
+    let mut map: HashMap<String, ConfigEntry> = vec![
+        wrap(base("Steam Deck Base", &["Steam Deck"]), true),
+        wrap_user(base("Steam Deck", &["Steam Deck"]), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    report_device_conflicts(&mut map);
+
+    let warned: Vec<&String> = map.values()
+        .filter(|e| e.errors.iter().any(|err| err.severity == "warning"))
+        .map(|e| &e.name)
+        .collect();
+    assert_eq!(warned, vec!["Steam Deck Base"],
+               "exactly one of the pair carries the warning");
+}
+
+#[test]
+fn unrelated_controllers_are_not_reported() {
+    // Neither name contains the other, so no device can match both — sharing a
+    // word is not a conflict.
+    let mut map: HashMap<String, ConfigEntry> = vec![
+        wrap(base("Steam Deck Base", &["Steam Deck"]), true),
+        wrap(base("Steam Controller", &["Steam Controller"]), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    report_device_conflicts(&mut map);
+
+    assert!(map.values().all(|e| e.errors.is_empty()),
+            "unrelated declarations must stay quiet");
+}
+
 /// Declare *trigger* a layer modifier of this config, the way the parser does
 /// for every combo it reads. The other helpers here build through
 /// `Config::new_empty` and leave the set empty, which is precisely why a merge

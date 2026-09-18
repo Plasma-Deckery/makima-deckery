@@ -879,6 +879,7 @@ impl ConfigRegistry {
 
         // Only knowable once every file has been read.
         report_binding_conflicts(&mut map);
+        report_device_conflicts(&mut map);
 
         map
     }
@@ -1128,6 +1129,63 @@ fn report_binding_conflicts(entries: &mut HashMap<String, ConfigEntry>) {
         for message in warnings {
             eprintln!("deckery: config {name:?}: {message}");
             if let Some(entry) = entries.get_mut(name) {
+                entry.errors.push(ConfigError { severity: "warning", message });
+            }
+        }
+    }
+}
+
+/// Warn when two base configs can be claimed by the same controller.
+///
+/// `launch_tasks()` walks the base configs and opens the first evdev device
+/// each one matches, so two declarations covering one controller both find it —
+/// and which of them ends up driving it comes down to `HashMap` iteration
+/// order. Nothing about either file says that, and the loser's bindings simply
+/// are not there.
+///
+/// The usual way to get into this: a copy of a base config left in the user's
+/// directory under a name that has since been retired. It is still a valid base
+/// config, it still names the same hardware, and it is invisible as a problem
+/// unless something says so.
+///
+/// Overlap is only reported when one declared name contains the other. That is
+/// the case where a device matching the narrower declaration necessarily
+/// matches the wider one too — a guarantee, not a guess, which is what keeps
+/// this from warning about unrelated hardware that merely shares a word.
+fn report_device_conflicts(entries: &mut HashMap<String, ConfigEntry>) {
+    struct Base {
+        name:  String,
+        gate:  Option<String>,
+        names: Vec<String>,
+    }
+    let mut bases: Vec<Base> = entries.values()
+        .filter_map(|e| e.config.as_ref())
+        .filter_map(|c| Some(Base {
+            name:  c.name.clone(),
+            gate:  c.module.requires_compositor.clone(),
+            names: c.device.as_ref()?.names.clone(),
+        }))
+        .collect();
+    bases.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for (i, base) in bases.iter().enumerate() {
+        for earlier in &bases[..i] {
+            if !gates_overlap(base.gate.as_ref(), earlier.gate.as_ref()) {
+                continue;
+            }
+            let Some(shared) = base.names.iter()
+                .find(|n| earlier.names.iter()
+                    .any(|m| n.contains(m.as_str()) || m.contains(n.as_str())))
+            else { continue };
+
+            let message = format!(
+                "declares device {shared:?}, which config {:?} also claims — \
+                 both match the same controller and only one of them drives it. \
+                 Delete or rename whichever is the leftover.",
+                earlier.name,
+            );
+            eprintln!("deckery: config {:?}: {message}", base.name);
+            if let Some(entry) = entries.get_mut(&base.name) {
                 entry.errors.push(ConfigError { severity: "warning", message });
             }
         }
