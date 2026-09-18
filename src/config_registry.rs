@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::config::{Config, Event};
 use crate::preferences::Preferences;
@@ -122,7 +123,17 @@ fn group_members(entries: &HashMap<String, ConfigEntry>, group: &str) -> HashSet
 /// has since been removed — the alphabetically first usable member is picked, so
 /// a group has exactly one active member unless the whole group is switched off,
 /// in which case none of its members are.
-fn apply_preferences(entries: &mut HashMap<String, ConfigEntry>, preferences: &Preferences) {
+///
+/// `compositor` is what the group's member choice is checked against. A member
+/// gated to a compositor that is not running can be marked enabled all it
+/// likes — `usable()` filters it out again at resolve time, and the group ends
+/// up with a named winner and no effect. `None` means the compositor has not
+/// been detected yet and nothing can be ruled out, so nothing is.
+fn apply_preferences(
+    entries: &mut HashMap<String, ConfigEntry>,
+    preferences: &Preferences,
+    compositor: Option<&str>,
+) {
     for entry in entries.values_mut() {
         if entry.config.is_some() && preferences.is_disabled(&entry.name) {
             entry.enabled = false;
@@ -137,7 +148,7 @@ fn apply_preferences(entries: &mut HashMap<String, ConfigEntry>, preferences: &P
     for group in groups {
         let members = group_members(entries, &group);
         let usable_member = |name: &String| {
-            entries.get(name).is_some_and(|e| e.config.is_some())
+            entries.get(name).is_some_and(|e| runnable(e, compositor))
         };
         let chosen = if preferences.is_group_disabled(&group) {
             None
@@ -275,6 +286,12 @@ pub struct ConfigRegistry {
     /// `None` is cached too: "this base has no config for that layout" is the
     /// answer `change_active_layout` probes for in a loop.
     resolved: Mutex<HashMap<ResolveKey, Option<Arc<Config>>>>,
+    /// Bumped by `invalidate_resolved()`. An answer is only worth caching if the
+    /// entries did not change while it was being computed — the merge runs
+    /// without the cache lock held, so a reload or a tray toggle can land in
+    /// that window and a stale result would otherwise be written on top of the
+    /// clean slate it just made.
+    generation: AtomicU64,
 }
 
 /// What a resolved config depends on. The other two fields of `Client::Class`
@@ -299,13 +316,16 @@ impl ConfigRegistry {
         refresh_readme(&roots);
         let preferences = Preferences::load(&roots.user);
         let mut entries = Self::load_entries(&roots);
-        apply_preferences(&mut entries, &preferences);
+        // No compositor yet — `set_compositor()` runs this again once there is
+        // one, which is what settles a group whose choice is gated.
+        apply_preferences(&mut entries, &preferences, None);
         Arc::new(Self {
             entries: Mutex::new(entries),
             roots,
             compositor: Mutex::new(None),
             preferences: Mutex::new(preferences),
             resolved: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -323,6 +343,7 @@ impl ConfigRegistry {
             compositor: Mutex::new(None),
             preferences: Mutex::new(Preferences::default()),
             resolved: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -336,6 +357,7 @@ impl ConfigRegistry {
             compositor: Mutex::new(None),
             preferences: Mutex::new(Preferences::default()),
             resolved: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -352,7 +374,7 @@ impl ConfigRegistry {
     pub fn reload(&self) {
         let preferences = Preferences::load(&self.roots.user);
         let mut new_entries = Self::load_entries(&self.roots);
-        apply_preferences(&mut new_entries, &preferences);
+        apply_preferences(&mut new_entries, &preferences, self.compositor().as_deref());
         *self.entries.lock().unwrap() = new_entries;
         *self.preferences.lock().unwrap() = preferences;
         self.invalidate_resolved();
@@ -366,6 +388,9 @@ impl ConfigRegistry {
     /// so working out which entries a change invalidates costs more than the
     /// handful of rebuilds it would save.
     fn invalidate_resolved(&self) {
+        // Bump first: an in-flight resolve() that reads the counter after this
+        // point but caches after the clear must still see a difference.
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.resolved.lock().unwrap().clear();
     }
 
@@ -470,7 +495,15 @@ impl ConfigRegistry {
     /// a different `[module] requires_compositor` are excluded from every query
     /// from this point on. Called once, after the environment is resolved.
     pub fn set_compositor(&self, name: Option<String>) {
-        *self.compositor.lock().unwrap() = name;
+        *self.compositor.lock().unwrap() = name.clone();
+        // A group's member choice is made against the gating, and at load time
+        // there was no compositor to check it against. Re-running that choice
+        // here is what keeps a group from settling on a member that cannot run.
+        {
+            let preferences = self.preferences.lock().unwrap();
+            let mut entries = self.entries.lock().unwrap();
+            apply_preferences(&mut entries, &preferences, name.as_deref());
+        }
         // Gating decides which modules are usable, so every answer changes.
         self.invalidate_resolved();
     }
@@ -550,8 +583,18 @@ impl ConfigRegistry {
         if let Some(hit) = self.resolved.lock().unwrap().get(&key) {
             return hit.clone();
         }
+        // Read before the work, compared after it. The merge runs without the
+        // cache lock held — on purpose, it is the expensive part — so a reload
+        // or a tray toggle can clear the cache while this answer is still being
+        // built. Writing it anyway would put a pre-change config back into a
+        // cache that was just emptied because of that change, where it would sit
+        // until something else invalidated it.
+        let generation = self.generation.load(Ordering::Acquire);
         let answer = self.resolve_uncached(base_name, client, layout).map(Arc::new);
-        self.resolved.lock().unwrap().insert(key, answer.clone());
+        let mut resolved = self.resolved.lock().unwrap();
+        if self.generation.load(Ordering::Acquire) == generation {
+            resolved.insert(key, answer.clone());
+        }
         answer
     }
 
@@ -723,6 +766,7 @@ impl ConfigRegistry {
     /// alphabetically first usable one — the same rule `apply_preferences` uses,
     /// so a restart lands on the member the click just produced.
     pub fn set_group_enabled(&self, group: &str, enabled: bool) -> bool {
+        let compositor = self.compositor();
         let preferences = {
             let mut entries = self.entries.lock().unwrap();
             let members = group_members(&entries, group);
@@ -731,7 +775,8 @@ impl ConfigRegistry {
             }
             let mut preferences = self.preferences.lock().unwrap();
 
-            let usable = |name: &String| entries.get(name).is_some_and(|e| e.config.is_some());
+            let usable = |name: &String| entries.get(name)
+                .is_some_and(|e| runnable(e, compositor.as_deref()));
             let chosen = enabled
                 .then(|| {
                     preferences.group_choice(group)
@@ -935,6 +980,22 @@ fn collect_aliases_from(config_dir: &Path, aliases: &mut HashMap<String, String>
 /// successfully, and — if it declares `requires_compositor` — matching the
 /// compositor this session is running under. Every query funnels through here
 /// so "usable" means exactly one thing across the registry.
+/// Could this entry be active here — ignoring whether it currently is?
+///
+/// `usable()` answers "is it live right now", which folds in `enabled`. Picking
+/// which member of a group to enable has to ask the other question: the members
+/// are all switched off at that moment, and one is about to be chosen.
+///
+/// An undetected compositor rules nothing out. Gating is only ever a reason to
+/// reject, so not knowing the answer means not rejecting.
+fn runnable(entry: &ConfigEntry, compositor: Option<&str>) -> bool {
+    let Some(config) = entry.config.as_ref() else { return false };
+    match (config.module.requires_compositor.as_deref(), compositor) {
+        (Some(required), Some(running)) => required == running,
+        _ => true,
+    }
+}
+
 fn usable<'a>(entry: &'a ConfigEntry, compositor: Option<&str>) -> Option<&'a Config> {
     let config = entry.config.as_ref().filter(|_| entry.enabled)?;
     match config.module.requires_compositor.as_deref() {

@@ -184,7 +184,8 @@ pub(crate) fn build_json(
     serde_json::to_string_pretty(&state).unwrap_or_default()
 }
 
-/// Write the state file, unless it would be byte-identical to the last write.
+/// Write the state file, unless it would be byte-identical to the file that is
+/// already there.
 ///
 /// `written` carries the previous contents and is updated on every successful
 /// write. It starts empty, so the first flush always happens.
@@ -197,11 +198,15 @@ fn flush(
     written:     &mut String,
 ) {
     let json  = build_json(lifecycle, errors, event_state, configs, roots);
-    if json.is_empty() || json == *written {
-        return;
-    }
     let tmp   = "/tmp/makima-state.json.tmp";
     let final_ = "/tmp/makima-state.json";
+    // "Unchanged since last time" only justifies skipping the write while last
+    // time's file is still there. /tmp gets swept, and without the existence
+    // check the state file would then stay gone until something in it happened
+    // to change — the tray reading nothing for as long as the state is calm.
+    if json.is_empty() || (json == *written && std::path::Path::new(final_).exists()) {
+        return;
+    }
     if std::fs::write(tmp, &json).is_ok() && std::fs::rename(tmp, final_).is_ok() {
         *written = json;
     }

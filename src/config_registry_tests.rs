@@ -20,6 +20,7 @@ fn make_registry(entries: Vec<ConfigEntry>) -> Arc<ConfigRegistry> {
         compositor: Mutex::new(None),
         preferences: Mutex::new(crate::preferences::Preferences::default()),
         resolved: Mutex::new(HashMap::new()),
+        generation: std::sync::atomic::AtomicU64::new(0),
     })
 }
 
@@ -1074,6 +1075,7 @@ fn registry_with_user_root(entries: Vec<ConfigEntry>, user: &Path) -> Arc<Config
         compositor: Mutex::new(None),
         preferences: Mutex::new(Preferences::default()),
         resolved: Mutex::new(HashMap::new()),
+        generation: std::sync::atomic::AtomicU64::new(0),
     })
 }
 
@@ -1153,7 +1155,7 @@ fn a_disabled_group_stays_off_across_a_reload() {
         wrap(grouped("Layout Horizontal", "layout"), true),
         wrap(grouped("Layout Vertical",   "layout"), true),
     ].into_iter().map(|e| (e.name.clone(), e)).collect();
-    apply_preferences(&mut fresh, &Preferences::load(&dir));
+    apply_preferences(&mut fresh, &Preferences::load(&dir), None);
 
     assert!(fresh.values().all(|e| !e.enabled));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1241,10 +1243,62 @@ fn a_recorded_choice_is_restored_over_the_loaded_defaults() {
 
     let mut prefs = Preferences::default();
     prefs.set_group_choice("layout", "Layout Vertical", &HashSet::new());
-    apply_preferences(&mut entries, &prefs);
+    apply_preferences(&mut entries, &prefs, None);
 
     assert!(!entries["Layout Horizontal"].enabled);
     assert!(entries["Layout Vertical"].enabled);
+}
+
+/// A member of *group* that only runs under *compositor*.
+fn gated(name: &str, group: &str, compositor: &str) -> Config {
+    let mut c = grouped(name, group);
+    c.module.requires_compositor = Some(compositor.to_string());
+    c
+}
+
+#[test]
+fn a_group_skips_the_member_that_cannot_run_here() {
+    // Alphabetically first, but gated to a compositor that is not running.
+    // Enabling it anyway gives the group a named winner and no effect —
+    // usable() filters it straight back out when the config is resolved.
+    let mut entries: HashMap<String, ConfigEntry> = [
+        wrap(gated("Layout Grid", "layout", "Hyprland"), true),
+        wrap(grouped("Layout Vertical", "layout"), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    apply_preferences(&mut entries, &Preferences::default(), Some("KDE"));
+
+    assert!(!entries["Layout Grid"].enabled);
+    assert!(entries["Layout Vertical"].enabled);
+}
+
+#[test]
+fn a_recorded_choice_that_cannot_run_here_gives_way() {
+    let mut entries: HashMap<String, ConfigEntry> = [
+        wrap(gated("Layout Grid", "layout", "Hyprland"), true),
+        wrap(grouped("Layout Vertical", "layout"), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    let mut prefs = Preferences::default();
+    prefs.set_group_choice("layout", "Layout Grid", &HashSet::new());
+    apply_preferences(&mut entries, &prefs, Some("KDE"));
+
+    assert!(entries["Layout Vertical"].enabled,
+            "a member that cannot run must not hold the group hostage");
+}
+
+#[test]
+fn an_undetected_compositor_rules_nothing_out() {
+    // Load time: the compositor is not known yet. Gating is only ever a reason
+    // to reject, so not knowing must not reject — set_compositor() revisits it.
+    let mut entries: HashMap<String, ConfigEntry> = [
+        wrap(gated("Layout Grid", "layout", "Hyprland"), true),
+        wrap(grouped("Layout Vertical", "layout"), true),
+    ].into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    apply_preferences(&mut entries, &Preferences::default(), None);
+
+    assert!(entries["Layout Grid"].enabled);
 }
 
 #[test]
@@ -1254,7 +1308,7 @@ fn a_group_without_a_recorded_choice_activates_its_first_member() {
         wrap(grouped("Layout Grid",     "layout"), true),
     ].into_iter().map(|e| (e.name.clone(), e)).collect();
 
-    apply_preferences(&mut entries, &Preferences::default());
+    apply_preferences(&mut entries, &Preferences::default(), None);
 
     assert!(entries["Layout Grid"].enabled);
     assert!(!entries["Layout Vertical"].enabled);
@@ -1269,7 +1323,7 @@ fn a_choice_naming_a_removed_module_falls_back_to_the_first_member() {
 
     let mut prefs = Preferences::default();
     prefs.set_group_choice("layout", "Layout Diagonal", &HashSet::new());
-    apply_preferences(&mut entries, &prefs);
+    apply_preferences(&mut entries, &prefs, None);
 
     assert!(entries["Layout Horizontal"].enabled);
     assert!(!entries["Layout Vertical"].enabled);
@@ -1283,7 +1337,7 @@ fn a_disabled_module_stays_disabled_after_reapplying_preferences() {
 
     let mut prefs = Preferences::default();
     prefs.set_disabled("Voice Control", true);
-    apply_preferences(&mut entries, &prefs);
+    apply_preferences(&mut entries, &prefs, None);
 
     assert!(!entries["Voice Control"].enabled);
 }
