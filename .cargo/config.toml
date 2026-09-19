@@ -1,0 +1,8 @@
+# Two compile jobs, not one per core.
+#
+# A full `cargo test` on this machine gets OOM-killed (exit 137) when rustc
+# fans out across every core: the crate pulls in tokio, evdev and serde, and
+# several of those link units peak at the same time. Two jobs finish in about
+# the same wall time here and leave the desktop usable while they do.
+[build]
+jobs = 2
