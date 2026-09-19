@@ -51,6 +51,10 @@ requires_compositor = "KDE"               # optional gate
 
 Entries are keyed by file base name and the system root is read first, so a user file of the same name **replaces** the system one outright. That is the entire override mechanism: nothing is copied at install time, and an update to a shipped config reaches every user who has not overridden that specific file.
 
+A user file only replaces the shipped one **if it parses**. When it does not, the shipped config stays in effect and the entry carries a `warning` naming the file that was skipped — an override that cannot be read is a mistake in the copy, not a reason to lose the original. Such an entry also reverts to `from_user = false`, because the config actually in effect is the shipped one and has to be layered as one. A broken user file with no shipped twin is still a hard `error`: there is nothing to fall back to.
+
+The fixed sections — `[module]`, `[device]`, `[gaming_mode]`, `[trackpad]`, and the set of section names itself — are `deny_unknown_fields`, so a misspelt key is a parse error rather than a silently dropped line. `match_window_classes` used to turn an app override into a plain module applied to every window; `[remaps]` used to be ignored wholesale. The binding maps are exempt: their keys are button names, and there is no list of legal ones.
+
 Only the system root has to exist. The user root stays absent until someone writes an override, and a missing one is not an error.
 
 ## Architecture

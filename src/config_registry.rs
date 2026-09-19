@@ -861,7 +861,7 @@ impl ConfigRegistry {
     }
 
     fn load_entries(roots: &ConfigRoots) -> HashMap<String, ConfigEntry> {
-        let mut map = HashMap::new();
+        let mut map: HashMap<String, ConfigEntry> = HashMap::new();
         // System first, user second: entries are keyed by config name, so a user
         // file of the same name simply overwrites the system entry as it is read.
         // Within each root, the `apps/` subdirectory is scanned alongside it.
@@ -902,10 +902,38 @@ impl ConfigRegistry {
                 let path = file.path();
                 let path_str = path.to_str().unwrap_or("");
 
-                let (config_opt, errors) = match Config::try_from_file(path_str, name.clone(), &aliases) {
+                let (mut config_opt, mut errors) = match Config::try_from_file(path_str, name.clone(), &aliases) {
                     Ok(c)    => (Some(c), vec![]),
                     Err(msg) => (None, vec![ConfigError { severity: "error", message: msg }]),
                 };
+
+                // A broken file from the user's directory must not take the
+                // shipped config of the same name down with it. Replacing a
+                // shipped config is what a same-named user file is *for*, so
+                // the insert below would otherwise turn one typo into "these
+                // bindings are simply gone" — and the error would read as a
+                // problem with the module rather than with the copy of it.
+                //
+                // The shipped entry is always already in the map: the system
+                // root and its apps/ are scanned before the user's.
+                //
+                // `from_user` reverts with it. It is the first sort key of the
+                // merge, and what is in effect here is the shipped config, so
+                // it has to be layered as one.
+                let mut from_user = from_user;
+                if config_opt.is_none() && from_user {
+                    if let Some(shipped) = map.get(&name).filter(|e: &&ConfigEntry| e.config.is_some()) {
+                        let why = errors.first().map(|e| e.message.clone()).unwrap_or_default();
+                        config_opt = shipped.config.clone();
+                        from_user  = false;
+                        errors     = vec![ConfigError {
+                            severity: "warning",
+                            message:  format!(
+                                "{path_str} has an error and was not loaded — \
+                                 the version Deckery ships is in use instead.\n\n{why}"),
+                        }];
+                    }
+                }
 
                 for e in &errors {
                     eprintln!("deckery: config {:?}: [{}] {}", name, e.severity, e.message);

@@ -87,6 +87,7 @@ impl Default for TrackpadConfig {
 // ── Raw deserialization types ─────────────────────────────────────────────────
 
 #[derive(serde::Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawTrackpadConfig {
     pub left: Option<toml::Value>,
     pub right: Option<toml::Value>,
@@ -319,6 +320,7 @@ pub struct MappedModifiers {
 /// Raw TOML form of the double-click trigger: the key name plus an optional
 /// inter-click window. Parsed from a `trigger = { key = "...", ms = N }` table.
 #[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawDoubleclickTrigger {
     /// Key name (e.g. `"BTN_BASE"`).
     /// `"disabled"` → trigger disabled (explicit opt-out).
@@ -338,6 +340,7 @@ pub struct DoubleclickTrigger {
 
 /// Raw TOML deserialization type for the `[gaming_mode]` section.
 #[derive(serde::Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RawGamingModeConfig {
     /// Double-click trigger configuration.
     /// Absent → default (BTN_BASE, 400 ms).
@@ -422,6 +425,7 @@ impl GamingModeConfig {
 // ── Raw TOML types for [device] / [module] ───────────────────────────────────
 
 #[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawDeviceDeclaration {
     pub class: String,
     pub names: Vec<String>,
@@ -433,6 +437,7 @@ pub struct RawDeviceDeclaration {
 }
 
 #[derive(serde::Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RawModuleMetadata {
     pub requires_compositor: Option<String>,
     pub match_window_class: Option<Vec<String>>,
@@ -444,6 +449,7 @@ pub struct RawModuleMetadata {
 // ── RawConfig ─────────────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawConfig {
     #[serde(default)]
     pub remap: HashMap<String, RemapValue>,

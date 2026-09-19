@@ -1646,3 +1646,147 @@ fn the_readme_is_not_mistaken_for_a_config() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── A broken override falls back to the shipped config ────────────────────────
+
+/// Two roots with the same module in each, the user's copy deliberately broken.
+fn roots_with_a_broken_override(name: &str, user_body: &str) -> (PathBuf, ConfigRoots) {
+    let root   = scratch_dir(name);
+    let system = root.join("system");
+    let user   = root.join("user");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(system.join("Steam Deck Base.toml"), DECK).unwrap();
+    std::fs::write(system.join("KDE Desktop.toml"),
+                   "[remap]\nBTN_TL = [\"KEY_LEFTCTRL\"]\n").unwrap();
+    std::fs::write(user.join("KDE Desktop.toml"), user_body).unwrap();
+    (root, ConfigRoots { system, user })
+}
+
+#[test]
+fn a_broken_user_override_falls_back_to_the_shipped_config() {
+    // Replacing a shipped config is what a same-named user file is for, so a
+    // typo in one used to delete the shipped bindings outright.
+    let (root, roots) = roots_with_a_broken_override(
+        "deckery-fallback-parse", "[remap\nthis is not toml\n");
+
+    let entries = ConfigRegistry::load_entries(&roots);
+    let entry = entries.get("KDE Desktop").expect("the config must still exist");
+
+    assert!(entry.config.is_some(), "the shipped config must stand in");
+    assert!(has_binding(entry.config.as_ref().unwrap(),
+                        evdev::Key::BTN_TL, evdev::Key::KEY_LEFTCTRL),
+            "the shipped bindings must be the ones in effect");
+    assert!(entry.enabled, "a config that loaded is not switched off by the fallback");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_fallback_warns_instead_of_erroring() {
+    // An error would light the tray red and read as "this module is broken".
+    // It is not: it runs, just not in the user's version of it.
+    let (root, roots) = roots_with_a_broken_override(
+        "deckery-fallback-warns", "[remap\nthis is not toml\n");
+
+    let entries = ConfigRegistry::load_entries(&roots);
+    let errors = &entries["KDE Desktop"].errors;
+
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].severity, "warning");
+    assert!(errors[0].message.contains("the version Deckery ships is in use"),
+            "the message must say which file is running: {}", errors[0].message);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_fallback_config_is_layered_as_a_shipped_one() {
+    // `from_user` is the first sort key of the merge. What is in effect here is
+    // the shipped config, so it must not keep the user's rank.
+    let (root, roots) = roots_with_a_broken_override(
+        "deckery-fallback-rank", "[remap\nthis is not toml\n");
+
+    let entries = ConfigRegistry::load_entries(&roots);
+    assert!(!entries["KDE Desktop"].from_user);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_broken_user_file_with_no_shipped_twin_still_errors() {
+    // Nothing to fall back to. Reporting it as a warning would claim a
+    // replacement that does not exist.
+    let root   = scratch_dir("deckery-fallback-none");
+    let system = root.join("system");
+    let user   = root.join("user");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(system.join("Steam Deck Base.toml"), DECK).unwrap();
+    std::fs::write(user.join("My Tweaks.toml"), "[remap\nbroken\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&ConfigRoots { system, user });
+    let entry = &entries["My Tweaks"];
+
+    assert!(entry.config.is_none());
+    assert_eq!(entry.errors[0].severity, "error");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── Unknown keys in the fixed sections ────────────────────────────────────────
+
+#[test]
+fn a_misspelled_module_key_is_rejected_rather_than_merged_everywhere() {
+    // `match_window_classes` used to be dropped silently, which turned an app
+    // override into a plain module applied to every window.
+    let root   = scratch_dir("deckery-deny-module");
+    let system = root.join("system");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::write(system.join("Steam Deck Base.toml"), DECK).unwrap();
+    std::fs::write(system.join("Firefox.toml"),
+                   "[module]\nmatch_window_classes = [\"firefox\"]\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&roots_at(&system));
+    let entry = &entries["Firefox"];
+
+    assert!(entry.config.is_none(), "the file must not load at all");
+    assert_eq!(entry.errors[0].severity, "error");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_misspelled_section_name_is_rejected() {
+    // `[remaps]` parses as valid TOML and used to be ignored wholesale.
+    let root   = scratch_dir("deckery-deny-section");
+    let system = root.join("system");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::write(system.join("Steam Deck Base.toml"), DECK).unwrap();
+    std::fs::write(system.join("Typo.toml"), "[remaps]\nBTN_TL = [\"KEY_A\"]\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&roots_at(&system));
+
+    assert!(entries["Typo"].config.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn button_names_are_still_free_form() {
+    // The guard must not reach into the binding maps: their keys are button
+    // names, and there is no list of legal ones to check against.
+    let root   = scratch_dir("deckery-deny-bindings");
+    let system = root.join("system");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::write(system.join("Steam Deck Base.toml"), DECK).unwrap();
+    std::fs::write(system.join("Odd.toml"),
+                   "[remap]\nBTN_TL-BTN_SOUTH = [\"KEY_A\"]\n").unwrap();
+
+    let entries = ConfigRegistry::load_entries(&roots_at(&system));
+
+    assert!(entries["Odd"].config.is_some(), "a combo key must still parse");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
