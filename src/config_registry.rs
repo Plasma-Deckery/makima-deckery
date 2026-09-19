@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::config::{Config, Event};
 use crate::preferences::Preferences;
-use crate::udev_monitor::Client;
+use crate::session::Client;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 // ── Public types ──────────────────────────────────────────────────────────────

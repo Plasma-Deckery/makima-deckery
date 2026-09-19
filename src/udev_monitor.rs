@@ -10,31 +10,9 @@ use std::{env, path::{Path, PathBuf}, process::Command, sync::Arc};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use crate::compositor;
+use crate::session::{Client, Environment, Server};
 use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle};
 use tokio_stream::StreamExt;
-
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
-pub enum Client {
-    #[default]
-    Default,
-    /// Window class + caption (both forwarded raw by the KWin script) +
-    /// the PID of the focused window's owning process (KDE only; None elsewhere).
-    Class(String, String, Option<u32>),
-}
-
-#[derive(Clone)]
-pub enum Server {
-    Connected(String),
-    Unsupported,
-    Failed,
-}
-
-#[derive(Clone)]
-pub struct Environment {
-    pub user: Result<String, env::VarError>,
-    pub sudo_user: Result<String, env::VarError>,
-    pub server: Server,
-}
 
 /// Spawn a reconnecting evdev reader for a non-Steam-Deck device.
 ///

@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{Config, DeviceClass, DeviceDeclaration, Event};
-use crate::udev_monitor::Client;
+use crate::session::Client;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

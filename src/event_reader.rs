@@ -9,7 +9,7 @@ use crate::state_export::LastAction;
 use crate::state_writer::{StateWriterHandle, StateCommand};
 use crate::trackpad::PadState;
 use crate::trackpad_router;
-use crate::udev_monitor::{Client, Environment, Server};
+use crate::session::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
 use crate::config::Config;
 use deckery_controller::ControllerEvent;

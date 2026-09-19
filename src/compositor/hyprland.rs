@@ -10,7 +10,7 @@
 //!   `/tmp/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock` — event stream
 
 use super::notify_focus_change;
-use crate::udev_monitor::Client;
+use crate::session::Client;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -115,7 +115,7 @@ async fn handle_event(line: &str, active_client: &Arc<Mutex<Client>>, notify: &A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::udev_monitor::Client;
+    use crate::session::Client;
 
     fn make_state() -> (Arc<Mutex<Client>>, Arc<Notify>) {
         (

@@ -29,7 +29,7 @@ pub mod fallback;
 pub mod hyprland;
 pub mod kde;
 
-use crate::udev_monitor::Client;
+use crate::session::Client;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 

@@ -14,7 +14,7 @@
 //!      via `super::notify_focus_change()` and fire `Arc<Notify>`.
 
 use super::notify_focus_change;
-use crate::udev_monitor::Client;
+use crate::session::Client;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use zbus::{interface, proxy, connection::Builder};
@@ -213,7 +213,7 @@ pub async fn run_focus_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::udev_monitor::Client;
+    use crate::session::Client;
     use tokio::time::{timeout, Duration};
 
     fn make_iface() -> WatcherIface {

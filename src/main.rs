@@ -13,6 +13,7 @@ mod mt_trackpad;
 mod preferences;
 mod resolver;
 mod scroll_pad;
+mod session;
 mod state_export;
 mod state_writer;
 mod trackball;
@@ -22,7 +23,7 @@ mod udev_monitor;
 mod virtual_devices;
 
 use crate::config_registry::ConfigRegistry;
-use crate::udev_monitor::*;
+use crate::udev_monitor::start_monitoring_udev;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio;

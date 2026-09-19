@@ -27,7 +27,7 @@
 //! global state).  `should_be_gaming` is the single public entry point used
 //! by `steam_detection_task`.
 
-use crate::udev_monitor::Client;
+use crate::session::Client;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -192,7 +192,7 @@ mod tests {
     /// even when the focused window looks exactly like Steam Big Picture Mode.
     #[tokio::test]
     async fn auto_detect_false_never_sends_true() {
-        use crate::udev_monitor::Client;
+        use crate::session::Client;
         let notify = Arc::new(Notify::new());
         // Focused window is Steam BPM — would normally trigger gaming mode.
         let client = Arc::new(Mutex::new(Client::Class(
@@ -220,7 +220,7 @@ mod tests {
     /// focused window is Steam Big Picture Mode.
     #[tokio::test]
     async fn auto_detect_true_sends_true_for_bpm() {
-        use crate::udev_monitor::Client;
+        use crate::session::Client;
         let notify = Arc::new(Notify::new());
         let client = Arc::new(Mutex::new(Client::Class(
             "steam".to_string(),
