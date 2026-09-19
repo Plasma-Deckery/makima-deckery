@@ -17,9 +17,7 @@ use evdev::{AbsoluteAxisType, EventType, InputEvent, Key, RelativeAxisType};
 use fork::{fork, setsid, Fork};
 use std::{
     collections::HashMap,
-    future::Future,
     option::Option,
-    pin::Pin,
     process::{Command, Stdio},
     str::FromStr,
     sync::Arc,
@@ -1778,9 +1776,12 @@ impl EventReader {
         released_keys
     }
 
-    async fn change_active_layout(&self) {
-        // Get the current client for layout matching.
-        let client: Client = match &self.environment.server {
+    /// The focused window, however this compositor reports one.
+    ///
+    /// Both callers below need it and used to derive it with the same ten
+    /// lines each.
+    async fn current_client(&self) -> Client {
+        match &self.environment.server {
             // Event-driven compositors push focus changes into active_client — read directly.
             Server::Connected(s) if crate::compositor::detect(s).is_event_driven() => {
                 self.active_client.lock().await.clone()
@@ -1790,27 +1791,34 @@ impl EventReader {
                 let known = self.registry.window_class_modules();
                 get_active_window(&self.environment, &known).await
             }
-        };
-        // Cycle active_layout until resolve() finds a valid config for this context.
-        // Lock, mutate, copy the new value, then drop the lock before any async work.
-        // Guard: if we complete a full cycle without a hit (base missing/disabled),
-        // break out rather than looping forever.
-        let layout_num = {
+        }
+    }
+
+    /// Advance to the next layout that actually resolves for *client*.
+    ///
+    /// Returns false — leaving the current layout untouched — when none of them
+    /// does. That is not an exotic state: it is what a missing or switched-off
+    /// base config looks like from here, and the caller has to be able to tell,
+    /// because "nothing resolves" is the one answer retrying cannot improve.
+    async fn advance_layout(&self, client: &Client) -> bool {
+        let found = {
             let mut active_layout = self.active_layout.lock().await;
             let start = *active_layout;
             loop {
                 *active_layout = if *active_layout == 3 { 0 } else { *active_layout + 1 };
-                if self.registry.resolve(&self.base_name, &client, *active_layout).is_some() {
-                    break;
+                if self.registry.resolve(&self.base_name, client, *active_layout).is_some() {
+                    break Some(*active_layout);
                 }
                 if *active_layout == start {
-                    // Full cycle completed with no valid config — give up and stay put.
-                    eprintln!("deckery: change_active_layout: no valid layout found for {:?}", self.base_name);
-                    break;
+                    // Full cycle, no hit. Stay where we were rather than
+                    // leaving the layout on an arbitrary number.
+                    eprintln!("deckery: no layout resolves for {:?} — base config missing or off",
+                              self.base_name);
+                    break None;
                 }
             }
-            *active_layout
         }; // lock released here — safe to await below
+        let Some(layout_num) = found else { return false };
         if self.settings.notify_layout_switch {
             let notify = vec![format!(
                 "notify-send -t 500 'Makima' 'Switching to layout {}'",
@@ -1818,32 +1826,42 @@ impl EventReader {
             )];
             self.spawn_subprocess(&notify).await;
         }
+        true
     }
 
-    fn update_config(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let active_layout = *self.active_layout.lock().await;
-            let client: Client = match &self.environment.server {
-                // Event-driven compositors push focus changes into active_client — read directly.
-                Server::Connected(s) if crate::compositor::detect(s).is_event_driven() => {
-                    self.active_client.lock().await.clone()
-                }
-                // Polling fallback (sway, niri, x11): query on demand.
-                _ => {
-                    let known = self.registry.window_class_modules();
-                    get_active_window(&self.environment, &known).await
-                }
-            };
-            let resolved = self.registry.resolve(&self.base_name, &client, active_layout);
-            match resolved {
-                Some(config) => { *self.current_config.lock().await = config; }
-                None => {
-                    self.change_active_layout().await;
-                    self.update_config().await;
-                }
+    async fn change_active_layout(&self) {
+        let client = self.current_client().await;
+        self.advance_layout(&client).await;
+    }
+
+    /// Re-resolve the active config for the current window and layout.
+    ///
+    /// This used to call change_active_layout() and then itself, which is why
+    /// it was a boxed future. The pair could also fail to terminate: when no
+    /// layout resolves, change_active_layout() leaves the layout as it found
+    /// it, so the retry asked the identical question and recursed again, one
+    /// heap allocation per turn. advance_layout() now reports whether it found
+    /// anything, which turns the retry into a single deterministic step — it
+    /// just tested that layout, so resolving it once more cannot fail.
+    async fn update_config(&self) {
+        let client = self.current_client().await;
+        let layout = *self.active_layout.lock().await;
+
+        let resolved = match self.registry.resolve(&self.base_name, &client, layout) {
+            Some(config) => Some(config),
+            None if self.advance_layout(&client).await => {
+                let layout = *self.active_layout.lock().await;
+                self.registry.resolve(&self.base_name, &client, layout)
             }
-            self.write_state().await;
-        })
+            // Nothing resolves. The last config stays live rather than being
+            // cleared: it is stale, but it is what the controller is holding,
+            // and dropping it would make every button dead instead of wrong.
+            None => None,
+        };
+        if let Some(config) = resolved {
+            *self.current_config.lock().await = config;
+        }
+        self.write_state().await;
     }
 
     async fn write_state(&self) {

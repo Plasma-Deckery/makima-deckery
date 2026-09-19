@@ -670,8 +670,13 @@ fn resolve_module_gated_by_compositor_does_not_apply() {
 
 #[test]
 fn set_enabled_returns_true_when_found() {
-    let r = make_registry(vec![wrap(base("Steam Deck", &["Steam Deck"]), true)]);
-    assert!(r.set_enabled("Steam Deck", false));
+    // A module, not the base config: switching the device itself off is
+    // refused — see a_base_config_cannot_be_disabled.
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(module("Voice Control", None, 0), true),
+    ]);
+    assert!(r.set_enabled("Voice Control", false));
 }
 
 #[test]
@@ -681,10 +686,13 @@ fn set_enabled_returns_false_when_not_found() {
 
 #[test]
 fn set_enabled_reflected_in_snapshot() {
-    let r = make_registry(vec![wrap(base("Steam Deck", &["Steam Deck"]), true)]);
-    assert!(r.snapshot().iter().any(|e| e.name == "Steam Deck" && e.enabled));
-    r.set_enabled("Steam Deck", false);
-    assert!(r.snapshot().iter().any(|e| e.name == "Steam Deck" && !e.enabled));
+    let r = make_registry(vec![
+        wrap(base("Steam Deck", &["Steam Deck"]), true),
+        wrap(module("Voice Control", None, 0), true),
+    ]);
+    assert!(r.snapshot().iter().any(|e| e.name == "Voice Control" && e.enabled));
+    r.set_enabled("Voice Control", false);
+    assert!(r.snapshot().iter().any(|e| e.name == "Voice Control" && !e.enabled));
 }
 
 #[test]
@@ -1790,3 +1798,36 @@ fn button_names_are_still_free_form() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+
+// ── A base config cannot be switched off ──────────────────────────────────────
+
+#[test]
+fn a_base_config_cannot_be_disabled() {
+    // The tray draws it as a plain row, but the control socket is the other way
+    // in. Without this, `config disable "Steam Deck Base"` left resolve() with
+    // no answer on any layout.
+    let dir = scratch_dir("deckery-base-off");
+    let reg = registry_with_user_root(
+        vec![wrap(base("Steam Deck Base", &["Steam Deck"]), true)], &dir);
+
+    assert!(!reg.set_enabled("Steam Deck Base", false),
+            "disabling a base config must be refused");
+    assert_eq!(enabled_names(&reg), vec!["Steam Deck Base"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_module_can_still_be_disabled() {
+    // The guard keys on [device], not on being first in the map.
+    let dir = scratch_dir("deckery-module-off");
+    let reg = registry_with_user_root(vec![
+        wrap(base("Steam Deck Base", &["Steam Deck"]), true),
+        wrap(module("Voice Control", None, 0), true),
+    ], &dir);
+
+    assert!(reg.set_enabled("Voice Control", false));
+    assert_eq!(enabled_names(&reg), vec!["Steam Deck Base"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

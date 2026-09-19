@@ -720,6 +720,14 @@ impl ConfigRegistry {
             if enabled && entry.config.is_none() {
                 return false;
             }
+            // A base config is the device. Switching it off leaves resolve()
+            // with no answer for any layout, and the caller of that — the event
+            // reader's update_config — has nothing left to apply. The tray
+            // already draws the base as a plain row for this reason; the socket
+            // is the other way in, and it needs the same rule.
+            if !enabled && entry.config.as_ref().is_some_and(|c| c.device.is_some()) {
+                return false;
+            }
             let group = entry.config.as_ref().and_then(|c| c.module.exclusive_group.clone());
             let was_enabled = entry.enabled;
 
