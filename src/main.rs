@@ -3,6 +3,7 @@ mod analog;
 mod config;
 mod config_registry;
 mod device_session;
+mod device_tasks;
 mod event_reader;
 mod gesture_pad;
 mod compositor;

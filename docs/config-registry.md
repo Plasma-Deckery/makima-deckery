@@ -18,7 +18,7 @@ A config declares its role through its **content**, never through its filename. 
 | Section | Role |
 |---|---|
 | `[device]` | **Base config** — names the physical device it drives |
-| `[module]` | **Conditional module** — activation conditions (window class, layout, compositor) |
+| `[module]` | **Conditional module** — activation conditions (window class, compositor) |
 | neither | **Plain module** — merged into every base config |
 
 There is no include list. A plain module applies by existing in a config directory, which means adding a feature is dropping in a file and removing it is deleting one — no second place to keep in sync.
@@ -34,7 +34,6 @@ names = ["Steam Deck", "Valve Software"]  # substring-matched against the evdev 
 # apps/konsole.toml — a conditional module
 [module]
 match_window_class = "org.kde.konsole"
-layout = 0
 requires_compositor = "KDE"               # optional gate
 ```
 
@@ -65,8 +64,10 @@ main.rs
   → ConfigRegistry::load(roots)          // read disk, parse, validate
   → Arc<ConfigRegistry>                  // shared via clone — one instance
   → udev_monitor::start_monitoring_udev(registry, ..., ipc_tx)
+      → session::set_environment()        // what session are we in
       → registry.set_compositor(...)      // once, after the environment is resolved
-      → launch_tasks(registry, ...)
+      → DeviceSession { registry, environment, ... }   // built once
+      → device_tasks::launch_tasks(&session, &mut tasks)   // and on every reinit
           → registry.base_configs()       // declared targets → find matching devices
           → registry.any_device_matches()  // is this evdev node one of ours?
           → EventReader { registry, base_name, ... }
@@ -78,7 +79,7 @@ main.rs
 
 Configs are stored **unmerged** — exactly as they appear on disk. `resolve()` merges the layers at the point of use. Enabling or disabling a config takes effect on the next key press without any reload.
 
-Device discovery is *inverted* relative to the old design: instead of scanning evdev nodes and looking for a config named after each one, the registry hands out its declared `[device]` targets and `launch_tasks()` finds the physical device that matches.
+Device discovery is *inverted* relative to the old design: instead of scanning evdev nodes and looking for a config named after each one, the registry hands out its declared `[device]` targets and `device_tasks::launch_tasks()` finds the physical device that matches.
 
 ## Key types
 
@@ -106,28 +107,28 @@ Files that fail to parse are stored with `config: None`. They appear in `state.j
 | `reload()` | `udev_monitor` | In-place update on file-watcher event — activation state is re-read from `preferences.toml` |
 | `set_compositor(Option<String>)` | `udev_monitor` | Record the session compositor; gates `requires_compositor` modules |
 | `any_device_matches(evdev_name) -> bool` | `udev_monitor` | Is this evdev node claimed by a base config? |
-| `base_configs() -> Vec<Config>` | `udev_monitor` | Declared device targets, plain modules already merged |
+| `base_configs() -> Vec<Config>` | `device_tasks` | Declared device targets, plain modules already merged |
 | `window_class_modules() -> Vec<Config>` | `active_client` | Modules that declare a `match_window_class` |
-| `resolve(base_name, client, layout) -> Option<Config>` | `EventReader` | Merged active config for the current window |
+| `resolve(base_name, client) -> Option<Config>` | `EventReader` | Merged active config for the current window |
 | `set_enabled(name, bool)` | `EventReader` IPC | Toggle config on/off; deactivates exclusive-group siblings and persists to `preferences.toml` |
-| `snapshot() -> Vec<ConfigEntry>` | `EventReader`, `udev_monitor` | For `SetLoadedConfigs` state update |
+| `snapshot() -> Vec<ConfigEntry>` | `EventReader`, `udev_monitor`, `device_tasks` | For `SetLoadedConfigs` state update |
 | `base_config_error() -> Option<String>` | `udev_monitor` | First hard parse error, for startup diagnostics |
 
 ## Usability gate
 
-Every query filters entries through the same predicate: the entry must be `enabled`, must have parsed (`config: Some`), and — if it declares `[module] requires_compositor` — that compositor must be the one recorded via `set_compositor()`. The compositor is unknown at load time, which is why it is set separately once `udev_monitor` has resolved the session environment.
+Every query filters entries through the same predicate: the entry must be `enabled`, must have parsed (`config: Some`), and — if it declares `[module] requires_compositor` — that compositor must be the one recorded via `set_compositor()`. The compositor is unknown at load time, which is why it is set separately once `session::set_environment()` has resolved the session.
 
 ## resolve() logic
 
-`resolve()` is keyed on the **base config's name**, not on a kernel device name. Device matching happens exactly once, in `launch_tasks()`; `EventReader` carries the resulting config name and passes it back on every switch. Re-deriving the match per keystroke would make the outcome depend on whether the filename happens to resemble the `[device] names` entries.
+`resolve()` is keyed on the **base config's name**, not on a kernel device name. Device matching happens exactly once, in `device_tasks::launch_tasks()`; `EventReader` carries the resulting config name and passes it back on every switch. Re-deriving the match per keystroke would make the outcome depend on whether the filename happens to resemble the `[device] names` entries.
 
 Merge order, lowest priority first:
 
 1. **Every usable plain module**, sorted by name. The alphabetically last one outranks the earlier ones.
 2. **The base config** — the usable entry with that name, which must have a `[device]` section.
-3. **The conditional module** matching the current window class and layout. Exact window-class match wins; otherwise a layout-only module (`layout != 0`, no `match_window_class`) is used.
+3. **The app override** whose `match_window_class` matches the focused window, if there is one.
 
-Returns `None` when the name identifies no usable base config, or when a layout other than 0 is requested and no module covers it. The latter is deliberate: it lets `change_active_layout()` skip unpopulated layout slots instead of cycling into an empty one.
+Returns `None` only when the name identifies no usable base config. There used to be a second reason — a layout with no module covering it — but the layout mechanism came from upstream makima, no shipped config ever used it, and it was removed along with the loop that probed for those empty slots.
 
 Two asymmetries are worth knowing about, since both are load-bearing in `with_modules()`:
 
@@ -216,4 +217,4 @@ Names are plain filenames — there is no naming convention to decode.
 
 ## Tests
 
-`src/config_registry_tests.rs` covers: `any_device_matches`, `base_configs`, `window_class_modules`, `requires_compositor` gating, automatic module merging (merge order and Gaming Mode preservation), binding-conflict warnings, two-root discovery and override, exclusive groups (sibling deactivation, default and fallback selection, persistence), `resolve` (keyed on config name, window-class match, layout-only fallback, empty-layout `None`, disabled entry filtered, no base config), `set_enabled`, `snapshot`, and `base_config_error`.
+`src/config_registry_tests.rs` covers: `any_device_matches`, `base_configs`, `window_class_modules`, `requires_compositor` gating, automatic module merging (merge order and Gaming Mode preservation), binding-conflict warnings, two-root discovery and override, exclusive groups (sibling deactivation, default and fallback selection, persistence), `resolve` (keyed on config name, window-class match, disabled entry filtered, no base config), `set_enabled`, `snapshot`, and `base_config_error`.
