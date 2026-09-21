@@ -49,11 +49,10 @@ fn base(name: &str, device_names: &[&str]) -> Config {
     c
 }
 
-/// A module config: no `[device]`, optionally bound to a window class / layout.
-fn module(name: &str, window_class: Option<&str>, layout: u16) -> Config {
+/// A module config: no `[device]`, optionally bound to a window class.
+fn module(name: &str, window_class: Option<&str>) -> Config {
     let mut c = Config::new_empty(name.to_string());
     c.module.match_window_class = window_class.map(|s| vec![s.to_string()]);
-    c.module.layout = layout;
     c
 }
 
@@ -118,7 +117,7 @@ fn device_does_not_match_undeclared_name() {
 
 #[test]
 fn module_without_device_section_matches_nothing() {
-    let r = make_registry(vec![wrap(module("konsole", Some("org.kde.konsole"), 0), true)]);
+    let r = make_registry(vec![wrap(module("konsole", Some("org.kde.konsole")), true)]);
     assert!(!r.any_device_matches("Steam Deck"));
 }
 
@@ -139,7 +138,7 @@ fn empty_registry_matches_nothing() {
 fn base_configs_lists_only_configs_with_device_section() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
     ]);
     let bases = r.base_configs();
     assert_eq!(bases.len(), 1);
@@ -161,8 +160,8 @@ fn base_configs_excludes_disabled_and_broken() {
 fn window_class_modules_lists_only_class_bound_modules() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
-        wrap(module("layer2", None, 2), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
+        wrap(module("layer2", None), true),
     ]);
     let mods = r.window_class_modules();
     assert_eq!(mods.len(), 1);
@@ -172,7 +171,7 @@ fn window_class_modules_lists_only_class_bound_modules() {
 #[test]
 fn window_class_modules_excludes_disabled() {
     let r = make_registry(vec![
-        wrap(module("konsole", Some("org.kde.konsole"), 0), false),
+        wrap(module("konsole", Some("org.kde.konsole")), false),
     ]);
     assert!(r.window_class_modules().is_empty());
 }
@@ -181,7 +180,7 @@ fn window_class_modules_excludes_disabled() {
 
 #[test]
 fn compositor_specific_module_hidden_until_compositor_is_set() {
-    let mut m = module("kde-gestures", Some("org.kde.konsole"), 0);
+    let mut m = module("kde-gestures", Some("org.kde.konsole"));
     m.module.requires_compositor = Some("KDE".into());
     let r = make_registry(vec![wrap(m, true)]);
     assert!(r.window_class_modules().is_empty());
@@ -189,7 +188,7 @@ fn compositor_specific_module_hidden_until_compositor_is_set() {
 
 #[test]
 fn compositor_specific_module_visible_on_matching_compositor() {
-    let mut m = module("kde-gestures", Some("org.kde.konsole"), 0);
+    let mut m = module("kde-gestures", Some("org.kde.konsole"));
     m.module.requires_compositor = Some("KDE".into());
     let r = make_registry(vec![wrap(m, true)]);
     r.set_compositor(Some("KDE".into()));
@@ -198,7 +197,7 @@ fn compositor_specific_module_visible_on_matching_compositor() {
 
 #[test]
 fn compositor_specific_module_hidden_on_other_compositor() {
-    let mut m = module("kde-gestures", Some("org.kde.konsole"), 0);
+    let mut m = module("kde-gestures", Some("org.kde.konsole"));
     m.module.requires_compositor = Some("KDE".into());
     let r = make_registry(vec![wrap(m, true)]);
     r.set_compositor(Some("Hyprland".into()));
@@ -207,7 +206,7 @@ fn compositor_specific_module_hidden_on_other_compositor() {
 
 #[test]
 fn unconditional_module_visible_regardless_of_compositor() {
-    let r = make_registry(vec![wrap(module("konsole", Some("org.kde.konsole"), 0), true)]);
+    let r = make_registry(vec![wrap(module("konsole", Some("org.kde.konsole")), true)]);
     r.set_compositor(Some("Hyprland".into()));
     assert_eq!(r.window_class_modules().len(), 1);
 }
@@ -217,20 +216,20 @@ fn unconditional_module_visible_regardless_of_compositor() {
 #[test]
 fn plain_module_bindings_are_merged_into_base() {
     let b = base("Steam Deck", &["Steam Deck"]);
-    let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let m = with_binding(module("gestures", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
 
     let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 }
 
 #[test]
 fn base_binding_wins_over_module() {
     let b = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
-    let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let m = with_binding(module("gestures", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
 
     let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
 }
 
@@ -239,15 +238,15 @@ fn alphabetically_last_module_wins_over_earlier_one() {
     // Colliding bindings are a config bug, reported by report_binding_conflicts.
     // Order is fixed alphabetically so the outcome is at least deterministic,
     // and the warning lands on the config that actually took effect.
-    let first  = with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
-    let second = with_binding(module("bbb", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let first  = with_binding(module("aaa", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let second = with_binding(module("bbb", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
 
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap(first, true),
         wrap(second, true),
     ]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
 }
 
@@ -255,15 +254,15 @@ fn alphabetically_last_module_wins_over_earlier_one() {
 fn a_user_module_wins_over_an_alphabetically_later_shipped_one() {
     // The point of the rule: a small hand-written file patches the shipped set
     // without its author having to find a name that sorts last.
-    let shipped = with_binding(module("zzz Shipped", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
-    let mine    = with_binding(module("aaa Mine",    None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let shipped = with_binding(module("zzz Shipped", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mine    = with_binding(module("aaa Mine",    None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
 
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap(shipped, true),
         wrap_user(mine, true),
     ]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
 }
 
@@ -321,9 +320,9 @@ fn a_user_module_does_not_strip_the_bases_modifiers() {
     let b = with_modifier(base("Steam Deck Base", &["Steam Deck"]), evdev::Key::BTN_TL);
     let r = make_registry(vec![
         wrap(b, true),
-        wrap_user(module("My Tweaks", None, 0), true),
+        wrap_user(module("My Tweaks", None), true),
     ]);
-    let cfg = r.resolve("Steam Deck Base", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck Base", &Client::Default).unwrap();
     assert!(cfg.mapped_modifiers.all.contains(&Event::Key(evdev::Key::BTN_TL)),
             "base modifier lost: {:?}", cfg.mapped_modifiers);
 }
@@ -333,12 +332,12 @@ fn a_module_brings_its_own_modifiers_along() {
     // A module is free to introduce a modifier the base config never uses. Its
     // bindings are merged either way, so without the modifier they would load
     // and then never fire.
-    let m = with_modifier(module("KDE Desktop", None, 0), evdev::Key::BTN_TR);
+    let m = with_modifier(module("KDE Desktop", None), evdev::Key::BTN_TR);
     let r = make_registry(vec![
         wrap(base("Steam Deck Base", &["Steam Deck"]), true),
         wrap(m, true),
     ]);
-    let cfg = r.resolve("Steam Deck Base", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck Base", &Client::Default).unwrap();
     assert!(cfg.mapped_modifiers.all.contains(&Event::Key(evdev::Key::BTN_TR)),
             "module modifier lost: {:?}", cfg.mapped_modifiers);
 }
@@ -348,24 +347,24 @@ fn an_app_override_keeps_the_modifiers_of_the_config_below_it() {
     let b = with_modifier(base("Steam Deck Base", &["Steam Deck"]), evdev::Key::BTN_TL);
     let r = make_registry(vec![
         wrap(b, true),
-        wrap(module("Firefox", Some("firefox"), 0), true),
+        wrap(module("Firefox", Some("firefox")), true),
     ]);
-    let cfg = r.resolve("Steam Deck Base", &class("firefox"), 0).unwrap();
+    let cfg = r.resolve("Steam Deck Base", &class("firefox")).unwrap();
     assert!(cfg.mapped_modifiers.all.contains(&Event::Key(evdev::Key::BTN_TL)),
             "base modifier lost under an app override: {:?}", cfg.mapped_modifiers);
 }
 
 #[test]
 fn among_user_modules_the_alphabet_still_decides() {
-    let first  = with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
-    let second = with_binding(module("bbb", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let first  = with_binding(module("aaa", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let second = with_binding(module("bbb", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
 
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap_user(first, true),
         wrap_user(second, true),
     ]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
 }
 
@@ -374,10 +373,10 @@ fn a_user_module_outranks_the_shipped_base_config() {
     // The bindings somebody wants to change are declared in the base config, so
     // the root rule would buy nothing if it stopped below it.
     let b    = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
-    let mine = with_binding(module("Mine", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let mine = with_binding(module("Mine", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
 
     let r = make_registry(vec![wrap(b, true), wrap_user(mine, true)]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
 }
 
@@ -386,10 +385,10 @@ fn the_users_own_base_config_outranks_their_modules() {
     // Both files are the user's, so nothing is being worked around any more and
     // the more specific statement — the one naming the device — wins.
     let b    = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
-    let mine = with_binding(module("Mine", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let mine = with_binding(module("Mine", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
 
     let r = make_registry(vec![wrap_user(b, true), wrap_user(mine, true)]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 }
 
@@ -399,10 +398,10 @@ fn a_user_module_keeps_what_the_base_config_is() {
     // from a file that declares no hardware. What it *is* must survive that.
     let mut b = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     b.aliases.insert("A".into(), "BTN_SOUTH".into());
-    let mine = with_binding(module("Mine", None, 0), evdev::Key::BTN_NORTH, evdev::Key::KEY_B);
+    let mine = with_binding(module("Mine", None), evdev::Key::BTN_NORTH, evdev::Key::KEY_B);
 
     let r = make_registry(vec![wrap(b, true), wrap_user(mine, true)]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert_eq!(cfg.name, "Steam Deck");
     assert!(cfg.device.is_some(), "the resolved config must still name its device");
     assert_eq!(cfg.aliases.get("A").map(String::as_str), Some("BTN_SOUTH"));
@@ -417,16 +416,16 @@ fn a_user_module_does_not_take_over_gaming_mode() {
     // the base config is its sole authority whoever wrote the module.
     let mut b = base("Steam Deck", &["Steam Deck"]);
     b.gaming_mode_config.auto_detect_steam_games = false;
-    let mine = module("Mine", None, 0);
+    let mine = module("Mine", None);
 
     let r = make_registry(vec![wrap(b, true), wrap_user(mine, true)]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(!cfg.gaming_mode_config.auto_detect_steam_games);
 }
 
 #[test]
 fn module_gated_to_another_compositor_is_not_merged() {
-    let mut m = with_binding(module("kde-only", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mut m = with_binding(module("kde-only", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     m.module.requires_compositor = Some("KDE".into());
 
     let r = make_registry(vec![
@@ -434,34 +433,38 @@ fn module_gated_to_another_compositor_is_not_merged() {
         wrap(m, true),
     ]);
     r.set_compositor(Some("Hyprland".into()));
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 }
 
 #[test]
 fn disabled_module_is_not_merged() {
-    let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let m = with_binding(module("gestures", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap(m, false),
     ]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 }
 
 #[test]
-fn app_and_layout_modules_are_not_merged_into_base() {
-    let app    = with_binding(module("konsole", Some("org.kde.konsole"), 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
-    let layout = with_binding(module("layer2", None, 2), evdev::Key::BTN_NORTH, evdev::Key::KEY_B);
+fn an_app_override_is_not_merged_into_the_base() {
+    // A plain module applies wherever it is merged; an app override waits for
+    // its window. With no window focused, only the first of the two is in.
+    let app   = with_binding(module("konsole", Some("org.kde.konsole")), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let plain = with_binding(module("Voice Control", None), evdev::Key::BTN_NORTH, evdev::Key::KEY_B);
 
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap(app, true),
-        wrap(layout, true),
+        wrap(plain, true),
     ]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
-    assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
-    assert!(!has_binding(&cfg, evdev::Key::BTN_NORTH, evdev::Key::KEY_B));
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
+    assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
+            "the app override must wait for its window");
+    assert!(has_binding(&cfg, evdev::Key::BTN_NORTH, evdev::Key::KEY_B),
+            "the plain module applies unconditionally");
 }
 
 #[test]
@@ -471,7 +474,7 @@ fn trackpad_config_reaches_the_base_from_a_module() {
     // settings when both of its own sides are "disabled" — which an empty base
     // happens to satisfy. Tightening that condition would silently leave both
     // pads dead, hence this test.
-    let mut m = module("Steam Deck Trackpad", None, 0);
+    let mut m = module("Steam Deck Trackpad", None);
     m.trackpad.right.mode = "mt-trackpad".to_string();
     m.trackpad.combined_gesture_device = true;
 
@@ -479,7 +482,7 @@ fn trackpad_config_reaches_the_base_from_a_module() {
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap(m, true),
     ]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert_eq!(cfg.trackpad.right.mode, "mt-trackpad");
     assert!(cfg.trackpad.combined_gesture_device);
 }
@@ -490,11 +493,11 @@ fn base_trackpad_config_wins_over_a_module() {
     // take it back — an override of Steam Deck.toml has to stay in charge.
     let mut b = base("Steam Deck", &["Steam Deck"]);
     b.trackpad.right.mode = "trackball".to_string();
-    let mut m = module("Steam Deck Trackpad", None, 0);
+    let mut m = module("Steam Deck Trackpad", None);
     m.trackpad.right.mode = "mt-trackpad".to_string();
 
     let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert_eq!(cfg.trackpad.right.mode, "trackball");
 }
 
@@ -503,14 +506,14 @@ fn settings_reach_the_base_from_a_module() {
     // [settings] moved into Steam Deck Settings.toml, so stick mode and
     // deadzones now arrive through the module merge rather than from the file
     // that declares the device.
-    let mut m = module("Steam Deck Settings", None, 0);
+    let mut m = module("Steam Deck Settings", None);
     m.settings.insert("RSTICK".to_string(), "cursor".to_string());
 
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap(m, true),
     ]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert_eq!(cfg.settings.get("RSTICK").map(String::as_str), Some("cursor"));
 }
 
@@ -519,8 +522,8 @@ fn module_does_not_override_base_gaming_mode() {
     let mut b = base("Steam Deck", &["Steam Deck"]);
     b.gaming_mode_config.auto_detect_steam_games = false;
 
-    let r = make_registry(vec![wrap(b, true), wrap(module("gestures", None, 0), true)]);
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let r = make_registry(vec![wrap(b, true), wrap(module("gestures", None), true)]);
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(!cfg.gaming_mode_config.auto_detect_steam_games);
 }
 
@@ -528,14 +531,14 @@ fn module_does_not_override_base_gaming_mode() {
 
 #[test]
 fn resolve_returns_none_without_base() {
-    let r = make_registry(vec![wrap(module("konsole", Some("org.kde.konsole"), 0), true)]);
-    assert!(r.resolve("Steam Deck", &class("org.kde.konsole"), 0).is_none());
+    let r = make_registry(vec![wrap(module("konsole", Some("org.kde.konsole")), true)]);
+    assert!(r.resolve("Steam Deck", &class("org.kde.konsole")).is_none());
 }
 
 #[test]
 fn resolve_returns_base_when_no_module_matches() {
     let r = make_registry(vec![wrap(base("Steam Deck", &["Steam Deck"]), true)]);
-    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole")).unwrap();
     assert_eq!(cfg.name, "Steam Deck");
 }
 
@@ -543,9 +546,9 @@ fn resolve_returns_base_when_no_module_matches() {
 fn resolve_applies_window_class_module() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
     ]);
-    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole")).unwrap();
     assert_eq!(cfg.name, "konsole");
 }
 
@@ -553,9 +556,9 @@ fn resolve_applies_window_class_module() {
 fn resolve_ignores_module_for_other_window_class() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
     ]);
-    let cfg = r.resolve("Steam Deck", &class("firefox"), 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &class("firefox")).unwrap();
     assert_eq!(cfg.name, "Steam Deck");
 }
 
@@ -563,56 +566,29 @@ fn resolve_ignores_module_for_other_window_class() {
 fn resolve_window_class_module_wins_over_layout_only_module() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("layer1", None, 1), true),
-        wrap(module("konsole-layer1", Some("org.kde.konsole"), 1), true),
+        wrap(module("layer1", None), true),
+        wrap(module("konsole-layer1", Some("org.kde.konsole")), true),
     ]);
-    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole"), 1).unwrap();
+    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole")).unwrap();
     assert_eq!(cfg.name, "konsole-layer1");
-}
-
-#[test]
-fn resolve_falls_back_to_layout_only_module() {
-    let r = make_registry(vec![
-        wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("layer2", None, 2), true),
-    ]);
-    let cfg = r.resolve("Steam Deck", &class("firefox"), 2).unwrap();
-    assert_eq!(cfg.name, "layer2");
-}
-
-#[test]
-fn resolve_returns_none_for_unpopulated_layout() {
-    // change_active_layout() relies on this to skip empty layout slots.
-    let r = make_registry(vec![wrap(base("Steam Deck", &["Steam Deck"]), true)]);
-    assert!(r.resolve("Steam Deck", &Client::Default, 3).is_none());
-}
-
-#[test]
-fn resolve_module_bound_to_other_layout_does_not_apply() {
-    let r = make_registry(vec![
-        wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 1), true),
-    ]);
-    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
-    assert_eq!(cfg.name, "Steam Deck");
 }
 
 #[test]
 fn resolve_disabled_base_returns_none() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), false),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
     ]);
-    assert!(r.resolve("Steam Deck", &class("org.kde.konsole"), 0).is_none());
+    assert!(r.resolve("Steam Deck", &class("org.kde.konsole")).is_none());
 }
 
 #[test]
 fn resolve_disabled_module_falls_back_to_base() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), false),
+        wrap(module("konsole", Some("org.kde.konsole")), false),
     ]);
-    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole")).unwrap();
     assert_eq!(cfg.name, "Steam Deck");
 }
 
@@ -622,14 +598,14 @@ fn resolve_broken_module_falls_back_to_base() {
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         broken_entry("konsole"),
     ]);
-    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole")).unwrap();
     assert_eq!(cfg.name, "Steam Deck");
 }
 
 #[test]
 fn resolve_unknown_base_name_returns_none() {
     let r = make_registry(vec![wrap(base("Steam Deck", &["Steam Deck"]), true)]);
-    assert!(r.resolve("Xbox Controller", &Client::Default, 0).is_none());
+    assert!(r.resolve("Xbox Controller", &Client::Default).is_none());
 }
 
 #[test]
@@ -638,9 +614,9 @@ fn resolve_keys_on_config_name_not_device_declaration() {
     // launch_tasks() already did the device matching, so resolve() must find
     // the config by name alone.
     let r = make_registry(vec![wrap(base("deck", &["Valve Software Steam Controller"]), true)]);
-    assert_eq!(r.resolve("deck", &Client::Default, 0).unwrap().name, "deck");
+    assert_eq!(r.resolve("deck", &Client::Default).unwrap().name, "deck");
     // The kernel name is not a registry key and must not resolve.
-    assert!(r.resolve("Valve Software Steam Controller", &Client::Default, 0).is_none());
+    assert!(r.resolve("Valve Software Steam Controller", &Client::Default).is_none());
 }
 
 #[test]
@@ -648,21 +624,21 @@ fn resolve_module_name_is_not_a_base_config() {
     // Only entries with a [device] section can anchor a resolve.
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
     ]);
-    assert!(r.resolve("konsole", &Client::Default, 0).is_none());
+    assert!(r.resolve("konsole", &Client::Default).is_none());
 }
 
 #[test]
 fn resolve_module_gated_by_compositor_does_not_apply() {
-    let mut m = module("konsole", Some("org.kde.konsole"), 0);
+    let mut m = module("konsole", Some("org.kde.konsole"));
     m.module.requires_compositor = Some("KDE".into());
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
         wrap(m, true),
     ]);
     r.set_compositor(Some("Hyprland".into()));
-    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &class("org.kde.konsole")).unwrap();
     assert_eq!(cfg.name, "Steam Deck");
 }
 
@@ -674,7 +650,7 @@ fn set_enabled_returns_true_when_found() {
     // refused — see a_base_config_cannot_be_disabled.
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("Voice Control", None, 0), true),
+        wrap(module("Voice Control", None), true),
     ]);
     assert!(r.set_enabled("Voice Control", false));
 }
@@ -688,7 +664,7 @@ fn set_enabled_returns_false_when_not_found() {
 fn set_enabled_reflected_in_snapshot() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("Voice Control", None, 0), true),
+        wrap(module("Voice Control", None), true),
     ]);
     assert!(r.snapshot().iter().any(|e| e.name == "Voice Control" && e.enabled));
     r.set_enabled("Voice Control", false);
@@ -705,7 +681,7 @@ fn set_enabled_refuses_to_activate_broken_config() {
 fn snapshot_contains_all_entries() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
         broken_entry("bad"),
     ]);
     assert_eq!(r.snapshot().len(), 3);
@@ -715,8 +691,8 @@ fn snapshot_contains_all_entries() {
 fn snapshot_reports_kind_per_entry() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("Konsole", Some("org.kde.konsole"), 0), true),
-        wrap(module("Voice Control", None, 0), true),
+        wrap(module("Konsole", Some("org.kde.konsole")), true),
+        wrap(module("Voice Control", None), true),
         broken_entry("bad"),
     ]);
     let snap = r.snapshot();
@@ -731,8 +707,8 @@ fn snapshot_reports_kind_per_entry() {
 fn snapshot_nests_plain_modules_under_the_base_config() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("Voice Control", None, 0), true),
-        wrap(module("Konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("Voice Control", None), true),
+        wrap(module("Konsole", Some("org.kde.konsole")), true),
     ]);
     let snap = r.snapshot();
     let parent = |n: &str| snap.iter().find(|e| e.name == n).unwrap().parent.clone();
@@ -743,9 +719,9 @@ fn snapshot_nests_plain_modules_under_the_base_config() {
 
 #[test]
 fn snapshot_hides_modules_gated_to_another_compositor() {
-    let mut hypr = module("Hyprland Desktop", None, 0);
+    let mut hypr = module("Hyprland Desktop", None);
     hypr.module.requires_compositor = Some("Hyprland".to_string());
-    let mut kde = module("KDE Desktop", None, 0);
+    let mut kde = module("KDE Desktop", None);
     kde.module.requires_compositor = Some("KDE".to_string());
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
@@ -776,7 +752,7 @@ fn base_config_error_none_when_empty_registry() {
 fn base_config_error_none_when_all_valid() {
     let r = make_registry(vec![
         wrap(base("Steam Deck", &["Steam Deck"]), true),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
     ]);
     assert!(r.base_config_error().is_none());
 }
@@ -785,7 +761,7 @@ fn base_config_error_none_when_all_valid() {
 fn base_config_error_some_when_a_file_fails_to_parse() {
     let r = make_registry(vec![
         broken_entry("Steam Deck"),
-        wrap(module("konsole", Some("org.kde.konsole"), 0), true),
+        wrap(module("konsole", Some("org.kde.konsole")), true),
     ]);
     let msg = r.base_config_error();
     assert!(msg.is_some_and(|m| m.contains("parse failed")));
@@ -836,8 +812,8 @@ fn warnings_of(entries: &HashMap<String, ConfigEntry>, name: &str) -> Vec<String
 #[test]
 fn colliding_modules_warn_on_the_losing_config() {
     let mut m = map_of(vec![
-        with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
-        with_binding(module("bbb", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
+        with_binding(module("aaa", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
+        with_binding(module("bbb", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
     ]);
     report_binding_conflicts(&mut m);
 
@@ -852,8 +828,8 @@ fn a_user_module_overriding_a_shipped_one_does_not_warn() {
     // Deliberate, and the only way to change one binding without adopting the
     // whole file it came in — warning about it would train the user to ignore
     // the warnings that do mean something.
-    let shipped = with_binding(module("Steam Deck Buttons", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
-    let mine    = with_binding(module("My Tweaks",          None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let shipped = with_binding(module("Steam Deck Buttons", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mine    = with_binding(module("My Tweaks",          None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
     let mut m: HashMap<String, ConfigEntry> = [
         (shipped.name.clone(), wrap(shipped, true)),
         (mine.name.clone(),    wrap_user(mine, true)),
@@ -868,8 +844,8 @@ fn a_user_module_overriding_a_shipped_one_does_not_warn() {
 fn two_user_modules_colliding_still_warn() {
     // Same root, so nothing says which of them the user meant to win.
     let mut m: HashMap<String, ConfigEntry> = [
-        with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
-        with_binding(module("bbb", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
+        with_binding(module("aaa", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
+        with_binding(module("bbb", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
     ].into_iter().map(|c| (c.name.clone(), wrap_user(c, true))).collect();
     report_binding_conflicts(&mut m);
 
@@ -879,8 +855,8 @@ fn two_user_modules_colliding_still_warn() {
 #[test]
 fn distinct_bindings_do_not_warn() {
     let mut m = map_of(vec![
-        with_binding(module("aaa", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
-        with_binding(module("bbb", None, 0), evdev::Key::BTN_NORTH, evdev::Key::KEY_B),
+        with_binding(module("aaa", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
+        with_binding(module("bbb", None), evdev::Key::BTN_NORTH, evdev::Key::KEY_B),
     ]);
     report_binding_conflicts(&mut m);
     assert!(warnings_of(&m, "bbb").is_empty());
@@ -890,9 +866,9 @@ fn distinct_bindings_do_not_warn() {
 fn modules_gated_to_different_compositors_do_not_warn() {
     // KDE and Hyprland modules never load together, so identical bindings in
     // both are the intended translation of one gesture, not a conflict.
-    let mut kde = with_binding(module("KDE Desktop", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mut kde = with_binding(module("KDE Desktop", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     kde.module.requires_compositor = Some("KDE".into());
-    let mut hypr = with_binding(module("Hyprland Desktop", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
+    let mut hypr = with_binding(module("Hyprland Desktop", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
     hypr.module.requires_compositor = Some("Hyprland".into());
 
     let mut m = map_of(vec![kde, hypr]);
@@ -907,8 +883,8 @@ fn base_and_app_configs_are_exempt_from_conflict_reporting() {
     // to override its modules, and an app config only applies to its window.
     let mut m = map_of(vec![
         with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A),
-        with_binding(module("konsole", Some("org.kde.konsole"), 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
-        with_binding(module("zzz", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_C),
+        with_binding(module("konsole", Some("org.kde.konsole")), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B),
+        with_binding(module("zzz", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_C),
     ]);
     report_binding_conflicts(&mut m);
     assert!(warnings_of(&m, "zzz").is_empty());
@@ -1103,7 +1079,7 @@ fn enabling_a_group_member_switches_its_siblings_off() {
         wrap(grouped("Layout Horizontal", "layout"), true),
         wrap(grouped("Layout Vertical",   "layout"), false),
         wrap(grouped("Layout Grid",       "layout"), false),
-        wrap(module("Voice Control", None, 0), true),
+        wrap(module("Voice Control", None), true),
     ], &dir);
 
     assert!(r.set_enabled("Layout Vertical", true));
@@ -1233,7 +1209,7 @@ fn a_group_choice_survives_a_reload() {
 fn disabling_a_module_is_recorded_as_a_preference() {
     let dir = scratch_dir("deckery-prefs-disable");
     let r = registry_with_user_root(vec![
-        wrap(module("Voice Control", None, 0), true),
+        wrap(module("Voice Control", None), true),
     ], &dir);
 
     r.set_enabled("Voice Control", false);
@@ -1340,7 +1316,7 @@ fn a_choice_naming_a_removed_module_falls_back_to_the_first_member() {
 #[test]
 fn a_disabled_module_stays_disabled_after_reapplying_preferences() {
     let mut entries: HashMap<String, ConfigEntry> = [
-        wrap(module("Voice Control", None, 0), true),
+        wrap(module("Voice Control", None), true),
     ].into_iter().map(|e| (e.name.clone(), e)).collect();
 
     let mut prefs = Preferences::default();
@@ -1417,7 +1393,7 @@ fn modules_in_the_same_exclusive_group_do_not_warn() {
 
 #[test]
 fn a_group_member_still_warns_about_an_ungrouped_module() {
-    let a = with_binding(module("Alpha", None, 0), evdev::Key::BTN_DPAD_UP, evdev::Key::KEY_A);
+    let a = with_binding(module("Alpha", None), evdev::Key::BTN_DPAD_UP, evdev::Key::KEY_A);
     let b = with_binding(grouped("Bravo", "layout"), evdev::Key::BTN_DPAD_UP, evdev::Key::KEY_B);
 
     let mut entries: HashMap<String, ConfigEntry> =
@@ -1463,11 +1439,11 @@ fn a_group_choice_survives_a_restart() {
 #[test]
 fn resolving_twice_returns_the_same_instance() {
     let b = base("Steam Deck", &["Steam Deck"]);
-    let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let m = with_binding(module("gestures", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
 
-    let first  = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
-    let second = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let first  = r.resolve("Steam Deck", &Client::Default).unwrap();
+    let second = r.resolve("Steam Deck", &Client::Default).unwrap();
 
     // Same allocation, not merely equal — the second call did no work.
     assert!(Arc::ptr_eq(&first, &second));
@@ -1477,15 +1453,15 @@ fn resolving_twice_returns_the_same_instance() {
 fn a_toggle_is_visible_to_the_next_resolve() {
     let dir = scratch_dir("deckery-cache-toggle");
     let b = base("Steam Deck", &["Steam Deck"]);
-    let m = with_binding(module("gestures", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let m = with_binding(module("gestures", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     let r = registry_with_user_root(vec![wrap(b, true), wrap(m, true)], &dir);
 
-    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default).unwrap(),
                         evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 
     assert!(r.set_enabled("gestures", false));
 
-    assert!(!has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+    assert!(!has_binding(&r.resolve("Steam Deck", &Client::Default).unwrap(),
                          evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1493,30 +1469,30 @@ fn a_toggle_is_visible_to_the_next_resolve() {
 #[test]
 fn a_compositor_change_is_visible_to_the_next_resolve() {
     let b = base("Steam Deck", &["Steam Deck"]);
-    let mut m = with_binding(module("kde only", None, 0), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
+    let mut m = with_binding(module("kde only", None), evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     m.module.requires_compositor = Some("KDE".to_string());
     let r = make_registry(vec![wrap(b, true), wrap(m, true)]);
 
     r.set_compositor(Some("Hyprland".to_string()));
-    assert!(!has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+    assert!(!has_binding(&r.resolve("Steam Deck", &Client::Default).unwrap(),
                          evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 
     r.set_compositor(Some("KDE".to_string()));
-    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default).unwrap(),
                         evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 }
 
 #[test]
 fn the_cache_distinguishes_window_class_and_layout() {
     let b = with_binding(base("Steam Deck", &["Steam Deck"]), evdev::Key::BTN_SOUTH, evdev::Key::KEY_B);
-    let app = with_binding(module("konsole", Some("org.kde.konsole"), 0),
+    let app = with_binding(module("konsole", Some("org.kde.konsole")),
                            evdev::Key::BTN_SOUTH, evdev::Key::KEY_A);
     let r = make_registry(vec![wrap(b, true), wrap(app, true)]);
 
     // Same base, same layout — only the focused window differs. Keying the cache
     // on the base alone would serve the app override to every other window.
-    let focused = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
-    let plain   = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let focused = r.resolve("Steam Deck", &class("org.kde.konsole")).unwrap();
+    let plain   = r.resolve("Steam Deck", &Client::Default).unwrap();
 
     assert!(has_binding(&focused, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
     assert!(has_binding(&plain,   evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
@@ -1537,14 +1513,14 @@ fn a_reload_is_visible_to_the_next_resolve() {
         "[module]\n\n[remap]\nBTN_SOUTH = [\"KEY_A\"]\n").unwrap();
 
     let r = ConfigRegistry::load(ConfigRoots { system: system.clone(), user });
-    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default, 0).unwrap(),
+    assert!(has_binding(&r.resolve("Steam Deck", &Client::Default).unwrap(),
                         evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 
     std::fs::write(system.join("gestures.toml"),
         "[module]\n\n[remap]\nBTN_SOUTH = [\"KEY_B\"]\n").unwrap();
     r.reload();
 
-    let cfg = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
+    let cfg = r.resolve("Steam Deck", &Client::Default).unwrap();
     assert!(has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_B));
     assert!(!has_binding(&cfg, evdev::Key::BTN_SOUTH, evdev::Key::KEY_A));
 
@@ -1554,20 +1530,20 @@ fn a_reload_is_visible_to_the_next_resolve() {
 #[test]
 fn unclaimed_window_classes_share_one_cache_entry() {
     let b = base("Steam Deck", &["Steam Deck"]);
-    let app = module("konsole", Some("org.kde.konsole"), 0);
+    let app = module("konsole", Some("org.kde.konsole"));
     let r = make_registry(vec![wrap(b, true), wrap(app, true)]);
 
     // Neither class is claimed by a module, so both resolve to the same config
     // as no focused window at all — and must not each occupy the cache.
-    let plain   = r.resolve("Steam Deck", &Client::Default, 0).unwrap();
-    let firefox = r.resolve("Steam Deck", &class("firefox"), 0).unwrap();
-    let mail    = r.resolve("Steam Deck", &class("thunderbird"), 0).unwrap();
+    let plain   = r.resolve("Steam Deck", &Client::Default).unwrap();
+    let firefox = r.resolve("Steam Deck", &class("firefox")).unwrap();
+    let mail    = r.resolve("Steam Deck", &class("thunderbird")).unwrap();
     assert!(Arc::ptr_eq(&plain, &firefox));
     assert!(Arc::ptr_eq(&plain, &mail));
 
     // A claimed class keeps its own entry — folding it in would hand Konsole's
     // override to every other window.
-    let konsole = r.resolve("Steam Deck", &class("org.kde.konsole"), 0).unwrap();
+    let konsole = r.resolve("Steam Deck", &class("org.kde.konsole")).unwrap();
     assert!(!Arc::ptr_eq(&plain, &konsole));
 
     assert_eq!(r.resolved.lock().unwrap().len(), 2);
@@ -1823,7 +1799,7 @@ fn a_module_can_still_be_disabled() {
     let dir = scratch_dir("deckery-module-off");
     let reg = registry_with_user_root(vec![
         wrap(base("Steam Deck Base", &["Steam Deck"]), true),
-        wrap(module("Voice Control", None, 0), true),
+        wrap(module("Voice Control", None), true),
     ], &dir);
 
     assert!(reg.set_enabled("Voice Control", false));

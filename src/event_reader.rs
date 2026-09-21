@@ -19,7 +19,6 @@ use std::{
     collections::HashMap,
     option::Option,
     process::{Command, Stdio},
-    str::FromStr,
     sync::Arc,
 };
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
@@ -46,8 +45,6 @@ struct Settings {
     cursor: Movement,
     scroll: Movement,
     chain_only: bool,
-    layout_switcher: Option<(Event, Vec<Event>)>,
-    notify_layout_switch: bool,
     /// If true, cursor/scroll loops keep running even while makima is paused.
     /// Default: true. Set CURSOR_WHEN_PAUSED = "false" in [settings] to disable.
     cursor_when_paused: bool,
@@ -96,7 +93,6 @@ pub struct EventReader {
     /// when a mid-hold modifier change (e.g. R1) switched the resolution to a combo.
     emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>>,
     device_is_connected: Arc<Mutex<bool>>,
-    active_layout: Arc<Mutex<u16>>,
     /// Held as an `Arc` because it is cloned out of the mutex on every event so
     /// the lock is not carried into the conversion — a deep copy there would put
     /// the whole merged config on the per-keypress path.
@@ -168,7 +164,6 @@ impl EventReader {
         let cursor_movement = Arc::new(Mutex::new((0, 0)));
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
-        let active_layout: Arc<Mutex<u16>> = Arc::new(Mutex::new(0));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
@@ -285,34 +280,6 @@ impl EventReader {
             speed: scroll_speed,
             acceleration: scroll_acceleration,
         };
-        let layout_switcher = if let Some(combination) = base_config.settings.get("LAYOUT_SWITCHER") {
-            if let Some(sequence) = combination.rsplit_once("-") {
-                let mut mods: Vec<Event> = sequence
-                    .0
-                    .split("-")
-                    .map(|m| Event::Key(Key::from_str(m).expect("LAYOUT_SWITCHER is invalid.")))
-                    .collect();
-                mods.sort();
-                mods.dedup();
-                Some((
-                    Event::Key(Key::from_str(sequence.1).expect("LAYOUT_SWITCHER is invalid.")),
-                    mods,
-                ))
-            } else {
-                Some((
-                    Event::Key(Key::from_str(combination).expect("LAYOUT_SWITCHER is invalid.")),
-                    Vec::new(),
-                ))
-            }
-        } else {
-            None
-        };
-        let notify_layout_switch: bool = base_config.settings
-            .get("NOTIFY_LAYOUT_SWITCH")
-            .unwrap_or(&"false".to_string())
-            .parse()
-            .expect("NOTIFY_LAYOUT_SWITCH can only be true or false.");
-
         let cursor_when_paused: bool = base_config.settings
             .get("CURSOR_WHEN_PAUSED")
             .unwrap_or(&"true".to_string())
@@ -332,8 +299,6 @@ impl EventReader {
             cursor,
             scroll,
             chain_only,
-            layout_switcher,
-            notify_layout_switch,
             cursor_when_paused,
         };
 
@@ -361,7 +326,6 @@ impl EventReader {
             held_keys,
             emitted_outputs,
             device_is_connected,
-            active_layout,
             current_config,
             environment,
             settings,
@@ -1459,26 +1423,6 @@ impl EventReader {
             }
             ResolvedBinding::Unbound => {}
         }
-        if let Some(map) = &self.settings.layout_switcher {
-            if map.0 == event && map.1 == modifiers && value == 1 {
-                let mut virt_dev = self.virt_dev.lock().await;
-                for modifier in modifiers {
-                    self.toggle_modifiers(modifier, 0, &config).await;
-                    if let Event::Key(key) = modifier {
-                        let virtual_event: InputEvent =
-                            InputEvent::new_now(EventType::KEY, key.code(), 0);
-                        virt_dev.keys.emit(&[virtual_event]).unwrap()
-                    }
-                }
-                if let Event::Key(key) = event {
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 0);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap()
-                }
-                self.change_active_layout().await;
-                return;
-            }
-        }
         self.emit_nonmapped_event(default_event, event, value, &modifiers, &config)
             .await;
     }
@@ -1794,72 +1738,21 @@ impl EventReader {
         }
     }
 
-    /// Advance to the next layout that actually resolves for *client*.
+    /// Re-resolve the active config for the currently focused window.
     ///
-    /// Returns false — leaving the current layout untouched — when none of them
-    /// does. That is not an exotic state: it is what a missing or switched-off
-    /// base config looks like from here, and the caller has to be able to tell,
-    /// because "nothing resolves" is the one answer retrying cannot improve.
-    async fn advance_layout(&self, client: &Client) -> bool {
-        let found = {
-            let mut active_layout = self.active_layout.lock().await;
-            let start = *active_layout;
-            loop {
-                *active_layout = if *active_layout == 3 { 0 } else { *active_layout + 1 };
-                if self.registry.resolve(&self.base_name, client, *active_layout).is_some() {
-                    break Some(*active_layout);
-                }
-                if *active_layout == start {
-                    // Full cycle, no hit. Stay where we were rather than
-                    // leaving the layout on an arbitrary number.
-                    eprintln!("deckery: no layout resolves for {:?} — base config missing or off",
-                              self.base_name);
-                    break None;
-                }
-            }
-        }; // lock released here — safe to await below
-        let Some(layout_num) = found else { return false };
-        if self.settings.notify_layout_switch {
-            let notify = vec![format!(
-                "notify-send -t 500 'Makima' 'Switching to layout {}'",
-                layout_num
-            )];
-            self.spawn_subprocess(&notify).await;
-        }
-        true
-    }
-
-    async fn change_active_layout(&self) {
-        let client = self.current_client().await;
-        self.advance_layout(&client).await;
-    }
-
-    /// Re-resolve the active config for the current window and layout.
-    ///
-    /// This used to call change_active_layout() and then itself, which is why
-    /// it was a boxed future. The pair could also fail to terminate: when no
-    /// layout resolves, change_active_layout() leaves the layout as it found
-    /// it, so the retry asked the identical question and recursed again, one
-    /// heap allocation per turn. advance_layout() now reports whether it found
-    /// anything, which turns the retry into a single deterministic step — it
-    /// just tested that layout, so resolving it once more cannot fail.
+    /// This used to cycle through four global layouts looking for one that
+    /// resolved, and to recurse between here and change_active_layout() while
+    /// doing it. Both are gone with the layouts themselves: resolve() now
+    /// answers None only when the base config is missing or switched off, and
+    /// there is no second question to ask in that case.
     async fn update_config(&self) {
         let client = self.current_client().await;
-        let layout = *self.active_layout.lock().await;
-
-        let resolved = match self.registry.resolve(&self.base_name, &client, layout) {
-            Some(config) => Some(config),
-            None if self.advance_layout(&client).await => {
-                let layout = *self.active_layout.lock().await;
-                self.registry.resolve(&self.base_name, &client, layout)
-            }
-            // Nothing resolves. The last config stays live rather than being
-            // cleared: it is stale, but it is what the controller is holding,
-            // and dropping it would make every button dead instead of wrong.
-            None => None,
-        };
-        if let Some(config) = resolved {
-            *self.current_config.lock().await = config;
+        match self.registry.resolve(&self.base_name, &client) {
+            Some(config) => { *self.current_config.lock().await = config; }
+            // The last config stays live rather than being cleared: it is
+            // stale, but it is what the controller is holding, and dropping it
+            // would make every button dead instead of wrong.
+            None => {}
         }
         self.write_state().await;
     }
@@ -1892,13 +1785,6 @@ impl EventReader {
             Ok(guard) => guard.clone(),
             Err(_) => {
                 eprintln!("deckery: write_state: modifiers lock timed out — possible deadlock");
-                return;
-            }
-        };
-        let layout = match tokio::time::timeout(TIMEOUT, self.active_layout.lock()).await {
-            Ok(guard) => *guard,
-            Err(_) => {
-                eprintln!("deckery: write_state: active_layout lock timed out — possible deadlock");
                 return;
             }
         };
@@ -2029,7 +1915,7 @@ impl EventReader {
             "y": crate::analog::normalize(imu_raw.1),
         });
         let mut event_state = crate::state_export::build_state(
-            &config, &modifiers, layout, paused, gaming_mode,
+            &config, &modifiers, paused, gaming_mode,
             &held_keys, &last_action, &config_stack, &self.gaming_mode_config,
         );
         event_state["trackpads"] = trackpads;
@@ -2127,9 +2013,6 @@ impl EventReader {
                     let mods = match tokio::time::timeout(TIMEOUT, self.modifiers.lock()).await {
                         Ok(g) => g.clone(), Err(_) => continue,
                     };
-                    let layout = match tokio::time::timeout(TIMEOUT, self.active_layout.lock()).await {
-                        Ok(g) => *g, Err(_) => continue,
-                    };
                     let la = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
                         Ok(g) => g.clone(), Err(_) => continue,
                     };
@@ -2143,7 +2026,7 @@ impl EventReader {
                         vec![base_name, config.name.clone()]
                     };
                     let mut event_state = crate::state_export::build_state(
-                        &config, &mods, layout, is_paused, is_gaming,
+                        &config, &mods, is_paused, is_gaming,
                         &hk, &la, &stack, &self.gaming_mode_config,
                     );
                     event_state["trackpads"] = serde_json::Value::Null;

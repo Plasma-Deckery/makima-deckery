@@ -8,7 +8,7 @@
 // declares what it is through its *content*, never through its filename:
 //
 //   [device]  → base config; names the physical device it drives
-//   [module]  → activation conditions (window class, layout, compositor)
+//   [module]  → activation conditions (window class, compositor)
 //   neither   → plain module, merged into every base config
 //
 // Files are discovered by scanning two roots: the system config directory that
@@ -283,8 +283,7 @@ pub struct ConfigRegistry {
     /// change, so it is computed once per distinct question and dropped whole
     /// at those three points.
     ///
-    /// `None` is cached too: "this base has no config for that layout" is the
-    /// answer `change_active_layout` probes for in a loop.
+    /// `None` is cached too — it means this name is no usable base config.
     resolved: Mutex<HashMap<ResolveKey, Option<Arc<Config>>>>,
     /// Bumped by `invalidate_resolved()`. An answer is only worth caching if the
     /// entries did not change while it was being computed — the merge runs
@@ -301,7 +300,6 @@ pub struct ConfigRegistry {
 struct ResolveKey {
     base_name: String,
     window_class: Option<String>,
-    layout: u16,
 }
 
 impl ConfigRegistry {
@@ -557,15 +555,13 @@ impl ConfigRegistry {
     /// Merge order, lowest priority first:
     ///   1. every enabled plain module, alphabetically last one winning
     ///   2. the base config itself
-    ///   3. the conditional module matching the current window class and layout
+    ///   3. the app override matching the current window class
     ///
-    /// Returns None when `base_name` names no usable base config, or when a
-    /// layout other than 0 is requested and no module covers it — the latter is
-    /// what lets `change_active_layout()` skip unpopulated layout slots.
+    /// Returns None when `base_name` names no usable base config.
     /// The result is memoised — see the `resolved` field. Callers get an `Arc`
     /// because this runs per key press and the config holds several maps that
     /// would otherwise be deep-copied each time.
-    pub fn resolve(&self, base_name: &str, client: &Client, layout: u16) -> Option<Arc<Config>> {
+    pub fn resolve(&self, base_name: &str, client: &Client) -> Option<Arc<Config>> {
         let key = ResolveKey {
             base_name: base_name.to_string(),
             window_class: match client {
@@ -578,7 +574,6 @@ impl ConfigRegistry {
                 }
                 _ => None,
             },
-            layout,
         };
         if let Some(hit) = self.resolved.lock().unwrap().get(&key) {
             return hit.clone();
@@ -590,7 +585,7 @@ impl ConfigRegistry {
         // cache that was just emptied because of that change, where it would sit
         // until something else invalidated it.
         let generation = self.generation.load(Ordering::Acquire);
-        let answer = self.resolve_uncached(base_name, client, layout).map(Arc::new);
+        let answer = self.resolve_uncached(base_name, client).map(Arc::new);
         let mut resolved = self.resolved.lock().unwrap();
         if self.generation.load(Ordering::Acquire) == generation {
             resolved.insert(key, answer.clone());
@@ -600,10 +595,8 @@ impl ConfigRegistry {
 
     /// Does any usable module name this window class?
     ///
-    /// Deliberately ignores the layout, unlike the lookup in `resolve_uncached`:
-    /// a class claimed for some other layout is still worth keying on, and being
-    /// generous here only costs a cache entry, whereas being too narrow would
-    /// serve one window's override to another.
+    /// Being generous here only costs a cache entry, whereas being too narrow
+    /// would serve one window's override to another.
     fn claims_window_class(&self, class: &str) -> bool {
         let compositor = self.compositor();
         self.entries.lock().unwrap()
@@ -615,7 +608,7 @@ impl ConfigRegistry {
 
     /// Build a resolved config from scratch. Everything expensive lives here;
     /// `resolve` is what keeps it from running more than once per question.
-    fn resolve_uncached(&self, base_name: &str, client: &Client, layout: u16) -> Option<Config> {
+    fn resolve_uncached(&self, base_name: &str, client: &Client) -> Option<Config> {
         let compositor = self.compositor();
         let compositor = compositor.as_deref();
         let entries = self.entries.lock().unwrap();
@@ -629,26 +622,20 @@ impl ConfigRegistry {
             Client::Default => None,
         };
 
-        // Most specific first: a module bound to both window class and layout
-        // beats one bound to the layout alone.
-        let candidates = || entries.values()
-            .filter_map(|e| usable(e, compositor))
-            .filter(|c| c.module.layout == layout);
-
         let by_class = client_class.and_then(|class| {
-            candidates().find(|c| {
-                c.module.match_window_class.as_deref()
-                    .is_some_and(|patterns| patterns.iter().any(|p| p == class))
-            })
+            entries.values()
+                .filter_map(|e| usable(e, compositor))
+                .find(|c| {
+                    c.module.match_window_class.as_deref()
+                        .is_some_and(|patterns| patterns.iter().any(|p| p == class))
+                })
         });
-        let by_layout = candidates()
-            .find(|c| c.module.match_window_class.is_none() && c.module.layout != 0);
 
-        let mut resolved = match by_class.or(by_layout) {
+        let mut resolved = match by_class {
             Some(module) => module.merged_with_base(&base),
-            // Layout 0 is always valid — it is the base config with no module.
-            None if layout == 0 => base,
-            None => return None,
+            // No window override applies — the base config with its modules is
+            // the answer, and it is always a valid one.
+            None => base,
         };
 
         // Hints resolve here and nowhere else: this is the single funnel every
@@ -721,7 +708,7 @@ impl ConfigRegistry {
                 return false;
             }
             // A base config is the device. Switching it off leaves resolve()
-            // with no answer for any layout, and the caller of that — the event
+            // with no answer at all, and the caller of that — the event
             // reader's update_config — has nothing left to apply. The tray
             // already draws the base as a plain row for this reason; the socket
             // is the other way in, and it needs the same rule.
@@ -1041,12 +1028,10 @@ fn usable<'a>(entry: &'a ConfigEntry, compositor: Option<&str>) -> Option<&'a Co
 }
 
 /// A config that applies wherever it is merged: it names no device, matches no
-/// window class, and belongs to no layout but the base one. These are the files
+/// window class. These are the files
 /// auto-discovery pulls in — everything else is activated by a condition.
 fn is_plain_module(config: &Config) -> bool {
-    config.device.is_none()
-        && config.module.match_window_class.is_none()
-        && config.module.layout == 0
+    config.device.is_none() && config.module.match_window_class.is_none()
 }
 
 /// Merge every usable plain module into `config`.

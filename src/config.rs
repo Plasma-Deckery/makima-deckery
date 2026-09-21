@@ -257,8 +257,6 @@ pub struct ModuleMetadata {
     /// Applied when the focused window's class matches any of these strings.
     /// Accepts a single string or a list: `match_window_class = ["firefox", "org.mozilla.firefox"]`.
     pub match_window_class: Option<Vec<String>>,
-    /// Applied only while this layout is active. Defaults to layout 0.
-    pub layout: u16,
     /// Name of a set of mutually exclusive modules. Activating one member
     /// deactivates its siblings — see `ConfigRegistry::set_enabled`.
     pub exclusive_group: Option<String>,
@@ -441,8 +439,6 @@ pub struct RawDeviceDeclaration {
 pub struct RawModuleMetadata {
     pub requires_compositor: Option<String>,
     pub match_window_class: Option<Vec<String>>,
-    #[serde(default)]
-    pub layout: u16,
     pub exclusive_group: Option<String>,
 }
 
@@ -572,7 +568,6 @@ impl Config {
         let module = ModuleMetadata {
             requires_compositor: raw_module.requires_compositor,
             match_window_class: raw_module.match_window_class,
-            layout: raw_module.layout,
             exclusive_group: raw_module.exclusive_group,
         };
         Self {
