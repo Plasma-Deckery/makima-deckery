@@ -5,7 +5,7 @@
 // to display live button mappings without re-implementing makima's lookup
 // logic.
 //
-// Actual I/O (writing /tmp/makima-state.json) is handled exclusively by
+// Actual I/O (writing the state file) is handled exclusively by
 // `state_writer::flush()` via the `StateWriterHandle` channel.  Nothing in
 // this module touches the filesystem.
 

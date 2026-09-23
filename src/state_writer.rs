@@ -1,7 +1,7 @@
 // ── Deckery State Writer ──────────────────────────────────────────────────────
 //
-// A dedicated Tokio task that is the sole owner and writer of
-// /tmp/makima-state.json.  Every module that needs to contribute state sends
+// A dedicated Tokio task that is the sole owner and writer of the state file.
+// Every module that needs to contribute state sends
 // a `StateCommand` over a cloned `Sender`; the task merges all slots and
 // writes atomically on every command.
 //
@@ -16,6 +16,7 @@
 //                 either one without re-implementing ConfigRoots::resolve().
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use crate::config_registry::{ConfigRoots, ConfigSummary};
 
@@ -58,6 +59,30 @@ pub enum StateCommand {
 
 // ── Spawner ───────────────────────────────────────────────────────────────────
 
+/// Where the state file lives.
+///
+/// `$XDG_RUNTIME_DIR` is a per-user tmpfs, mode `0700`, created by systemd at
+/// login — the same directory the control socket lives in, for the same
+/// reason. `/tmp` is mode `1777`: anything able to create the path first
+/// decides what every reader believes, and both readers treat the contents as
+/// a description of makima's state.
+///
+/// The fallback is for sessions that have no runtime directory at all — a bare
+/// TTY, a container started without one. There `/tmp` is what there is, and a
+/// readable state file beats none.
+pub fn state_path() -> PathBuf {
+    state_path_in(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
+}
+
+/// The choice itself, with the environment passed in rather than read — so it
+/// can be tested without mutating a process-global the other tests share.
+fn state_path_in(runtime_dir: Option<&str>) -> PathBuf {
+    match runtime_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("makima-state.json"),
+        _ => PathBuf::from("/tmp/makima-state.json"),
+    }
+}
+
 /// Spawn the writer task and return the sender handle.
 /// The task writes the initial "starting" state immediately.
 pub fn spawn_state_writer() -> StateWriterHandle {
@@ -73,10 +98,14 @@ pub fn spawn_state_writer() -> StateWriterHandle {
         // but most presses change nothing a reader can see — re-writing the same
         // document would be pure disk traffic on the input path.
         let mut written = String::new();
+        // Resolved once: the process keeps the directory it started in, and
+        // re-deriving it per write would let a mid-session environment change
+        // split the file in two.
+        let path = state_path();
 
         // Write the initial "starting" state before any command arrives so the
         // tray sees a non-stale file the moment makima boots.
-        flush(&lifecycle, &errors, &event_state, &configs, &roots, &mut written);
+        flush(&lifecycle, &errors, &event_state, &configs, &roots, &path, &mut written);
 
         while let Some(cmd) = rx.recv().await {
             apply(cmd, &mut lifecycle, &mut errors, &mut event_state, &mut configs, &mut roots);
@@ -87,7 +116,7 @@ pub fn spawn_state_writer() -> StateWriterHandle {
             while let Ok(next) = rx.try_recv() {
                 apply(next, &mut lifecycle, &mut errors, &mut event_state, &mut configs, &mut roots);
             }
-            flush(&lifecycle, &errors, &event_state, &configs, &roots, &mut written);
+            flush(&lifecycle, &errors, &event_state, &configs, &roots, &path, &mut written);
         }
     });
     tx
@@ -195,19 +224,21 @@ fn flush(
     event_state: &Option<serde_json::Value>,
     configs:     &[ConfigSummary],
     roots:       &Option<ConfigRoots>,
+    path:        &Path,
     written:     &mut String,
 ) {
-    let json  = build_json(lifecycle, errors, event_state, configs, roots);
-    let tmp   = "/tmp/makima-state.json.tmp";
-    let final_ = "/tmp/makima-state.json";
+    let json = build_json(lifecycle, errors, event_state, configs, roots);
+    // Same directory as the target: rename is only atomic within a filesystem.
+    let tmp = path.with_extension("json.tmp");
     // "Unchanged since last time" only justifies skipping the write while last
-    // time's file is still there. /tmp gets swept, and without the existence
-    // check the state file would then stay gone until something in it happened
-    // to change — the tray reading nothing for as long as the state is calm.
-    if json.is_empty() || (json == *written && std::path::Path::new(final_).exists()) {
+    // time's file is still there. A runtime directory can be cleared out too,
+    // and without the existence check the state file would then stay gone
+    // until something in it happened to change — the tray reading nothing for
+    // as long as the state is calm.
+    if json.is_empty() || (json == *written && path.exists()) {
         return;
     }
-    if std::fs::write(tmp, &json).is_ok() && std::fs::rename(tmp, final_).is_ok() {
+    if std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, path).is_ok() {
         *written = json;
     }
 }

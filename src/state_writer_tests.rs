@@ -193,3 +193,101 @@ fn a_changed_field_changes_the_document() {
                             &vec![summary("KDE Desktop", "module", None, false)], &None);
     assert_ne!(before, after);
 }
+
+// ── Where the file goes, and that it actually gets there ──────────────────────
+
+#[test]
+fn the_runtime_directory_is_preferred() {
+    assert_eq!(state_path_in(Some("/run/user/1000")),
+               std::path::PathBuf::from("/run/user/1000/makima-state.json"));
+}
+
+#[test]
+fn without_a_runtime_directory_tmp_is_the_fallback() {
+    // A bare TTY or a container started without one. /tmp is worse, but a
+    // readable state file beats none.
+    assert_eq!(state_path_in(None),
+               std::path::PathBuf::from("/tmp/makima-state.json"));
+    assert_eq!(state_path_in(Some("")),
+               std::path::PathBuf::from("/tmp/makima-state.json"));
+}
+
+/// A throwaway directory to write state into.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn flush_writes_the_document_to_the_given_path() {
+    // Until the path was a parameter this could only be verified by running
+    // makima and looking — see makima-deckery#42.
+    let dir = scratch("deckery-flush-writes");
+    let path = dir.join("makima-state.json");
+    let mut written = String::new();
+
+    flush(&AppLifecycle::Ready, &HashMap::new(), &None, &[], &None, &path, &mut written);
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(doc["lifecycle"], "ready");
+    assert!(!written.is_empty(), "the written cache must hold what went to disk");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn flush_leaves_no_temporary_file_behind() {
+    // The write goes to a sibling and is renamed, so a reader never sees a
+    // half-written document. The sibling must not survive the rename.
+    let dir = scratch("deckery-flush-tmp");
+    let path = dir.join("makima-state.json");
+    let mut written = String::new();
+
+    flush(&AppLifecycle::Ready, &HashMap::new(), &None, &[], &None, &path, &mut written);
+
+    let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n != "makima-state.json")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn flush_recreates_a_file_that_was_swept_away() {
+    // Unchanged content is not written again — but only while last time's file
+    // is still there. Without the existence check a swept runtime directory
+    // would leave the tray reading nothing for as long as the state is calm.
+    let dir = scratch("deckery-flush-recreate");
+    let path = dir.join("makima-state.json");
+    let mut written = String::new();
+
+    flush(&AppLifecycle::Ready, &HashMap::new(), &None, &[], &None, &path, &mut written);
+    std::fs::remove_file(&path).unwrap();
+    flush(&AppLifecycle::Ready, &HashMap::new(), &None, &[], &None, &path, &mut written);
+
+    assert!(path.exists(), "an unchanged document must still restore a missing file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn flush_skips_an_unchanged_document() {
+    // State is reported on every key press; most presses change nothing a
+    // reader could see, and rewriting the same bytes is disk traffic on the
+    // input path.
+    let dir = scratch("deckery-flush-skip");
+    let path = dir.join("makima-state.json");
+    let mut written = String::new();
+
+    flush(&AppLifecycle::Ready, &HashMap::new(), &None, &[], &None, &path, &mut written);
+    let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    flush(&AppLifecycle::Ready, &HashMap::new(), &None, &[], &None, &path, &mut written);
+
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), first,
+               "the file was rewritten although nothing changed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
