@@ -61,25 +61,29 @@ pub enum StateCommand {
 
 /// Where the state file lives.
 ///
-/// `$XDG_RUNTIME_DIR` is a per-user tmpfs, mode `0700`, created by systemd at
-/// login — the same directory the control socket lives in, for the same
-/// reason. `/tmp` is mode `1777`: anything able to create the path first
-/// decides what every reader believes, and both readers treat the contents as
-/// a description of makima's state.
+/// `$XDG_RUNTIME_DIR` (= `/run/user/<uid>`) is a per-user tmpfs, mode `0700`,
+/// created by systemd at login — the same directory the control socket is
+/// bound in, and for the same reason. `/tmp` is mode `1777`: anything able to
+/// create the path first decides what every reader believes, and both readers
+/// treat the contents as a description of makima's state.
 ///
-/// The fallback is for sessions that have no runtime directory at all — a bare
-/// TTY, a container started without one. There `/tmp` is what there is, and a
-/// readable state file beats none.
+/// No `/tmp` fallback, on purpose, and for the reason the socket has none
+/// either — it would silently downgrade to the squattable path in exactly the
+/// situation where something is already unusual. When the variable is missing
+/// the directory is derived from the uid, which is what it would have said.
 pub fn state_path() -> PathBuf {
-    state_path_in(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
+    runtime_dir(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+                unsafe { libc::getuid() })
+        .join("makima-state.json")
 }
 
-/// The choice itself, with the environment passed in rather than read — so it
-/// can be tested without mutating a process-global the other tests share.
-fn state_path_in(runtime_dir: Option<&str>) -> PathBuf {
-    match runtime_dir {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("makima-state.json"),
-        _ => PathBuf::from("/tmp/makima-state.json"),
+/// The directory itself, with the environment passed in rather than read — so
+/// the choice can be tested without mutating a process-global that the other
+/// tests share.
+fn runtime_dir(xdg_runtime_dir: Option<&str>, uid: u32) -> PathBuf {
+    match xdg_runtime_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(format!("/run/user/{uid}")),
     }
 }
 

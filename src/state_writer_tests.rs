@@ -197,19 +197,17 @@ fn a_changed_field_changes_the_document() {
 // ── Where the file goes, and that it actually gets there ──────────────────────
 
 #[test]
-fn the_runtime_directory_is_preferred() {
-    assert_eq!(state_path_in(Some("/run/user/1000")),
-               std::path::PathBuf::from("/run/user/1000/makima-state.json"));
+fn the_runtime_directory_is_where_the_state_goes() {
+    assert_eq!(runtime_dir(Some("/run/user/1000"), 1000),
+               std::path::PathBuf::from("/run/user/1000"));
 }
 
 #[test]
-fn without_a_runtime_directory_tmp_is_the_fallback() {
-    // A bare TTY or a container started without one. /tmp is worse, but a
-    // readable state file beats none.
-    assert_eq!(state_path_in(None),
-               std::path::PathBuf::from("/tmp/makima-state.json"));
-    assert_eq!(state_path_in(Some("")),
-               std::path::PathBuf::from("/tmp/makima-state.json"));
+fn a_missing_variable_is_derived_from_the_uid_not_from_tmp() {
+    // Never /tmp: that would downgrade to the squattable path in exactly the
+    // situation where something is already unusual. Same rule as the socket.
+    assert_eq!(runtime_dir(None, 1000), std::path::PathBuf::from("/run/user/1000"));
+    assert_eq!(runtime_dir(Some(""), 42), std::path::PathBuf::from("/run/user/42"));
 }
 
 /// A throwaway directory to write state into.
