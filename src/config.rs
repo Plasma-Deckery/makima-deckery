@@ -134,28 +134,6 @@ pub(crate) enum CommandValue {
     WithAttrs { run: Vec<String>, #[serde(default)] no_pause: bool, #[serde(default)] while_gaming: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool },
 }
 
-/// Value for `match_window_class` — one name, or a list of them.
-///
-/// Now that one entry covers an application's spellings (see
-/// `ModuleMetadata::matches_window_class`), naming a single one is the normal
-/// case, and writing it as a one-element array is ceremony. The list stays for
-/// the app that is genuinely published under more than one name.
-#[derive(serde::Deserialize, Debug, Clone)]
-#[serde(untagged)]
-pub(crate) enum WindowClasses {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl WindowClasses {
-    fn into_vec(self) -> Vec<String> {
-        match self {
-            Self::One(name) => vec![name],
-            Self::Many(names) => names,
-        }
-    }
-}
-
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
 pub enum Event {
     Axis(Axis),
@@ -276,50 +254,12 @@ impl DeviceDeclaration {
 pub struct ModuleMetadata {
     /// Only active when the named compositor is running.
     pub requires_compositor: Option<String>,
-    /// Applied when the focused window's class matches any of these names.
-    /// Written as `match_window_class = "firefox"`, or as a list when an app is
-    /// published under genuinely different names. `matches_window_class` is
-    /// what decides whether a class counts as one of them.
+    /// Applied when the focused window's class matches any of these strings.
+    /// Accepts a single string or a list: `match_window_class = ["firefox", "org.mozilla.firefox"]`.
     pub match_window_class: Option<Vec<String>>,
     /// Name of a set of mutually exclusive modules. Activating one member
     /// deactivates its siblings — see `ConfigRegistry::set_enabled`.
     pub exclusive_group: Option<String>,
-}
-
-impl ModuleMetadata {
-    /// Does the focused window's class match this module's declaration?
-    ///
-    /// One application reports different classes depending on how it was
-    /// packaged and which display server it is on: `firefox` and
-    /// `org.mozilla.firefox`, `Claude` and `com.anthropic.Claude`. Those are not
-    /// different applications, and a plain string comparison makes them look
-    /// like ones — every config here used to carry two spellings of one name to
-    /// work around that, and still broke the day a third appeared.
-    ///
-    /// So the two systematic variations are handled by the rule instead:
-    ///
-    ///   * capitalisation, which differs between X11 and Wayland for the same app
-    ///   * a reverse-DNS prefix, which says who publishes the app, not which it is
-    ///
-    /// A declared `claude` therefore matches `Claude`, `com.anthropic.Claude`
-    /// and `org.whoever.CLAUDE`. It does not match `claude-box` or
-    /// `claude-desktop-debian`: only whole names are compared, never fragments
-    /// of one, because a substring rule would quietly claim the terminal window
-    /// of anything that happens to have the word in its name.
-    ///
-    /// A packaging that renames the app outright still needs its own entry.
-    /// There is no rule that can guess that one.
-    pub fn matches_window_class(&self, window_class: &str) -> bool {
-        let Some(patterns) = self.match_window_class.as_deref() else {
-            return false;
-        };
-        // The part after the last dot: the name, with the publisher dropped.
-        // No dot means the whole string is already the name.
-        let name = window_class.rsplit('.').next().unwrap_or(window_class);
-        patterns.iter().any(|p| {
-            p.eq_ignore_ascii_case(window_class) || p.eq_ignore_ascii_case(name)
-        })
-    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -498,7 +438,7 @@ pub struct RawDeviceDeclaration {
 #[serde(deny_unknown_fields)]
 pub struct RawModuleMetadata {
     pub requires_compositor: Option<String>,
-    pub match_window_class: Option<WindowClasses>,
+    pub match_window_class: Option<Vec<String>>,
     pub exclusive_group: Option<String>,
 }
 
@@ -627,7 +567,7 @@ impl Config {
         });
         let module = ModuleMetadata {
             requires_compositor: raw_module.requires_compositor,
-            match_window_class: raw_module.match_window_class.map(WindowClasses::into_vec),
+            match_window_class: raw_module.match_window_class,
             exclusive_group: raw_module.exclusive_group,
         };
         Self {
