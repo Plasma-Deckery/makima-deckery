@@ -602,8 +602,7 @@ impl ConfigRegistry {
         self.entries.lock().unwrap()
             .values()
             .filter_map(|e| usable(e, compositor.as_deref()))
-            .any(|c| c.module.match_window_class.as_deref()
-                .is_some_and(|patterns| patterns.iter().any(|p| p == class)))
+            .any(|c| c.module.matches_window_class(class))
     }
 
     /// Build a resolved config from scratch. Everything expensive lives here;
@@ -625,10 +624,7 @@ impl ConfigRegistry {
         let by_class = client_class.and_then(|class| {
             entries.values()
                 .filter_map(|e| usable(e, compositor))
-                .find(|c| {
-                    c.module.match_window_class.as_deref()
-                        .is_some_and(|patterns| patterns.iter().any(|p| p == class))
-                })
+                .find(|c| c.module.matches_window_class(class))
         });
 
         let mut resolved = match by_class {
