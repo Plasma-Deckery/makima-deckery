@@ -5,7 +5,7 @@
 // to display live button mappings without re-implementing makima's lookup
 // logic.
 //
-// Actual I/O (writing /tmp/makima-state.json) is handled exclusively by
+// Actual I/O (writing the state file) is handled exclusively by
 // `state_writer::flush()` via the `StateWriterHandle` channel.  Nothing in
 // this module touches the filesystem.
 
@@ -76,7 +76,6 @@ fn modifier_sort_key(key: &str) -> (u8, String) {
 pub fn build_state(
     config: &Config,
     modifiers: &[Event],
-    layout: u16,
     paused: bool,
     gaming_mode: bool,
     held_keys: &[Event],
@@ -496,7 +495,6 @@ pub fn build_state(
         "context": {
             "active_app": active_app,
             "config_stack": config_stack,
-            "layout": layout,
             "paused": paused,
             "gaming_mode": gaming_mode,
             "held_modifiers": held_modifiers,

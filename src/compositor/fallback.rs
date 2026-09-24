@@ -8,7 +8,7 @@
 //! This adapter simply parks the task. It never updates `active_client` or
 //! fires `notify` — that remains the job of the polling path in EventReader.
 
-use crate::udev_monitor::Client;
+use crate::session::Client;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 

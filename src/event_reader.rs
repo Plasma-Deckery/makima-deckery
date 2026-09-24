@@ -9,7 +9,7 @@ use crate::state_export::LastAction;
 use crate::state_writer::{StateWriterHandle, StateCommand};
 use crate::trackpad::PadState;
 use crate::trackpad_router;
-use crate::udev_monitor::{Client, Environment, Server};
+use crate::session::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
 use crate::config::Config;
 use deckery_controller::ControllerEvent;
@@ -17,11 +17,8 @@ use evdev::{AbsoluteAxisType, EventType, InputEvent, Key, RelativeAxisType};
 use fork::{fork, setsid, Fork};
 use std::{
     collections::HashMap,
-    future::Future,
     option::Option,
-    pin::Pin,
     process::{Command, Stdio},
-    str::FromStr,
     sync::Arc,
 };
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
@@ -48,8 +45,6 @@ struct Settings {
     cursor: Movement,
     scroll: Movement,
     chain_only: bool,
-    layout_switcher: Option<(Event, Vec<Event>)>,
-    notify_layout_switch: bool,
     /// If true, cursor/scroll loops keep running even while makima is paused.
     /// Default: true. Set CURSOR_WHEN_PAUSED = "false" in [settings] to disable.
     cursor_when_paused: bool,
@@ -98,8 +93,10 @@ pub struct EventReader {
     /// when a mid-hold modifier change (e.g. R1) switched the resolution to a combo.
     emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>>,
     device_is_connected: Arc<Mutex<bool>>,
-    active_layout: Arc<Mutex<u16>>,
-    current_config: Arc<Mutex<Config>>,
+    /// Held as an `Arc` because it is cloned out of the mutex on every event so
+    /// the lock is not carried into the conversion — a deep copy there would put
+    /// the whole merged config on the per-keypress path.
+    current_config: Arc<Mutex<Arc<Config>>>,
     environment: Environment,
     settings: Settings,
     active_client: Arc<Mutex<Client>>,
@@ -167,12 +164,12 @@ impl EventReader {
         let cursor_movement = Arc::new(Mutex::new((0, 0)));
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
-        let active_layout: Arc<Mutex<u16>> = Arc::new(Mutex::new(0));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let current_config: Arc<Mutex<Config>> = Arc::new(Mutex::new(base_config.clone()));
+        let current_config: Arc<Mutex<Arc<Config>>> =
+            Arc::new(Mutex::new(Arc::new(base_config.clone())));
 
         let lstick_function = base_config.settings
             .get("LSTICK")
@@ -283,34 +280,6 @@ impl EventReader {
             speed: scroll_speed,
             acceleration: scroll_acceleration,
         };
-        let layout_switcher = if let Some(combination) = base_config.settings.get("LAYOUT_SWITCHER") {
-            if let Some(sequence) = combination.rsplit_once("-") {
-                let mut mods: Vec<Event> = sequence
-                    .0
-                    .split("-")
-                    .map(|m| Event::Key(Key::from_str(m).expect("LAYOUT_SWITCHER is invalid.")))
-                    .collect();
-                mods.sort();
-                mods.dedup();
-                Some((
-                    Event::Key(Key::from_str(sequence.1).expect("LAYOUT_SWITCHER is invalid.")),
-                    mods,
-                ))
-            } else {
-                Some((
-                    Event::Key(Key::from_str(combination).expect("LAYOUT_SWITCHER is invalid.")),
-                    Vec::new(),
-                ))
-            }
-        } else {
-            None
-        };
-        let notify_layout_switch: bool = base_config.settings
-            .get("NOTIFY_LAYOUT_SWITCH")
-            .unwrap_or(&"false".to_string())
-            .parse()
-            .expect("NOTIFY_LAYOUT_SWITCH can only be true or false.");
-
         let cursor_when_paused: bool = base_config.settings
             .get("CURSOR_WHEN_PAUSED")
             .unwrap_or(&"true".to_string())
@@ -330,8 +299,6 @@ impl EventReader {
             cursor,
             scroll,
             chain_only,
-            layout_switcher,
-            notify_layout_switch,
             cursor_when_paused,
         };
 
@@ -359,7 +326,6 @@ impl EventReader {
             held_keys,
             emitted_outputs,
             device_is_connected,
-            active_layout,
             current_config,
             environment,
             settings,
@@ -1457,26 +1423,6 @@ impl EventReader {
             }
             ResolvedBinding::Unbound => {}
         }
-        if let Some(map) = &self.settings.layout_switcher {
-            if map.0 == event && map.1 == modifiers && value == 1 {
-                let mut virt_dev = self.virt_dev.lock().await;
-                for modifier in modifiers {
-                    self.toggle_modifiers(modifier, 0, &config).await;
-                    if let Event::Key(key) = modifier {
-                        let virtual_event: InputEvent =
-                            InputEvent::new_now(EventType::KEY, key.code(), 0);
-                        virt_dev.keys.emit(&[virtual_event]).unwrap()
-                    }
-                }
-                if let Event::Key(key) = event {
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 0);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap()
-                }
-                self.change_active_layout().await;
-                return;
-            }
-        }
         self.emit_nonmapped_event(default_event, event, value, &modifiers, &config)
             .await;
     }
@@ -1774,9 +1720,12 @@ impl EventReader {
         released_keys
     }
 
-    async fn change_active_layout(&self) {
-        // Get the current client for layout matching.
-        let client: Client = match &self.environment.server {
+    /// The focused window, however this compositor reports one.
+    ///
+    /// Both callers below need it and used to derive it with the same ten
+    /// lines each.
+    async fn current_client(&self) -> Client {
+        match &self.environment.server {
             // Event-driven compositors push focus changes into active_client — read directly.
             Server::Connected(s) if crate::compositor::detect(s).is_event_driven() => {
                 self.active_client.lock().await.clone()
@@ -1786,60 +1735,26 @@ impl EventReader {
                 let known = self.registry.window_class_modules();
                 get_active_window(&self.environment, &known).await
             }
-        };
-        // Cycle active_layout until resolve() finds a valid config for this context.
-        // Lock, mutate, copy the new value, then drop the lock before any async work.
-        // Guard: if we complete a full cycle without a hit (base missing/disabled),
-        // break out rather than looping forever.
-        let layout_num = {
-            let mut active_layout = self.active_layout.lock().await;
-            let start = *active_layout;
-            loop {
-                *active_layout = if *active_layout == 3 { 0 } else { *active_layout + 1 };
-                if self.registry.resolve(&self.base_name, &client, *active_layout).is_some() {
-                    break;
-                }
-                if *active_layout == start {
-                    // Full cycle completed with no valid config — give up and stay put.
-                    eprintln!("deckery: change_active_layout: no valid layout found for {:?}", self.base_name);
-                    break;
-                }
-            }
-            *active_layout
-        }; // lock released here — safe to await below
-        if self.settings.notify_layout_switch {
-            let notify = vec![format!(
-                "notify-send -t 500 'Makima' 'Switching to layout {}'",
-                layout_num
-            )];
-            self.spawn_subprocess(&notify).await;
         }
     }
 
-    fn update_config(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let active_layout = *self.active_layout.lock().await;
-            let client: Client = match &self.environment.server {
-                // Event-driven compositors push focus changes into active_client — read directly.
-                Server::Connected(s) if crate::compositor::detect(s).is_event_driven() => {
-                    self.active_client.lock().await.clone()
-                }
-                // Polling fallback (sway, niri, x11): query on demand.
-                _ => {
-                    let known = self.registry.window_class_modules();
-                    get_active_window(&self.environment, &known).await
-                }
-            };
-            let resolved = self.registry.resolve(&self.base_name, &client, active_layout);
-            match resolved {
-                Some(config) => { *self.current_config.lock().await = config; }
-                None => {
-                    self.change_active_layout().await;
-                    self.update_config().await;
-                }
-            }
-            self.write_state().await;
-        })
+    /// Re-resolve the active config for the currently focused window.
+    ///
+    /// This used to cycle through four global layouts looking for one that
+    /// resolved, and to recurse between here and change_active_layout() while
+    /// doing it. Both are gone with the layouts themselves: resolve() now
+    /// answers None only when the base config is missing or switched off, and
+    /// there is no second question to ask in that case.
+    async fn update_config(&self) {
+        let client = self.current_client().await;
+        match self.registry.resolve(&self.base_name, &client) {
+            Some(config) => { *self.current_config.lock().await = config; }
+            // The last config stays live rather than being cleared: it is
+            // stale, but it is what the controller is holding, and dropping it
+            // would make every button dead instead of wrong.
+            None => {}
+        }
+        self.write_state().await;
     }
 
     async fn write_state(&self) {
@@ -1870,13 +1785,6 @@ impl EventReader {
             Ok(guard) => guard.clone(),
             Err(_) => {
                 eprintln!("deckery: write_state: modifiers lock timed out — possible deadlock");
-                return;
-            }
-        };
-        let layout = match tokio::time::timeout(TIMEOUT, self.active_layout.lock()).await {
-            Ok(guard) => *guard,
-            Err(_) => {
-                eprintln!("deckery: write_state: active_layout lock timed out — possible deadlock");
                 return;
             }
         };
@@ -2007,7 +1915,7 @@ impl EventReader {
             "y": crate::analog::normalize(imu_raw.1),
         });
         let mut event_state = crate::state_export::build_state(
-            &config, &modifiers, layout, paused, gaming_mode,
+            &config, &modifiers, paused, gaming_mode,
             &held_keys, &last_action, &config_stack, &self.gaming_mode_config,
         );
         event_state["trackpads"] = trackpads;
@@ -2105,9 +2013,6 @@ impl EventReader {
                     let mods = match tokio::time::timeout(TIMEOUT, self.modifiers.lock()).await {
                         Ok(g) => g.clone(), Err(_) => continue,
                     };
-                    let layout = match tokio::time::timeout(TIMEOUT, self.active_layout.lock()).await {
-                        Ok(g) => *g, Err(_) => continue,
-                    };
                     let la = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
                         Ok(g) => g.clone(), Err(_) => continue,
                     };
@@ -2121,7 +2026,7 @@ impl EventReader {
                         vec![base_name, config.name.clone()]
                     };
                     let mut event_state = crate::state_export::build_state(
-                        &config, &mods, layout, is_paused, is_gaming,
+                        &config, &mods, is_paused, is_gaming,
                         &hk, &la, &stack, &self.gaming_mode_config,
                     );
                     event_state["trackpads"] = serde_json::Value::Null;
@@ -2133,6 +2038,24 @@ impl EventReader {
                 }
                 "analog-state-export on" | "analog-state-export off" => {
                     *self.analog_state_export.lock().await = cmd == "analog-state-export on";
+                }
+                _ if cmd.starts_with("config group enable ")
+                    || cmd.starts_with("config group disable ") => {
+                    let enabling = cmd.starts_with("config group enable ");
+                    let group = if enabling {
+                        cmd.trim_start_matches("config group enable ").trim()
+                    } else {
+                        cmd.trim_start_matches("config group disable ").trim()
+                    };
+                    if !self.registry.set_group_enabled(group, enabling) {
+                        eprintln!("deckery: IPC config group enable/disable: no group named {:?}", group);
+                        continue;
+                    }
+                    eprintln!("deckery: IPC config group {}: {:?}",
+                        if enabling { "enable" } else { "disable" }, group);
+                    let _ = self.state_tx.send(
+                        StateCommand::SetLoadedConfigs(self.registry.snapshot())
+                    ).await;
                 }
                 _ if cmd.starts_with("config enable ") || cmd.starts_with("config disable ") => {
                     let enabling = cmd.starts_with("config enable ");

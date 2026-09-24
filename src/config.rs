@@ -87,6 +87,7 @@ impl Default for TrackpadConfig {
 // ── Raw deserialization types ─────────────────────────────────────────────────
 
 #[derive(serde::Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawTrackpadConfig {
     pub left: Option<toml::Value>,
     pub right: Option<toml::Value>,
@@ -256,8 +257,9 @@ pub struct ModuleMetadata {
     /// Applied when the focused window's class matches any of these strings.
     /// Accepts a single string or a list: `match_window_class = ["firefox", "org.mozilla.firefox"]`.
     pub match_window_class: Option<Vec<String>>,
-    /// Applied only while this layout is active. Defaults to layout 0.
-    pub layout: u16,
+    /// Name of a set of mutually exclusive modules. Activating one member
+    /// deactivates its siblings — see `ConfigRegistry::set_enabled`.
+    pub exclusive_group: Option<String>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -316,6 +318,7 @@ pub struct MappedModifiers {
 /// Raw TOML form of the double-click trigger: the key name plus an optional
 /// inter-click window. Parsed from a `trigger = { key = "...", ms = N }` table.
 #[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawDoubleclickTrigger {
     /// Key name (e.g. `"BTN_BASE"`).
     /// `"disabled"` → trigger disabled (explicit opt-out).
@@ -335,6 +338,7 @@ pub struct DoubleclickTrigger {
 
 /// Raw TOML deserialization type for the `[gaming_mode]` section.
 #[derive(serde::Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RawGamingModeConfig {
     /// Double-click trigger configuration.
     /// Absent → default (BTN_BASE, 400 ms).
@@ -416,9 +420,10 @@ impl GamingModeConfig {
     }
 }
 
-// ── Raw TOML types for [device] / [module] / [modules] ───────────────────────
+// ── Raw TOML types for [device] / [module] ───────────────────────────────────
 
 #[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawDeviceDeclaration {
     pub class: String,
     pub names: Vec<String>,
@@ -430,22 +435,17 @@ pub struct RawDeviceDeclaration {
 }
 
 #[derive(serde::Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RawModuleMetadata {
     pub requires_compositor: Option<String>,
     pub match_window_class: Option<Vec<String>>,
-    #[serde(default)]
-    pub layout: u16,
-}
-
-#[derive(serde::Deserialize, Debug, Clone, Default)]
-pub struct RawModuleIncludes {
-    #[serde(default)]
-    pub include: Vec<String>,
+    pub exclusive_group: Option<String>,
 }
 
 // ── RawConfig ─────────────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawConfig {
     #[serde(default)]
     pub remap: HashMap<String, RemapValue>,
@@ -468,8 +468,6 @@ pub struct RawConfig {
     pub device: Option<RawDeviceDeclaration>,
     #[serde(default)]
     pub module: RawModuleMetadata,
-    #[serde(default)]
-    pub modules: RawModuleIncludes,
 }
 
 #[derive(Debug, Clone)]
@@ -494,8 +492,6 @@ pub struct Config {
     pub device: Option<DeviceDeclaration>,
     /// Module-level metadata — activation conditions for non-base configs.
     pub module: ModuleMetadata,
-    /// Names of plain modules to merge in, from `[modules] include = [...]`.
-    pub module_includes: Vec<String>,
     /// Button aliases in effect while this file was parsed, kept so settings
     /// read later at runtime (`LSTICK_ACTIVATION_MODIFIERS`) resolve the same way.
     pub aliases: HashMap<String, String>,
@@ -552,7 +548,6 @@ impl Config {
         let raw_gaming_mode = raw_config.gaming_mode.clone();
         let raw_device      = raw_config.device.clone();
         let raw_module      = raw_config.module.clone();
-        let raw_modules     = raw_config.modules.clone();
         let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config, aliases);
         let trackpad = TrackpadConfig {
             left: parse_trackpad_side(raw_trackpad.left.as_ref()),
@@ -573,7 +568,7 @@ impl Config {
         let module = ModuleMetadata {
             requires_compositor: raw_module.requires_compositor,
             match_window_class: raw_module.match_window_class,
-            layout: raw_module.layout,
+            exclusive_group: raw_module.exclusive_group,
         };
         Self {
             name: file_name,
@@ -585,7 +580,6 @@ impl Config {
             gaming_mode_config,
             device,
             module,
-            module_includes: raw_modules.include,
             aliases: aliases.clone(),
         }
     }
@@ -601,7 +595,6 @@ impl Config {
             gaming_mode_config: Default::default(),
             device: None,
             module: Default::default(),
-            module_includes: Vec::new(),
             aliases: Default::default(),
         }
     }
@@ -677,6 +670,19 @@ impl Config {
 
         self.bindings = merged;
 
+        // Both halves of the modifier set have to come across, not just the
+        // declared one. `default` is what the parser derived from the combos of
+        // *that* file, so it is exactly as load-bearing as the bindings just
+        // merged above — a config that inherits `L1-X` without inheriting "L1 is
+        // a modifier" holds a binding that can never fire. Leaving `default`
+        // behind used to empty the set whenever the merge ran into an
+        // `new_empty` shell, which is how one user module could silence every
+        // combo the base config declares.
+        for key in &base.mapped_modifiers.default {
+            if !self.mapped_modifiers.default.contains(key) {
+                self.mapped_modifiers.default.push(*key);
+            }
+        }
         for key in &base.mapped_modifiers.custom {
             if !self.mapped_modifiers.custom.contains(key) {
                 self.mapped_modifiers.custom.push(*key);

@@ -3,6 +3,7 @@ mod analog;
 mod config;
 mod config_registry;
 mod device_session;
+mod device_tasks;
 mod event_reader;
 mod gesture_pad;
 mod compositor;
@@ -10,8 +11,10 @@ mod kde_input_defaults;
 mod resume_watcher;
 mod steam_detector;
 mod mt_trackpad;
+mod preferences;
 mod resolver;
 mod scroll_pad;
+mod session;
 mod state_export;
 mod state_writer;
 mod trackball;
@@ -21,8 +24,7 @@ mod udev_monitor;
 mod virtual_devices;
 
 use crate::config_registry::ConfigRegistry;
-use crate::udev_monitor::*;
-use std::env;
+use crate::udev_monitor::start_monitoring_udev;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio;
@@ -41,14 +43,14 @@ pub fn startup_ms() -> u128 {
     START.get().map(|s| s.elapsed().as_millis()).unwrap_or(0)
 }
 
-fn wait_for_config_dir(path: &str) {
-    if std::path::Path::new(path).is_dir() {
+fn wait_for_config_dir(path: &std::path::Path) {
+    if path.is_dir() {
         return;
     }
-    eprintln!("deckery: config dir {:?} not found — waiting (tray may still be seeding)", path);
+    eprintln!("deckery: config dir {:?} not found — waiting (install may still be running)", path);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
-        if std::path::Path::new(path).is_dir() {
+        if path.is_dir() {
             eprintln!("deckery: config dir {:?} appeared, continuing startup", path);
             return;
         }
@@ -69,30 +71,13 @@ async fn main() {
         default_hook(info);
         std::process::exit(1);
     }));
-    // DECKERY_CONFIG is the canonical env var; MAKIMA_CONFIG is the legacy name
-    // kept for backwards compatibility with hand-edited service overrides.
-    let config_dir = match env::var("DECKERY_CONFIG").or_else(|_| env::var("MAKIMA_CONFIG")) {
-        Ok(path) => {
-            eprintln!("deckery: config dir: {:?}", path);
-            wait_for_config_dir(&path);
-            path
-        }
-        Err(_) => {
-            let user_home = match env::var("HOME") {
-                Ok(user_home) if user_home == "/root".to_string() => match env::var("SUDO_USER") {
-                    Ok(sudo_user) => format!("/home/{}", sudo_user),
-                    _ => user_home,
-                },
-                Ok(user_home) => user_home,
-                _ => "/root".to_string(),
-            };
-            let path = format!("{}/.config/deckery", user_home);
-            eprintln!("deckery: DECKERY_CONFIG not set, using {:?}", path);
-            wait_for_config_dir(&path);
-            path
-        }
-    };
-    let registry = ConfigRegistry::load(&config_dir);
+    let roots = config_registry::ConfigRoots::resolve();
+    eprintln!("deckery: system configs: {:?}", roots.system);
+    eprintln!("deckery: user configs:   {:?}", roots.user);
+    // Only the system root has to be there. The user root holds overrides and
+    // preferences, and stays absent until the user actually makes one.
+    wait_for_config_dir(&roots.system);
+    let registry = ConfigRegistry::load(roots);
     // Hints resolve against the merged config, so a dead or ambiguous one can
     // only be detected here — not while parsing the file it was written in.
     // Reported, never fatal: a hint is display-only.
@@ -104,6 +89,9 @@ async fn main() {
     // Publish initial config list so the tray sees all configs on startup,
     // even before any device is connected.
     let _ = state_tx.try_send(state_writer::StateCommand::SetLoadedConfigs(registry.snapshot()));
+    // Where those configs came from — the tray offers both folders for opening.
+    let _ = state_tx.try_send(
+        state_writer::StateCommand::SetConfigRoots(registry.roots().clone()));
     // A broken base config is a global failure — escalate to a top-level error
     // so the tray shows red, not just a per-config marker in the submenu.
     udev_monitor::report_base_config_error(&registry, &state_tx);
@@ -153,5 +141,5 @@ async fn main() {
         });
     }
 
-    start_monitoring_udev(registry, config_dir, tasks, gaming_mode, state_tx, ipc_tx).await;
+    start_monitoring_udev(registry, tasks, gaming_mode, state_tx, ipc_tx).await;
 }

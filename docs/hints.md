@@ -125,8 +125,8 @@ Two buttons may emit the same key. This is not hypothetical; the live base confi
 has it:
 
 ```
-Steam Deck.toml:26   R2 = { keys = ["BTN_LEFT"], ... }
-Steam Deck.toml:47   R3 = ["BTN_LEFT"]
+Steam Deck Base.toml:26   R2 = { keys = ["BTN_LEFT"], ... }
+Steam Deck Base.toml:47   R3 = ["BTN_LEFT"]
 ```
 
 Rule: **a hint that resolves to several buttons is shown on all of them**, plus a
@@ -260,7 +260,7 @@ mechanism does not help.
 The useful range is exactly: `KEY_LEFTCTRL` / `KEY_LEFTALT` / `KEY_LEFTSHIFT` /
 `KEY_LEFTMETA` as the modifier side, and the arrow keys, Enter, Esc, Backspace,
 Space, Tab, F10 as the trigger side. That is the full set of plain base remaps in
-`Steam Deck.toml`, and it covers what hints are for.
+`Steam Deck Base.toml`, and it covers what hints are for.
 
 **Hints are unverified assertions.** Nothing checks that Ctrl+Up does anything in
 the focused app. A wrong hint is a silent display error — the same risk class as
@@ -352,7 +352,7 @@ Not part of this design, but decided or deferred alongside it and easy to lose:
   It cannot be a hint — no button emits `KEY_C` — so it would have needed a real
   binding, and the shortcut itself came from a web source that was already wrong
   twice. Both candidate placements were poor: `···` is `BTN_BASE`, which is also
-  the Gaming Mode double-click trigger (`Steam Deck.toml:89`), so a double tap
+  the Gaming Mode double-click trigger (`Steam Deck Base.toml:89`), so a double tap
   would toggle Gaming Mode. Not worth a binding.
 - **Closed:** `Ctrl+A`, zoom reset (`Ctrl+0`), and copy/paste are not needed —
   the latter is already covered by `L1-X` / `L1-Y` in the base config.
