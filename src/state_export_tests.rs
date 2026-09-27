@@ -1206,3 +1206,68 @@ fn modifier_less_hint_adds_no_available_modifier() {
 
     assert_eq!(state["context"]["available_modifiers"], serde_json::json!({}));
 }
+
+// ── matching_hint: the rule the event reader announces by ─────────────────
+//
+// The HUD grid and the OSD toast must agree about what a press means, so both
+// go through `matching_hint`. These pin the agreement: what the grid shows
+// under a given held set is exactly what a press under that set announces.
+
+/// Held set and trigger from the ticket's example: R5 + DPad Up is hinted,
+/// and that is what the toast has to say.
+#[test]
+fn matching_hint_names_the_hint_under_its_modifier() {
+    let config = config_with_ctrl_hints();
+    let held   = vec![key(Key::BTN_GRIPR2), key(Key::BTN_DPAD_UP)];
+    let active = active_input_modifiers(&config, &[]);
+    let mods   = hint_modifiers(&config, &active, &held);
+
+    let hint = matching_hint(&config, &key(Key::BTN_DPAD_UP), &mods);
+    assert_eq!(hint.map(|h| h.label.as_str()), Some("Jump to Top"));
+}
+
+/// The trigger needs no special handling: DPad Up is held too, but it is not a
+/// hint modifier anywhere, so it never enters the comparison set.
+#[test]
+fn matching_hint_ignores_the_pressed_button_itself() {
+    let config = config_with_ctrl_hints();
+    let held   = vec![key(Key::BTN_GRIPR2), key(Key::BTN_DPAD_UP)];
+    let mods   = hint_modifiers(&config, &[], &held);
+    assert_eq!(mods, vec![key(Key::BTN_GRIPR2)]);
+}
+
+/// Nothing held that a hint names means nothing to announce — a plain press
+/// must stay silent rather than raise a toast for its base binding.
+#[test]
+fn matching_hint_is_none_without_the_hint_modifier() {
+    let config = config_with_ctrl_hints();
+    let mods   = hint_modifiers(&config, &[], &[key(Key::BTN_DPAD_UP)]);
+    assert!(matching_hint(&config, &key(Key::BTN_DPAD_UP), &mods).is_none());
+}
+
+/// Same exactness as the grid: a real modifier on top of the hint modifier
+/// opens an actual layer, so the hint no longer applies and must not be
+/// announced either.
+#[test]
+fn matching_hint_is_none_when_a_real_modifier_is_also_held() {
+    let config = config_with_ctrl_hints();
+    let held   = vec![key(Key::BTN_GRIPR2), key(Key::BTN_DPAD_UP)];
+    let active = active_input_modifiers(&config, &[key(Key::BTN_TL)]);
+    let mods   = hint_modifiers(&config, &active, &held);
+
+    assert!(matching_hint(&config, &key(Key::BTN_DPAD_UP), &mods).is_none(),
+        "R5-only hint survived L1 being held: {mods:?}");
+}
+
+/// A hint on another button must not be announced for this one.
+#[test]
+fn matching_hint_is_per_trigger() {
+    let config = config_with_ctrl_hints();
+    let held   = vec![key(Key::BTN_GRIPR2), key(Key::BTN_DPAD_DOWN)];
+    let mods   = hint_modifiers(&config, &[], &held);
+
+    assert_eq!(matching_hint(&config, &key(Key::BTN_DPAD_DOWN), &mods)
+                   .map(|h| h.label.as_str()), Some("Jump to Bottom"));
+    assert_eq!(matching_hint(&config, &key(Key::BTN_SOUTH), &mods).map(|h| h.label.as_str()),
+               None);
+}
