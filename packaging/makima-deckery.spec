@@ -1,5 +1,5 @@
 Name:           makima-deckery
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
@@ -91,6 +91,13 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Sun Sep 27 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 0.4.1-1
+- Command bindings report failures: journal entry plus an error toast in the HUD
+- Shell operators in a command binding are no longer split by the spawn path
+- A pressed hint announces itself in the overlay, not just in the binding grid
+- Config auto-discovery: user files layer over shipped ones, broken copies fall back
+- State file moved to $XDG_RUNTIME_DIR; requires deckery and deckery-hud 0.4.1
+
 * Thu Sep 11 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 0.4.0-1
 - Minor version bump to 0.4.0
 
