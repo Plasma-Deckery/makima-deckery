@@ -50,6 +50,93 @@ pub fn now_ts() -> f64 {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// The custom modifiers held right now.
+///
+/// A modifier counts as held either directly, or through its own modifier-less
+/// remap: `R1 = ["KEY_LEFTCTRL"]` means holding R1 puts Ctrl into `modifiers`,
+/// and the combo `R1-A` still has to resolve.
+pub fn active_input_modifiers(config: &Config, modifiers: &[Event]) -> Vec<Event> {
+    config
+        .mapped_modifiers
+        .custom
+        .iter()
+        .filter(|input_mod| {
+            if modifiers.contains(input_mod) {
+                return true;
+            }
+            config
+                .bindings
+                .remap
+                .get(*input_mod)
+                .and_then(|m| m.get(&vec![]))
+                .map(|output_keys: &Vec<Key>| {
+                    output_keys
+                        .iter()
+                        .any(|k| modifiers.contains(&Event::Key(*k)))
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Every button that acts as a hint modifier somewhere in this config.
+pub fn hint_modifier_buttons(config: &Config) -> std::collections::HashSet<Event> {
+    config
+        .bindings
+        .hints_resolved
+        .keys()
+        .flat_map(|(_, combo)| combo.iter().copied())
+        .collect()
+}
+
+/// The set a hint's combo is matched against.
+///
+/// Hints are display-only, so their modifiers were never registered in
+/// mapped_modifiers and never enter `modifiers`. They are recognised from
+/// held_keys instead, which tracks every pressed button regardless of role.
+/// Real modifiers stay in the comparison set: holding L1 *and* R5 must hide
+/// R5-only hints, because L1 opens an actual layer.
+///
+/// The trigger of the press needs no special handling: it only survives the
+/// filter if it is itself a hint modifier somewhere, which is the same thing
+/// the display side decides.
+pub fn hint_modifiers(
+    config: &Config,
+    active_input_mods: &[Event],
+    held_keys: &[Event],
+) -> Vec<Event> {
+    let buttons = hint_modifier_buttons(config);
+    let mut hint_mods: Vec<Event> = active_input_mods.to_vec();
+    hint_mods.extend(held_keys.iter().filter(|e| buttons.contains(e)).copied());
+    hint_mods.sort();
+    hint_mods.dedup();
+    hint_mods
+}
+
+/// A combo counts only when the held set is exactly it — same rule as the
+/// resolver, so nothing is advertised or announced that would not fire.
+pub fn combo_satisfied(combo: &[Event], held: &[Event]) -> bool {
+    !combo.is_empty() && combo.len() == held.len() && combo.iter().all(|m| held.contains(m))
+}
+
+/// The hint `trigger` carries under the currently held buttons, if any.
+///
+/// Shared with the event reader so a pressed hint announces itself with the
+/// same label the HUD is already showing for it, decided by the same rule.
+pub fn matching_hint<'a>(
+    config: &'a Config,
+    trigger: &Event,
+    hint_mods: &[Event],
+) -> Option<&'a Hint> {
+    config
+        .bindings
+        .hints_resolved
+        .iter()
+        .find(|((t, combo), _)| t == trigger && combo_satisfied(combo, hint_mods))
+        .map(|(_, hint)| hint)
+}
+
 /// Canonical modifier order: Meta → Ctrl → Alt → Shift → everything else.
 /// Matches the standard shortcut notation used by most desktop environments.
 fn modifier_sort_key(key: &str) -> (u8, String) {
@@ -218,49 +305,10 @@ pub fn build_state(
     }
 
     // Build modifier_active: combos reachable given the currently held modifiers.
-    let active_input_mods: Vec<Event> = config
-        .mapped_modifiers
-        .custom
-        .iter()
-        .filter(|input_mod| {
-            if modifiers.contains(input_mod) {
-                return true;
-            }
-            config
-                .bindings
-                .remap
-                .get(*input_mod)
-                .and_then(|m| m.get(&vec![]))
-                .map(|output_keys: &Vec<Key>| {
-                    output_keys
-                        .iter()
-                        .any(|k| modifiers.contains(&Event::Key(*k)))
-                })
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-
-    // Hints are display-only, so their modifiers were never registered in
-    // mapped_modifiers and never enter `modifiers`. They are recognised from
-    // held_keys instead, which tracks every pressed button regardless of role.
-    // Real modifiers stay in the comparison set: holding L1 *and* R5 must hide
-    // R5-only hints, because L1 opens an actual layer.
-    let hint_modifier_buttons: std::collections::HashSet<Event> = config
-        .bindings
-        .hints_resolved
-        .keys()
-        .flat_map(|(_, combo)| combo.iter().copied())
-        .collect();
-    let mut hint_mods: Vec<Event> = active_input_mods.clone();
-    hint_mods.extend(held_keys.iter().filter(|e| hint_modifier_buttons.contains(e)).copied());
-    hint_mods.sort();
-    hint_mods.dedup();
-
-    // A combo is shown only when the held set is exactly it — same rule as the
-    // resolver, so the HUD never advertises something that would not fire.
+    let active_input_mods = active_input_modifiers(config, modifiers);
+    let hint_mods = hint_modifiers(config, &active_input_mods, held_keys);
     let shown_under = |combo: &Vec<Event>, held: &[Event]| -> bool {
-        !combo.is_empty() && combo.len() == held.len() && combo.iter().all(|m| held.contains(m))
+        combo_satisfied(combo, held)
     };
     let mut modifier_active: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     if !active_input_mods.is_empty() {
@@ -449,7 +497,7 @@ pub fn build_state(
     let hint_qualifies = |m: &Event, combo: &Vec<Event>| -> bool {
         combo.contains(m) && hint_mods.iter().all(|held| combo.contains(held))
     };
-    for m in &hint_modifier_buttons {
+    for m in &hint_modifier_buttons(config) {
         if hint_mods.contains(m) {
             continue;
         }

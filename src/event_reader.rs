@@ -1917,8 +1917,22 @@ impl EventReader {
     /// Record the actual emitted key output for the HUD last-event display.
     /// Called at the emission site (not at input time) so the action reflects
     /// what was truly sent to the virtual device.
-    async fn set_last_emitted(&self, _trigger: &Event, emitted: &[Key], value: i32, is_combo: bool, label: Option<String>, silent: bool) {
-        if is_combo && value == 1 {
+    async fn set_last_emitted(&self, trigger: &Event, emitted: &[Key], value: i32, is_combo: bool, label: Option<String>, silent: bool) {
+        // A hint relabels a press that resolves through the base binding, so it
+        // is never a combo and carries no label of its own — `label` is None and
+        // the toast stayed empty. The hint's text is the only thing that says
+        // what the press did, so it is what gets announced. Read-only: the
+        // resolution and the emitted keys are already decided and untouched.
+        //
+        // Only hints are added here. A plain base binding still announces
+        // nothing even when it has a label, because every button press would
+        // otherwise raise a toast.
+        let hint = if value == 1 && !is_combo {
+            self.hint_label(trigger).await
+        } else {
+            None
+        };
+        if value == 1 && (is_combo || hint.is_some()) {
             let mut la = self.last_action.lock().await;
             *la = Some(LastAction {
                 r#type: "keys".to_string(),
@@ -1926,11 +1940,29 @@ impl EventReader {
                     emitted.iter().map(|k| format!("{:?}", k)).collect::<Vec<_>>()
                 ),
                 ts: crate::state_export::now_ts(),
-                label,
+                label: if is_combo { label } else { hint },
                 silent,
             });
         }
         self.write_state().await;
+    }
+
+    /// The hint `trigger` carries under the buttons held right now.
+    ///
+    /// Same inputs and same rule as the HUD's binding grid — both go through
+    /// `state_export::matching_hint`, so a hint cannot be shown in one place
+    /// and missed in the other.
+    async fn hint_label(&self, trigger: &Event) -> Option<String> {
+        let config = self.current_config.lock().await.clone();
+        if config.bindings.hints_resolved.is_empty() {
+            return None;
+        }
+        let modifiers = self.modifiers.lock().await.clone();
+        let held_keys = self.held_keys.lock().await.clone();
+        let active = crate::state_export::active_input_modifiers(&config, &modifiers);
+        let hint_mods = crate::state_export::hint_modifiers(&config, &active, &held_keys);
+        crate::state_export::matching_hint(&config, trigger, &hint_mods)
+            .map(|hint| hint.label.clone())
     }
 
     /// Store emitted output keys for a physical button so they can be released
