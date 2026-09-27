@@ -14,11 +14,9 @@ use crate::virtual_devices::VirtualDevices;
 use crate::config::Config;
 use deckery_controller::ControllerEvent;
 use evdev::{AbsoluteAxisType, EventType, InputEvent, Key, RelativeAxisType};
-use fork::{fork, setsid, Fork};
 use std::{
     collections::HashMap,
     option::Option,
-    process::{Command, Stdio},
     sync::Arc,
 };
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
@@ -127,6 +125,12 @@ pub struct EventReader {
     /// Channel to the central state writer task. All state.json writes go
     /// through this sender — EventReader never touches the file directly.
     state_tx: StateWriterHandle,
+    /// Asks `state_write_loop` for a state write. Created here rather than in
+    /// `start()` so a detached task — one waiting on a spawned command — can
+    /// hold a clone and make its result visible without borrowing `self`.
+    state_write_tx: mpsc::Sender<crate::trackpad_router::StateWrite>,
+    /// Receiver half of the above, taken once by `start()`.
+    state_write_rx: Mutex<Option<mpsc::Receiver<crate::trackpad_router::StateWrite>>>,
 }
 
 
@@ -166,6 +170,7 @@ impl EventReader {
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
+        let (state_write_tx, state_write_rx) = mpsc::channel(8);
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> = Arc::new(Mutex::new(HashMap::new()));
         let current_config: Arc<Mutex<Arc<Config>>> =
@@ -341,6 +346,8 @@ impl EventReader {
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
             gaming_mode_tx,
             state_tx,
+            state_write_tx,
+            state_write_rx: Mutex::new(Some(state_write_rx)),
         }
     }
 
@@ -348,7 +355,9 @@ impl EventReader {
         let name = self.base_name.clone();
         let name = &name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
-        let (state_tx, state_rx) = mpsc::channel(8);
+        let state_tx = self.state_write_tx.clone();
+        let state_rx = self.state_write_rx.lock().await.take()
+            .expect("start() runs once per EventReader");
         self.write_state().await;
 
         tokio::join!(
@@ -1406,9 +1415,12 @@ impl EventReader {
             }
             ResolvedBinding::Command { commands, label, no_pause, while_gaming: _, silent, .. } => {
                 if value == 1 {
+                    let binding_label = label.clone();
                     self.set_last_emitted_cmd(&event, &commands, label, silent).await;
                     if !paused || no_pause {
-                        self.spawn_subprocess(&commands).await;
+                        // The label travels with it so a failure can name the
+                        // binding the user pressed rather than the command line.
+                        self.spawn_subprocess(&commands, binding_label).await;
                     }
                 } else {
                     self.write_state().await;
@@ -1625,53 +1637,22 @@ impl EventReader {
         };
     }
 
-    async fn spawn_subprocess(&self, command_list: &Vec<String>) {
-        let mut modifier_was_activated = self.modifier_was_activated.lock().await;
-        *modifier_was_activated = true;
-        let (user, running_as_root) = if let Ok(sudo_user) = &self.environment.sudo_user {
-            (Option::Some(sudo_user), true)
-        } else if let Ok(user) = &self.environment.user {
-            (Option::Some(user), false)
-        } else {
-            (Option::None, false)
-        };
-        if let Some(user) = user {
-            for command in command_list {
-                if running_as_root {
-                    match fork() {
-                        Ok(Fork::Child) => match fork() {
-                            Ok(Fork::Child) => {
-                                setsid().unwrap();
-                                Command::new("runuser")
-                                    .args([user, "-c", command])
-                                    .stdin(Stdio::null())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .spawn()
-                                    .unwrap();
-                                std::process::exit(0);
-                            }
-                            Ok(Fork::Parent(_)) => std::process::exit(0),
-                            Err(_) => std::process::exit(1),
-                        },
-                        Ok(Fork::Parent(_)) => (),
-                        Err(_) => std::process::exit(1),
-                    }
-                } else {
-                    Command::new("sh")
-                        .arg("-c")
-                        .arg(format!(
-                            "systemd-run --wait --pipe --user --machine {}@ -- systemd-run --user --scope {}",
-                            user, command
-                        ))
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .unwrap();
-                }
-            }
-        }
+    /// Run a command binding. `label` is the binding's own label, used to
+    /// name it if the command fails.
+    ///
+    /// The spawning itself lives in `subprocess`; what stays here is the one
+    /// thing that belongs to the event path — a command press counts as having
+    /// used its modifier, so releasing that modifier must not also fire its own
+    /// base binding.
+    async fn spawn_subprocess(&self, command_list: &Vec<String>, label: Option<String>) {
+        *self.modifier_was_activated.lock().await = true;
+        crate::subprocess::run_command_binding(
+            &self.environment,
+            command_list,
+            label,
+            self.last_action.clone(),
+            self.state_write_tx.clone(),
+        ).await;
     }
 
     /// Emit a single multi-touch frame for a trackpad to its virtual uinput device.
