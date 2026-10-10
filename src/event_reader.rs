@@ -1455,6 +1455,12 @@ impl EventReader {
         }
         let mut virt_dev = self.virt_dev.lock().await;
         let mut modifier_was_activated = self.modifier_was_activated.lock().await;
+        // Both machines run on every press. The old path below is still the one
+        // that reaches the kernel; the new one only decides, and the two are
+        // compared at the end. `mwa_before` is the state the new machine has to be
+        // given, captured before the old path starts changing it.
+        let mwa_before = *modifier_was_activated;
+        let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
         if release_keys && value != 2 && !modifiers.is_empty() {
             // Only release previous modifier outputs when there are actually modifiers
             // held. With an empty modifier set there is nothing to clean up, and
@@ -1468,6 +1474,7 @@ impl EventReader {
                     let virtual_event: InputEvent =
                         InputEvent::new_now(EventType::KEY, key.code(), 0);
                     virt_dev.keys.emit(&[virtual_event]).unwrap();
+                    performed.push(crate::machine::recorded(key.code(), 0));
                 }
             }
         } else if ignore_modifiers {
@@ -1490,6 +1497,7 @@ impl EventReader {
                     virt_dev.keys.emit(&[
                         InputEvent::new_now(EventType::KEY, code, 0),
                     ]).unwrap();
+                    performed.push(crate::machine::recorded(code, 0));
                 }
             }
         }
@@ -1510,9 +1518,11 @@ impl EventReader {
                     let virtual_event: InputEvent =
                         InputEvent::new_now(EventType::KEY, key.code(), 1);
                     virt_dev.keys.emit(&[virtual_event]).unwrap();
+                    performed.push(crate::machine::recorded(key.code(), 1));
                     let virtual_event: InputEvent =
                         InputEvent::new_now(EventType::KEY, key.code(), 0);
                     virt_dev.keys.emit(&[virtual_event]).unwrap();
+                    performed.push(crate::machine::recorded(key.code(), 0));
                     *modifier_was_activated = true;
                 } else if value == 1 {
                     *modifier_was_activated = false;
@@ -1521,9 +1531,24 @@ impl EventReader {
                 let virtual_event: InputEvent =
                     InputEvent::new_now(EventType::KEY, key.code(), value);
                 virt_dev.keys.emit(&[virtual_event]).unwrap();
+                performed.push(crate::machine::recorded(key.code(), value));
                 *modifier_was_activated = true;
             }
         }
+
+        // The new machine decides the same press, and the two are compared. The
+        // old path has already acted, so a disagreement costs nothing but a
+        // journal line — which is the point of running them side by side.
+        let planned = crate::machine::plan_emit(
+            config, event_list, value, modifiers,
+            release_keys, ignore_modifiers, mwa_before,
+        );
+        crate::machine::compare(
+            "emit_event", &planned, &performed, *modifier_was_activated,
+            &format!("value={value} release_keys={release_keys} \
+ignore_modifiers={ignore_modifiers} mwa_before={mwa_before} \
+keys={event_list:?} modifiers={modifiers:?}"),
+        );
     }
 
     async fn emit_nonmapped_event(

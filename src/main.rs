@@ -11,6 +11,7 @@ mod kde_input_defaults;
 mod resume_watcher;
 mod steam_detector;
 mod subprocess;
+mod machine;
 mod mt_trackpad;
 mod output;
 mod preferences;
