@@ -1,3 +1,5 @@
+use crate::output::OutputDevice;
+
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
     AbsoluteAxisType, AbsInfo, BusType, InputId, Key, PropType, UinputAbsSetup,
@@ -238,6 +240,37 @@ impl VirtualDevices {
     pub fn enable_gesture_pad(&mut self) {
         if self.gesture_pad.is_none() {
             self.gesture_pad = Some(build_gesture_pad_device());
+        }
+    }
+
+    /// Send one frame to one device.
+    ///
+    /// One call is one frame as the kernel reads it: `evdev` appends a SYN_REPORT
+    /// per `emit`, so `events` is a frame and not a list of things to send. They
+    /// go out exactly as given, timestamps included, which is what lets a
+    /// forwarded hardware event stay the event it was.
+    ///
+    /// A pad that was never enabled has nowhere to put the frame, and that is not
+    /// an error — it is a device the config switched off.
+    pub fn emit(
+        &mut self,
+        device: OutputDevice,
+        events: &[evdev::InputEvent],
+    ) -> std::io::Result<()> {
+        match self.device_mut(device) {
+            Some(dev) => dev.emit(events),
+            None => Ok(()),
+        }
+    }
+
+    fn device_mut(&mut self, device: OutputDevice) -> Option<&mut VirtualDevice> {
+        match device {
+            OutputDevice::Keys => Some(&mut self.keys),
+            OutputDevice::Axis => Some(&mut self.axis),
+            OutputDevice::Abs => Some(&mut self.abs),
+            OutputDevice::LeftPad => self.lpad.as_mut(),
+            OutputDevice::RightPad => self.rpad.as_mut(),
+            OutputDevice::GesturePad => self.gesture_pad.as_mut(),
         }
     }
 }

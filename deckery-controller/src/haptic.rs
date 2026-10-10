@@ -77,7 +77,7 @@ pub(super) struct HapticCommand {
 /// feel. `gain_db` defaults to 0 — on-hardware A/B testing showed it has no
 /// perceptible effect on this hardware (see issue #20), so the meaningful
 /// levers are `duration_us`, `interval_us`, and `count`.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 pub struct HapticPulse {
     #[serde(default = "default_duration_us")]
     pub duration_us: u16,
@@ -103,7 +103,7 @@ impl Default for HapticPulse {
 
 /// One step in a `HapticChain`: a single burst followed by an optional pause
 /// before the next step. The last step in a chain typically omits `pause_ms`.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 pub struct HapticChainStep {
     #[serde(flatten)]
     pub pulse: HapticPulse,
@@ -133,7 +133,7 @@ pub struct HapticChainStep {
 /// Chain evaluation (including `pause_ms` sleeps) happens inside the
 /// controller's haptic player task — callers send the chain and return
 /// immediately.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(untagged)]
 pub enum HapticChain {
     /// Single burst — the common case and the backward-compatible form.
