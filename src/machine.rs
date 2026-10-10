@@ -2,23 +2,28 @@
 //!
 //! This is the machine issue #32 asks for: state and input come in, the new state
 //! and a list of `OutputAction` go out, and nothing here touches a device, a
-//! socket or a process. It is built beside the existing path rather than in place
-//! of it — the old path stays the one that actually reaches the kernel, both run
-//! on every event, and the two are compared. A disagreement is a finding with the
-//! input that produced it, instead of a hypothesis.
+//! socket or a process. The event reader applies what comes out; it no longer
+//! decides anything these functions decide.
 //!
-//! It is a state machine and not a function, deliberately: `modifier_was_activated`
-//! is read and written inside the same loop that emits, so pretending the decision
-//! is stateless would be wrong about the thing being modelled.
+//! It is a state machine and not a function, deliberately. `modifier_was_activated`
+//! and the acceleration ramp are read and written by the same step that emits, so
+//! pretending a decision here is stateless would be wrong about the thing being
+//! modelled — and the loop that feeds state back in is what makes a mode change
+//! observable as an action before it is believed as state.
 //!
-//! Only `emit_event` is modelled so far. The rest follows once this one has run
-//! quietly against the real path for a while.
+//! It was built beside the old path first and run against it: 380 real decisions
+//! through `emit_event` with no disagreement, which is what justified replacing
+//! the old half rather than keeping both. The comparison machinery is gone with
+//! it — keeping a second implementation of every branch in order to check the
+//! first is only worth it until the check has passed.
+//!
+//! Still performed where it is decided, and so still untestable: `convert_event`
+//! itself, `emit_nonmapped_event`, and the trackpad path.
 
 use crate::config::{Config, Event};
 use crate::output::action::{Ev, OutputAction, OutputDevice, Raw};
 
 use evdev::{EventType, Key};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What one `emit_event` amounts to.
 #[derive(Debug, Clone, PartialEq)]
@@ -247,107 +252,6 @@ pub fn plan_key_tick(
         frames.push(axis_frame(axes.1, movement.1 * current_speed as i32));
     }
     (frames, current_speed)
-}
-
-/// What the old path just sent, in the new vocabulary, so the two can be compared.
-pub fn recorded(code: u16, value: i32) -> OutputAction {
-    key_frame(code, value)
-}
-
-/// The same, for a relative-axis movement the old path sent.
-pub fn moved(code: u16, value: i32) -> OutputAction {
-    axis_frame(code, value)
-}
-
-/// The same, for an event the old path passed straight through.
-pub fn forwarded(device: OutputDevice, event: evdev::InputEvent) -> OutputAction {
-    OutputAction::Forward { device, events: vec![Raw(event)] }
-}
-
-/// Per-site tally of how much has been compared, and how much disagreed.
-///
-/// One of these per call site rather than one shared between them. A shared
-/// counter answers "how much of the input path has been checked", which sounds
-/// like the interesting number but is not: the question that actually comes up
-/// is whether *this* function ran at all, and a shared counter cannot say.
-pub struct Tally {
-    compared: AtomicU64,
-    reported: AtomicU64,
-}
-
-impl Tally {
-    pub const fn new() -> Self {
-        Self { compared: AtomicU64::new(0), reported: AtomicU64::new(0) }
-    }
-}
-
-/// Compare a plan against what the old path actually sent.
-pub fn compare_actions(
-    tally: &Tally,
-    what: &str,
-    planned: &[OutputAction],
-    performed: &[OutputAction],
-    input: &str,
-) {
-    let plan = EmitPlan {
-        frames: planned.to_vec(),
-        toggles: Vec::new(),
-        modifier_was_activated: false,
-    };
-    compare(tally, what, &plan, performed, false, input);
-}
-
-/// Compare the two machines and say so when they disagree.
-///
-/// Rate-limited and one line per kind of disagreement rather than per press: a
-/// mismatch that fires on every keystroke would bury the first and only
-/// interesting instance of it, and at 60 Hz it would bury the journal too.
-///
-/// Silent when they agree, which is meant to be always — this exists to be
-/// boring, and a line from it is a finding.
-pub fn compare(
-    tally: &Tally,
-    what: &str,
-    planned: &EmitPlan,
-    performed: &[OutputAction],
-    modifier_was_activated: bool,
-    input: &str,
-) {
-    const MAX: u64 = 50;
-    const EVERY: u64 = 20;
-
-    // Silence on agreement is what makes a line from this worth reading — but it
-    // also makes "they never disagreed" and "this never ran" look identical. So
-    // the count is reported now and then: without it, a quiet journal is not
-    // evidence of anything.
-    let compared = tally.compared.fetch_add(1, Ordering::Relaxed) + 1;
-    // The first one too, not only every twentieth: the useful question early on
-    // is whether this path runs at all, and waiting for a round number to answer
-    // it is what made the first attempt say nothing.
-    if compared == 1 || compared % EVERY == 0 {
-        println!("deckery: {what}: {compared} decisions compared, {} disagreements",
-                 tally.reported.load(Ordering::Relaxed));
-    }
-
-    let frames_agree = planned.frames == performed;
-    let state_agrees = planned.modifier_was_activated == modifier_was_activated;
-    if frames_agree && state_agrees {
-        return;
-    }
-    if tally.reported.fetch_add(1, Ordering::Relaxed) >= MAX {
-        return;
-    }
-
-    eprintln!("deckery: {what}: the two machines disagree
-  input:     {input}");
-    if !frames_agree {
-        eprintln!("  planned:   {:?}
-  performed: {:?}", planned.frames, performed);
-    }
-    if !state_agrees {
-        eprintln!("  modifier_was_activated: planned {}, actual {}",
-                  planned.modifier_was_activated, modifier_was_activated);
-    }
 }
 
 #[cfg(test)]

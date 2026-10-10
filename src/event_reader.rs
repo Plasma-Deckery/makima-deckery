@@ -1439,6 +1439,54 @@ impl EventReader {
             .await;
     }
 
+    /// Send a plan's frames to the output devices.
+    ///
+    /// One lock for the whole plan, so every frame of one decision is contiguous
+    /// as the kernel reads it. `Frame` is synthesised and stamped here, which is
+    /// what the old path did; `Forward` keeps the stamp it arrived with, which is
+    /// why it is a separate kind.
+    ///
+    /// This does change one thing: `key_cursor_loop` used to take the lock once
+    /// per axis, so another producer could split a pointer motion between X and
+    /// Y. It cannot any more. That is deliberate — the other three loops already
+    /// behaved this way, and a motion split in half was never the intent.
+    async fn apply_frames(&self, actions: &[crate::output::action::OutputAction]) {
+        use crate::output::action::OutputAction;
+        if actions.is_empty() {
+            return;
+        }
+        let mut virt_dev = self.virt_dev.lock().await;
+        for action in actions {
+            match action {
+                OutputAction::Frame { device, events } => {
+                    let batch: Vec<InputEvent> = events
+                        .iter()
+                        .map(|e| InputEvent::new_now(EventType(e.ev_type), e.code, e.value))
+                        .collect();
+                    virt_dev.emit(*device, &batch).unwrap();
+                }
+                OutputAction::Forward { device, events } => {
+                    let batch: Vec<InputEvent> = events.iter().map(|r| r.0).collect();
+                    virt_dev.emit(*device, &batch).unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Emit what a resolved key binding amounts to.
+    ///
+    /// The decision is `machine::plan_emit`, which is pure and tested; this
+    /// applies it. The two used to be one interleaved loop — read state, mutate
+    /// state, emit, repeat — and that interleaving was what made the binding
+    /// engine impossible to test without a kernel.
+    ///
+    /// The frames go out first and under one lock, so every frame of one
+    /// decision reaches the kernel contiguously. The modifier bookkeeping
+    /// follows, which is the one observable change from the old order: it used
+    /// to happen between frames, and each of those calls publishes state at its
+    /// end, so those publishes now land after the frames rather than among
+    /// them. Only the overlay sees that, and only as timing.
     async fn emit_event(
         &self,
         event_list: &Vec<Key>,
@@ -1453,103 +1501,22 @@ impl EventReader {
         if paused && !no_pause {
             return;
         }
-        let mut virt_dev = self.virt_dev.lock().await;
-        let mut modifier_was_activated = self.modifier_was_activated.lock().await;
-        // Both machines run on every press. The old path below is still the one
-        // that reaches the kernel; the new one only decides, and the two are
-        // compared at the end. `mwa_before` is the state the new machine has to be
-        // given, captured before the old path starts changing it.
-        let mwa_before = *modifier_was_activated;
-        let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
-        if release_keys && value != 2 && !modifiers.is_empty() {
-            // Only release previous modifier outputs when there are actually modifiers
-            // held. With an empty modifier set there is nothing to clean up, and
-            // iterating released_keys(&[]) would spuriously release system modifier
-            // keys (e.g. KEY_LEFTSHIFT from a back-paddle remap) that happen to share
-            // their key code with a base remap output.
-            let released_keys: Vec<Key> = self.released_keys(&modifiers, &config).await;
-            for key in released_keys {
-                if config.mapped_modifiers.all.contains(&Event::Key(key)) {
-                    self.toggle_modifiers(Event::Key(key), 0, &config).await;
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 0);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap();
-                    performed.push(crate::machine::recorded(key.code(), 0));
-                }
-            }
-        } else if ignore_modifiers {
-            // For each active modifier, release its OUTPUT key (not the raw input
-            // code). For a custom modifier with a remap (e.g. BTN_TL → KEY_LEFTCTRL)
-            // that means releasing KEY_LEFTCTRL so the system modifier state is
-            // cleared before the combo keys are emitted.
-            for modifier in modifiers.iter() {
-                let codes: Vec<u16> = config
-                    .bindings
-                    .remap
-                    .get(modifier)
-                    .and_then(|m| m.get(&vec![]))
-                    .map(|keys| keys.iter().map(|k| k.code()).collect())
-                    .unwrap_or_else(|| match modifier {
-                        Event::Key(k) => vec![k.code()],
-                        _ => vec![],
-                    });
-                for code in codes {
-                    virt_dev.keys.emit(&[
-                        InputEvent::new_now(EventType::KEY, code, 0),
-                    ]).unwrap();
-                    performed.push(crate::machine::recorded(code, 0));
-                }
-            }
-        }
-        for key in event_list {
-            if release_keys && value != 2 {
-                // Only track CUSTOM_MODIFIERS in self.modifiers — not system modifier
-                // keys like KEY_LEFTSHIFT/CTRL/ALT that appear as remap outputs.
-                // Tracking system modifiers corrupts the modifier state and breaks
-                // subsequent combo lookups (e.g. pressing Shift after a combo would
-                // leave KEY_LEFTSHIFT stuck in self.modifiers).
-                if config.mapped_modifiers.custom.contains(&Event::Key(*key)) {
-                    self.toggle_modifiers(Event::Key(*key), value, &config)
-                        .await;
-                }
-            }
-            if config.mapped_modifiers.custom.contains(&Event::Key(*key)) {
-                if value == 0 && !*modifier_was_activated {
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 1);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap();
-                    performed.push(crate::machine::recorded(key.code(), 1));
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 0);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap();
-                    performed.push(crate::machine::recorded(key.code(), 0));
-                    *modifier_was_activated = true;
-                } else if value == 1 {
-                    *modifier_was_activated = false;
-                }
-            } else {
-                let virtual_event: InputEvent =
-                    InputEvent::new_now(EventType::KEY, key.code(), value);
-                virt_dev.keys.emit(&[virtual_event]).unwrap();
-                performed.push(crate::machine::recorded(key.code(), value));
-                *modifier_was_activated = true;
-            }
-        }
 
-        // The new machine decides the same press, and the two are compared. The
-        // old path has already acted, so a disagreement costs nothing but a
-        // journal line — which is the point of running them side by side.
-        let planned = crate::machine::plan_emit(
-            config, event_list, value, modifiers,
-            release_keys, ignore_modifiers, mwa_before,
-        );
-        static TALLY: crate::machine::Tally = crate::machine::Tally::new();
-        crate::machine::compare(
-            &TALLY, "emit_event", &planned, &performed, *modifier_was_activated,
-            &format!("value={value} release_keys={release_keys} \
-ignore_modifiers={ignore_modifiers} mwa_before={mwa_before} \
-keys={event_list:?} modifiers={modifiers:?}"),
-        );
+        let plan = {
+            let mut modifier_was_activated = self.modifier_was_activated.lock().await;
+            let plan = crate::machine::plan_emit(
+                config, event_list, value, modifiers,
+                release_keys, ignore_modifiers, *modifier_was_activated,
+            );
+            *modifier_was_activated = plan.modifier_was_activated;
+            plan
+        };
+
+        self.apply_frames(&plan.frames).await;
+
+        for (modifier, value) in plan.toggles {
+            self.toggle_modifiers(modifier, value, config).await;
+        }
     }
 
     async fn emit_nonmapped_event(
@@ -1623,49 +1590,10 @@ keys={event_list:?} modifiers={modifiers:?}"),
         }
     }
 
+    /// Pass an event the reader has no binding for straight through.
     async fn emit_default_event(&self, event: InputEvent) {
         let paused = *self.paused.lock().await;
-        // Both machines, as in emit_event: the old path still does the work, the
-        // new one only says what it would have done.
-        let planned = crate::machine::plan_default(&event, paused);
-        let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
-
-        if !paused {
-            match event.event_type() {
-                EventType::KEY => {
-                    let mut virt_dev = self.virt_dev.lock().await;
-                    virt_dev.keys.emit(&[event]).unwrap();
-                    performed.push(crate::machine::forwarded(
-                        crate::output::OutputDevice::Keys, event));
-                }
-                EventType::RELATIVE => {
-                    let mut virt_dev = self.virt_dev.lock().await;
-                    virt_dev.axis.emit(&[event]).unwrap();
-                    performed.push(crate::machine::forwarded(
-                        crate::output::OutputDevice::Axis, event));
-                }
-                EventType::ABSOLUTE => {
-                    let mut virt_dev = self.virt_dev.lock().await;
-                    virt_dev.abs.emit(&[event]).unwrap();
-                    performed.push(crate::machine::forwarded(
-                        crate::output::OutputDevice::Abs, event));
-                }
-                EventType::MISC => {
-                    let mut virt_dev = self.virt_dev.lock().await;
-                    virt_dev.abs.emit(&[event]).unwrap();
-                    performed.push(crate::machine::forwarded(
-                        crate::output::OutputDevice::Abs, event));
-                }
-                _ => {}
-            }
-        }
-
-        static TALLY: crate::machine::Tally = crate::machine::Tally::new();
-        crate::machine::compare_actions(
-            &TALLY, "emit_default_event", &planned, &performed,
-            &format!("paused={paused} type={:?} code={} value={}",
-                     event.event_type(), event.code(), event.value()),
-        );
+        self.apply_frames(&crate::machine::plan_default(&event, paused)).await;
     }
 
     async fn emit_movement(&self, movement: &Relative, value: i32) {
@@ -2170,36 +2098,12 @@ keys={event_list:?} modifiers={modifiers:?}"),
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
                             let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
-                            let planned = crate::machine::plan_stick_tick(
+                            self.apply_frames(&crate::machine::plan_stick_tick(
                                 crate::machine::CURSOR_AXES,
                                 (stick_position[0], stick_position[1]),
                                 self.settings.invert_cursor_axis,
                                 &activation_modifiers, &modifiers, active,
-                            );
-                            let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
-                            if active {
-                                let (x_coord, y_coord) = if self.settings.invert_cursor_axis {
-                                    (-stick_position[0], -stick_position[1])
-                                } else {
-                                    (stick_position[0], stick_position[1])
-                                };
-                                let virtual_event_x: InputEvent =
-                                    InputEvent::new_now(EventType::RELATIVE, 0, x_coord);
-                                let virtual_event_y: InputEvent =
-                                    InputEvent::new_now(EventType::RELATIVE, 1, y_coord);
-                                let mut virt_dev = self.virt_dev.lock().await;
-                                virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                                virt_dev.axis.emit(&[virtual_event_y]).unwrap();
-                                performed.push(crate::machine::moved(0, x_coord));
-                                performed.push(crate::machine::moved(1, y_coord));
-                            }
-                            static TALLY: crate::machine::Tally = crate::machine::Tally::new();
-                            crate::machine::compare_actions(
-                                &TALLY, "cursor_loop", &planned, &performed,
-                                &format!("pos=({},{}) invert={} active={active}",
-                                         stick_position[0], stick_position[1],
-                                         self.settings.invert_cursor_axis),
-                            );
+                            )).await;
                         }
                     }
                 }
@@ -2241,36 +2145,12 @@ keys={event_list:?} modifiers={modifiers:?}"),
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
                             let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
-                            let planned = crate::machine::plan_stick_tick(
+                            self.apply_frames(&crate::machine::plan_stick_tick(
                                 crate::machine::SCROLL_AXES,
                                 (stick_position[0], stick_position[1]),
                                 self.settings.invert_scroll_axis,
                                 &activation_modifiers, &modifiers, active,
-                            );
-                            let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
-                            if active {
-                                let (x_coord, y_coord) = if self.settings.invert_scroll_axis {
-                                    (-stick_position[0], -stick_position[1])
-                                } else {
-                                    (stick_position[0], stick_position[1])
-                                };
-                                let virtual_event_x: InputEvent =
-                                    InputEvent::new_now(EventType::RELATIVE, 12, x_coord);
-                                let virtual_event_y: InputEvent =
-                                    InputEvent::new_now(EventType::RELATIVE, 11, y_coord);
-                                let mut virt_dev = self.virt_dev.lock().await;
-                                virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                                virt_dev.axis.emit(&[virtual_event_y]).unwrap();
-                                performed.push(crate::machine::moved(12, x_coord));
-                                performed.push(crate::machine::moved(11, y_coord));
-                            }
-                            static TALLY: crate::machine::Tally = crate::machine::Tally::new();
-                            crate::machine::compare_actions(
-                                &TALLY, "scroll_loop", &planned, &performed,
-                                &format!("pos=({},{}) invert={} active={active}",
-                                         stick_position[0], stick_position[1],
-                                         self.settings.invert_scroll_axis),
-                            );
+                            )).await;
                         }
                     }
                 }
@@ -2298,57 +2178,16 @@ keys={event_list:?} modifiers={modifiers:?}"),
         while *self.device_is_connected.lock().await {
             {
                 let cursor_movement = self.cursor_movement.lock().await;
-                if *cursor_movement == (0, 0) {
-                    current_speed = 0.0
-                } else {
-                    current_speed += speed as f32 * acceleration / 10.0;
-                    if current_speed > speed as f32 {
-                        current_speed = speed as f32
-                    }
-                    let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
-                    // The ramp was already advanced above, so the plan is given
-                    // the value before that step to arrive at the same number.
-                    let (planned, planned_speed) = crate::machine::plan_key_tick(
-                        crate::machine::CURSOR_AXES, *cursor_movement,
-                        speed, acceleration, current_speed - speed as f32 * acceleration / 10.0,
-                        active,
-                    );
-                    let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
-                    if active {
-                        // Two locks rather than one, as today: another producer
-                        // can slip between X and Y here, and changing that is a
-                        // behaviour change rather than a tidy-up.
-                        if cursor_movement.0 != 0 {
-                            let mut virt_dev = self.virt_dev.lock().await;
-                            let virtual_event_x: InputEvent = InputEvent::new_now(
-                                EventType::RELATIVE,
-                                0,
-                                cursor_movement.0 * current_speed as i32,
-                            );
-                            virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                            performed.push(crate::machine::moved(
-                                0, cursor_movement.0 * current_speed as i32));
-                        }
-                        if cursor_movement.1 != 0 {
-                            let mut virt_dev = self.virt_dev.lock().await;
-                            let virtual_event_y: InputEvent = InputEvent::new_now(
-                                EventType::RELATIVE,
-                                1,
-                                cursor_movement.1 * current_speed as i32,
-                            );
-                            virt_dev.axis.emit(&[virtual_event_y]).unwrap();
-                            performed.push(crate::machine::moved(
-                                1, cursor_movement.1 * current_speed as i32));
-                        }
-                    }
-                    static TALLY: crate::machine::Tally = crate::machine::Tally::new();
-                    crate::machine::compare_actions(
-                        &TALLY, "key_cursor_loop", &planned, &performed,
-                        &format!("movement={:?} speed={speed} accel={acceleration} \
-current={current_speed} planned_speed={planned_speed} active={active}",
-                                 *cursor_movement),
-                    );
-                }
+                let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                // The ramp is part of the decision, so the plan advances it and
+                // hands back the new value — including the collapse to nothing
+                // when no direction is held.
+                let (frames, next_speed) = crate::machine::plan_key_tick(
+                    crate::machine::CURSOR_AXES, *cursor_movement,
+                    speed, acceleration, current_speed, active,
+                );
+                current_speed = next_speed;
+                self.apply_frames(&frames).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -2371,53 +2210,16 @@ current={current_speed} planned_speed={planned_speed} active={active}",
         while *self.device_is_connected.lock().await {
             {
                 let scroll_movement = self.scroll_movement.lock().await;
-                if *scroll_movement == (0, 0) {
-                    current_speed = 0.0
-                } else {
-                    current_speed += speed as f32 * acceleration / 10.0;
-                    if current_speed > speed as f32 {
-                        current_speed = speed as f32
-                    }
-                    let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
-                    let (planned, planned_speed) = crate::machine::plan_key_tick(
-                        crate::machine::SCROLL_AXES, *scroll_movement,
-                        speed, acceleration, current_speed - speed as f32 * acceleration / 10.0,
-                        active,
-                    );
-                    let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
-                    if active {
-                        // One lock for both axes here, unlike key_cursor_loop.
-                        // The asymmetry is pre-existing and left alone.
-                        let mut virt_dev = self.virt_dev.lock().await;
-                        if scroll_movement.0 != 0 {
-                            let virtual_event_x: InputEvent = InputEvent::new_now(
-                                EventType::RELATIVE,
-                                12,
-                                scroll_movement.0 * current_speed as i32,
-                            );
-                            virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                            performed.push(crate::machine::moved(
-                                12, scroll_movement.0 * current_speed as i32));
-                        }
-                        if scroll_movement.1 != 0 {
-                            let virtual_event_y: InputEvent = InputEvent::new_now(
-                                EventType::RELATIVE,
-                                11,
-                                scroll_movement.1 * current_speed as i32,
-                            );
-                            virt_dev.axis.emit(&[virtual_event_y]).unwrap();
-                            performed.push(crate::machine::moved(
-                                11, scroll_movement.1 * current_speed as i32));
-                        }
-                    }
-                    static TALLY: crate::machine::Tally = crate::machine::Tally::new();
-                    crate::machine::compare_actions(
-                        &TALLY, "key_scroll_loop", &planned, &performed,
-                        &format!("movement={:?} speed={speed} accel={acceleration} \
-current={current_speed} planned_speed={planned_speed} active={active}",
-                                 *scroll_movement),
-                    );
-                }
+                let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                // The ramp is part of the decision, so the plan advances it and
+                // hands back the new value — including the collapse to nothing
+                // when no direction is held.
+                let (frames, next_speed) = crate::machine::plan_key_tick(
+                    crate::machine::SCROLL_AXES, *scroll_movement,
+                    speed, acceleration, current_speed, active,
+                );
+                current_speed = next_speed;
+                self.apply_frames(&frames).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

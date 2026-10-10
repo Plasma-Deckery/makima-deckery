@@ -204,20 +204,6 @@ fn released_keys_resolves_the_held_set() {
     assert!(released_keys(&[ev(Key::BTN_TR)], &config).is_empty());
 }
 
-/// The comparison is silent when the two machines agree, which is what makes a
-/// line from it worth reading.
-#[test]
-fn comparing_identical_results_says_nothing() {
-    let config = make_config(vec![], vec![]);
-    let plan = plan_emit(&config, &[Key::KEY_A], 1, &[], true, false, true);
-    let performed: Vec<OutputAction> = plan.frames.clone();
-
-    // No output to assert on directly; what this pins is that agreement is the
-    // quiet path and takes no special casing.
-    static TALLY: Tally = Tally::new();
-    compare(&TALLY, "test", &plan, &performed, plan.modifier_was_activated, "");
-}
-
 // ── emit_default_event: passing an event straight through ─────────────────
 
 fn raw(ev_type: EventType, code: u16, value: i32) -> evdev::InputEvent {
