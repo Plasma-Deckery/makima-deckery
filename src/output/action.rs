@@ -61,6 +61,25 @@ impl OutputDevice {
     }
 }
 
+/// A hardware event on its way through unchanged.
+///
+/// Wrapped rather than used bare so the enum can keep its derive: `InputEvent`
+/// has no `PartialEq`, and the equality that belongs here is not the derived one
+/// anyway.
+#[derive(Debug, Clone, Copy)]
+pub struct Raw(pub evdev::InputEvent);
+
+impl PartialEq for Raw {
+    /// Equal when the event is, timestamp aside.
+    ///
+    /// The timestamp belongs to the hardware, not to any decision — the decision
+    /// was "forward this", and the payload was never chosen. So two forwards of
+    /// the same event are the same action however far apart they happened.
+    fn eq(&self, other: &Self) -> bool {
+        Ev::from(&self.0) == Ev::from(&other.0)
+    }
+}
+
 /// One action, numbered and placed, on its way out of a port.
 ///
 /// The sequence number is process-wide and monotonic, so records from different
@@ -91,6 +110,20 @@ pub enum OutputAction {
     /// itself (the trackpad path does; nothing else does). The recorded form is
     /// what the code handed over, never a tidied-up version.
     Frame { device: OutputDevice, events: Vec<Ev> },
+
+    /// A hardware event passed through untouched.
+    ///
+    /// Separate from `Frame` because forwarding and synthesising are different
+    /// things, and the difference is the timestamp: a synthesised event is
+    /// stamped when it is emitted, whereas a forwarded one carries the
+    /// hardware's own stamp and has to keep it — libinput reads timestamps for
+    /// velocity and smoothing, so restamping a forwarded pen event changes what
+    /// the desktop sees.
+    ///
+    /// The alternative was for `Ev` to carry a timestamp that its equality
+    /// ignores. That hides a surprise in a type everything else compares with;
+    /// this says out loud that there are two kinds of emission.
+    Forward { device: OutputDevice, events: Vec<Raw> },
 
     /// Publish state, or change what the overlay says happened last.
     State(StateAction),

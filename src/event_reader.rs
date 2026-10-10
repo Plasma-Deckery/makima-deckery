@@ -1543,8 +1543,9 @@ impl EventReader {
             config, event_list, value, modifiers,
             release_keys, ignore_modifiers, mwa_before,
         );
+        static TALLY: crate::machine::Tally = crate::machine::Tally::new();
         crate::machine::compare(
-            "emit_event", &planned, &performed, *modifier_was_activated,
+            &TALLY, "emit_event", &planned, &performed, *modifier_was_activated,
             &format!("value={value} release_keys={release_keys} \
 ignore_modifiers={ignore_modifiers} mwa_before={mwa_before} \
 keys={event_list:?} modifiers={modifiers:?}"),
@@ -1623,28 +1624,48 @@ keys={event_list:?} modifiers={modifiers:?}"),
     }
 
     async fn emit_default_event(&self, event: InputEvent) {
-        if *self.paused.lock().await {
-            return;
+        let paused = *self.paused.lock().await;
+        // Both machines, as in emit_event: the old path still does the work, the
+        // new one only says what it would have done.
+        let planned = crate::machine::plan_default(&event, paused);
+        let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
+
+        if !paused {
+            match event.event_type() {
+                EventType::KEY => {
+                    let mut virt_dev = self.virt_dev.lock().await;
+                    virt_dev.keys.emit(&[event]).unwrap();
+                    performed.push(crate::machine::forwarded(
+                        crate::output::OutputDevice::Keys, event));
+                }
+                EventType::RELATIVE => {
+                    let mut virt_dev = self.virt_dev.lock().await;
+                    virt_dev.axis.emit(&[event]).unwrap();
+                    performed.push(crate::machine::forwarded(
+                        crate::output::OutputDevice::Axis, event));
+                }
+                EventType::ABSOLUTE => {
+                    let mut virt_dev = self.virt_dev.lock().await;
+                    virt_dev.abs.emit(&[event]).unwrap();
+                    performed.push(crate::machine::forwarded(
+                        crate::output::OutputDevice::Abs, event));
+                }
+                EventType::MISC => {
+                    let mut virt_dev = self.virt_dev.lock().await;
+                    virt_dev.abs.emit(&[event]).unwrap();
+                    performed.push(crate::machine::forwarded(
+                        crate::output::OutputDevice::Abs, event));
+                }
+                _ => {}
+            }
         }
-        match event.event_type() {
-            EventType::KEY => {
-                let mut virt_dev = self.virt_dev.lock().await;
-                virt_dev.keys.emit(&[event]).unwrap();
-            }
-            EventType::RELATIVE => {
-                let mut virt_dev = self.virt_dev.lock().await;
-                virt_dev.axis.emit(&[event]).unwrap();
-            }
-            EventType::ABSOLUTE => {
-                let mut virt_dev = self.virt_dev.lock().await;
-                virt_dev.abs.emit(&[event]).unwrap();
-            }
-            EventType::MISC => {
-                let mut virt_dev = self.virt_dev.lock().await;
-                virt_dev.abs.emit(&[event]).unwrap();
-            }
-            _ => {}
-        }
+
+        static TALLY: crate::machine::Tally = crate::machine::Tally::new();
+        crate::machine::compare_actions(
+            &TALLY, "emit_default_event", &planned, &performed,
+            &format!("paused={paused} type={:?} code={} value={}",
+                     event.event_type(), event.code(), event.value()),
+        );
     }
 
     async fn emit_movement(&self, movement: &Relative, value: i32) {

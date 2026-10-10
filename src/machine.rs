@@ -15,9 +15,10 @@
 //! quietly against the real path for a while.
 
 use crate::config::{Config, Event};
-use crate::output::action::{Ev, OutputAction, OutputDevice};
+use crate::output::action::{Ev, OutputAction, OutputDevice, Raw};
 
 use evdev::{EventType, Key};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What one `emit_event` amounts to.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,9 +134,79 @@ pub fn plan_emit(
     plan
 }
 
+/// Which virtual device a passed-through event belongs on.
+///
+/// The pen and the tablet share the `abs` device, which is why MISC lands there
+/// too — a pen's `MSC_SERIAL` is part of the same report as its position.
+fn device_for(event_type: EventType) -> Option<OutputDevice> {
+    match event_type {
+        EventType::KEY => Some(OutputDevice::Keys),
+        EventType::RELATIVE => Some(OutputDevice::Axis),
+        EventType::ABSOLUTE | EventType::MISC => Some(OutputDevice::Abs),
+        // Anything else is not forwarded. The incoming SYN in particular is
+        // consumed for rate limiting and never passed on, because `emit`
+        // appends one of its own.
+        _ => None,
+    }
+}
+
+/// Decide what `emit_default_event` sends: the event itself, or nothing.
+///
+/// The whole decision is which device an untouched event belongs on, and whether
+/// a pause swallows it. It is modelled anyway, because it is the function where
+/// forwarding *is* the job — and therefore the one that shows whether `Forward`
+/// keeping the hardware timestamp is right.
+pub fn plan_default(event: &evdev::InputEvent, paused: bool) -> Vec<OutputAction> {
+    if paused {
+        return Vec::new();
+    }
+    match device_for(event.event_type()) {
+        Some(device) => vec![OutputAction::Forward { device, events: vec![Raw(*event)] }],
+        None => Vec::new(),
+    }
+}
+
 /// What the old path just sent, in the new vocabulary, so the two can be compared.
 pub fn recorded(code: u16, value: i32) -> OutputAction {
     key_frame(code, value)
+}
+
+/// The same, for an event the old path passed straight through.
+pub fn forwarded(device: OutputDevice, event: evdev::InputEvent) -> OutputAction {
+    OutputAction::Forward { device, events: vec![Raw(event)] }
+}
+
+/// Per-site tally of how much has been compared, and how much disagreed.
+///
+/// One of these per call site rather than one shared between them. A shared
+/// counter answers "how much of the input path has been checked", which sounds
+/// like the interesting number but is not: the question that actually comes up
+/// is whether *this* function ran at all, and a shared counter cannot say.
+pub struct Tally {
+    compared: AtomicU64,
+    reported: AtomicU64,
+}
+
+impl Tally {
+    pub const fn new() -> Self {
+        Self { compared: AtomicU64::new(0), reported: AtomicU64::new(0) }
+    }
+}
+
+/// Compare a plan against what the old path actually sent.
+pub fn compare_actions(
+    tally: &Tally,
+    what: &str,
+    planned: &[OutputAction],
+    performed: &[OutputAction],
+    input: &str,
+) {
+    let plan = EmitPlan {
+        frames: planned.to_vec(),
+        toggles: Vec::new(),
+        modifier_was_activated: false,
+    };
+    compare(tally, what, &plan, performed, false, input);
 }
 
 /// Compare the two machines and say so when they disagree.
@@ -147,15 +218,13 @@ pub fn recorded(code: u16, value: i32) -> OutputAction {
 /// Silent when they agree, which is meant to be always — this exists to be
 /// boring, and a line from it is a finding.
 pub fn compare(
+    tally: &Tally,
     what: &str,
     planned: &EmitPlan,
     performed: &[OutputAction],
     modifier_was_activated: bool,
     input: &str,
 ) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static REPORTED: AtomicU64 = AtomicU64::new(0);
-    static COMPARED: AtomicU64 = AtomicU64::new(0);
     const MAX: u64 = 50;
     const EVERY: u64 = 20;
 
@@ -163,13 +232,13 @@ pub fn compare(
     // also makes "they never disagreed" and "this never ran" look identical. So
     // the count is reported now and then: without it, a quiet journal is not
     // evidence of anything.
-    let compared = COMPARED.fetch_add(1, Ordering::Relaxed) + 1;
+    let compared = tally.compared.fetch_add(1, Ordering::Relaxed) + 1;
     // The first one too, not only every twentieth: the useful question early on
     // is whether this path runs at all, and waiting for a round number to answer
     // it is what made the first attempt say nothing.
     if compared == 1 || compared % EVERY == 0 {
         println!("deckery: {what}: {compared} decisions compared, {} disagreements",
-                 REPORTED.load(Ordering::Relaxed));
+                 tally.reported.load(Ordering::Relaxed));
     }
 
     let frames_agree = planned.frames == performed;
@@ -177,7 +246,7 @@ pub fn compare(
     if frames_agree && state_agrees {
         return;
     }
-    if REPORTED.fetch_add(1, Ordering::Relaxed) >= MAX {
+    if tally.reported.fetch_add(1, Ordering::Relaxed) >= MAX {
         return;
     }
 

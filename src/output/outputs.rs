@@ -110,28 +110,32 @@ impl Outputs {
 
         // Frames first and under one lock, so one decision's frames are
         // contiguous as the kernel reads them.
+        let emits = |a: &OutputAction| {
+            matches!(a, OutputAction::Frame { .. } | OutputAction::Forward { .. })
+        };
         if let Some(devices) = &self.devices {
-            if actions.iter().any(|a| matches!(a, OutputAction::Frame { .. })) {
+            if actions.iter().any(emits) {
                 let mut devices = devices.lock().await;
                 for action in actions {
-                    if let OutputAction::Frame { device, events } = action {
-                        // UNRESOLVED — the one thing this port cannot answer by
-                        // itself. `Ev` drops the timestamp so two runs of the same
-                        // decision compare equal, but emitting needs one, so this
-                        // stamps "now". For a synthesised event that is exactly
-                        // what the old path did. For a *forwarded* hardware event
-                        // — the pen batch, the passthroughs — the original
-                        // timestamp is lost, and libinput reads timestamps for
-                        // velocity. So either `Ev` carries a timestamp that its
-                        // equality ignores, or forwarding becomes its own action
-                        // kind. Not wired until that is decided.
-                        let stamped: Vec<evdev::InputEvent> = events
-                            .iter()
-                            .map(|e| evdev::InputEvent::new_now(
-                                evdev::EventType(e.ev_type), e.code, e.value,
-                            ))
-                            .collect();
-                        let _ = devices.emit(*device, &stamped);
+                    match action {
+                        // Synthesised, so it is stamped as it goes out — which is
+                        // what the old path did with `new_now`.
+                        OutputAction::Frame { device, events } => {
+                            let stamped: Vec<evdev::InputEvent> = events
+                                .iter()
+                                .map(|e| evdev::InputEvent::new_now(
+                                    evdev::EventType(e.ev_type), e.code, e.value,
+                                ))
+                                .collect();
+                            let _ = devices.emit(*device, &stamped);
+                        }
+                        // Forwarded, so it keeps the stamp it arrived with.
+                        OutputAction::Forward { device, events } => {
+                            let raw: Vec<evdev::InputEvent> =
+                                events.iter().map(|r| r.0).collect();
+                            let _ = devices.emit(*device, &raw);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -140,7 +144,7 @@ impl Outputs {
         for action in actions {
             match action {
                 // Done above.
-                OutputAction::Frame { .. } => {}
+                OutputAction::Frame { .. } | OutputAction::Forward { .. } => {}
 
                 OutputAction::Internal(InternalCommand::SetGamingMode { enabled, .. }) => {
                     if let Some(tx) = &self.internal {
