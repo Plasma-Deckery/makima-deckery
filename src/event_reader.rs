@@ -2169,7 +2169,15 @@ keys={event_list:?} modifiers={modifiers:?}"),
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
+                            let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                            let planned = crate::machine::plan_stick_tick(
+                                crate::machine::CURSOR_AXES,
+                                (stick_position[0], stick_position[1]),
+                                self.settings.invert_cursor_axis,
+                                &activation_modifiers, &modifiers, active,
+                            );
+                            let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
+                            if active {
                                 let (x_coord, y_coord) = if self.settings.invert_cursor_axis {
                                     (-stick_position[0], -stick_position[1])
                                 } else {
@@ -2182,7 +2190,16 @@ keys={event_list:?} modifiers={modifiers:?}"),
                                 let mut virt_dev = self.virt_dev.lock().await;
                                 virt_dev.axis.emit(&[virtual_event_x]).unwrap();
                                 virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                                performed.push(crate::machine::moved(0, x_coord));
+                                performed.push(crate::machine::moved(1, y_coord));
                             }
+                            static TALLY: crate::machine::Tally = crate::machine::Tally::new();
+                            crate::machine::compare_actions(
+                                &TALLY, "cursor_loop", &planned, &performed,
+                                &format!("pos=({},{}) invert={} active={active}",
+                                         stick_position[0], stick_position[1],
+                                         self.settings.invert_cursor_axis),
+                            );
                         }
                     }
                 }
@@ -2223,7 +2240,15 @@ keys={event_list:?} modifiers={modifiers:?}"),
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
+                            let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                            let planned = crate::machine::plan_stick_tick(
+                                crate::machine::SCROLL_AXES,
+                                (stick_position[0], stick_position[1]),
+                                self.settings.invert_scroll_axis,
+                                &activation_modifiers, &modifiers, active,
+                            );
+                            let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
+                            if active {
                                 let (x_coord, y_coord) = if self.settings.invert_scroll_axis {
                                     (-stick_position[0], -stick_position[1])
                                 } else {
@@ -2236,7 +2261,16 @@ keys={event_list:?} modifiers={modifiers:?}"),
                                 let mut virt_dev = self.virt_dev.lock().await;
                                 virt_dev.axis.emit(&[virtual_event_x]).unwrap();
                                 virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                                performed.push(crate::machine::moved(12, x_coord));
+                                performed.push(crate::machine::moved(11, y_coord));
                             }
+                            static TALLY: crate::machine::Tally = crate::machine::Tally::new();
+                            crate::machine::compare_actions(
+                                &TALLY, "scroll_loop", &planned, &performed,
+                                &format!("pos=({},{}) invert={} active={active}",
+                                         stick_position[0], stick_position[1],
+                                         self.settings.invert_scroll_axis),
+                            );
                         }
                     }
                 }
@@ -2271,7 +2305,19 @@ keys={event_list:?} modifiers={modifiers:?}"),
                     if current_speed > speed as f32 {
                         current_speed = speed as f32
                     }
-                    if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
+                    let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                    // The ramp was already advanced above, so the plan is given
+                    // the value before that step to arrive at the same number.
+                    let (planned, planned_speed) = crate::machine::plan_key_tick(
+                        crate::machine::CURSOR_AXES, *cursor_movement,
+                        speed, acceleration, current_speed - speed as f32 * acceleration / 10.0,
+                        active,
+                    );
+                    let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
+                    if active {
+                        // Two locks rather than one, as today: another producer
+                        // can slip between X and Y here, and changing that is a
+                        // behaviour change rather than a tidy-up.
                         if cursor_movement.0 != 0 {
                             let mut virt_dev = self.virt_dev.lock().await;
                             let virtual_event_x: InputEvent = InputEvent::new_now(
@@ -2280,6 +2326,8 @@ keys={event_list:?} modifiers={modifiers:?}"),
                                 cursor_movement.0 * current_speed as i32,
                             );
                             virt_dev.axis.emit(&[virtual_event_x]).unwrap();
+                            performed.push(crate::machine::moved(
+                                0, cursor_movement.0 * current_speed as i32));
                         }
                         if cursor_movement.1 != 0 {
                             let mut virt_dev = self.virt_dev.lock().await;
@@ -2289,8 +2337,17 @@ keys={event_list:?} modifiers={modifiers:?}"),
                                 cursor_movement.1 * current_speed as i32,
                             );
                             virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                            performed.push(crate::machine::moved(
+                                1, cursor_movement.1 * current_speed as i32));
                         }
                     }
+                    static TALLY: crate::machine::Tally = crate::machine::Tally::new();
+                    crate::machine::compare_actions(
+                        &TALLY, "key_cursor_loop", &planned, &performed,
+                        &format!("movement={:?} speed={speed} accel={acceleration} \
+current={current_speed} planned_speed={planned_speed} active={active}",
+                                 *cursor_movement),
+                    );
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2321,7 +2378,16 @@ keys={event_list:?} modifiers={modifiers:?}"),
                     if current_speed > speed as f32 {
                         current_speed = speed as f32
                     }
-                    if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
+                    let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                    let (planned, planned_speed) = crate::machine::plan_key_tick(
+                        crate::machine::SCROLL_AXES, *scroll_movement,
+                        speed, acceleration, current_speed - speed as f32 * acceleration / 10.0,
+                        active,
+                    );
+                    let mut performed: Vec<crate::output::action::OutputAction> = Vec::new();
+                    if active {
+                        // One lock for both axes here, unlike key_cursor_loop.
+                        // The asymmetry is pre-existing and left alone.
                         let mut virt_dev = self.virt_dev.lock().await;
                         if scroll_movement.0 != 0 {
                             let virtual_event_x: InputEvent = InputEvent::new_now(
@@ -2330,6 +2396,8 @@ keys={event_list:?} modifiers={modifiers:?}"),
                                 scroll_movement.0 * current_speed as i32,
                             );
                             virt_dev.axis.emit(&[virtual_event_x]).unwrap();
+                            performed.push(crate::machine::moved(
+                                12, scroll_movement.0 * current_speed as i32));
                         }
                         if scroll_movement.1 != 0 {
                             let virtual_event_y: InputEvent = InputEvent::new_now(
@@ -2338,8 +2406,17 @@ keys={event_list:?} modifiers={modifiers:?}"),
                                 scroll_movement.1 * current_speed as i32,
                             );
                             virt_dev.axis.emit(&[virtual_event_y]).unwrap();
+                            performed.push(crate::machine::moved(
+                                11, scroll_movement.1 * current_speed as i32));
                         }
                     }
+                    static TALLY: crate::machine::Tally = crate::machine::Tally::new();
+                    crate::machine::compare_actions(
+                        &TALLY, "key_scroll_loop", &planned, &performed,
+                        &format!("movement={:?} speed={speed} accel={acceleration} \
+current={current_speed} planned_speed={planned_speed} active={active}",
+                                 *scroll_movement),
+                    );
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

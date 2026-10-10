@@ -302,3 +302,114 @@ fn a_forward_is_not_a_frame() {
 
     assert_ne!(forward, frame);
 }
+
+// ── the stick loops ───────────────────────────────────────────────────────
+
+fn axis_pairs(plan: &[OutputAction]) -> Vec<(u16, i32)> {
+    plan.iter()
+        .flat_map(|a| match a {
+            OutputAction::Frame { events, .. } => {
+                events.iter().map(|e| (e.code, e.value)).collect::<Vec<_>>()
+            }
+            _ => vec![],
+        })
+        .collect()
+}
+
+/// The framing fact, now where it matters: X and Y are two frames, so the kernel
+/// reads two motions rather than one diagonal. Anyone merging them later changes
+/// what the desktop sees.
+#[test]
+fn a_stick_tick_sends_two_frames_not_one() {
+    let plan = plan_stick_tick(CURSOR_AXES, (5, -3), false, &[], &[], true);
+
+    assert_eq!(plan.len(), 2, "two frames");
+    assert_eq!(axis_pairs(&plan), vec![(0, 5), (1, -3)]);
+}
+
+/// Scrolling uses different axis codes, and the pair is stored X-then-Y while
+/// the codes run 12 then 11 — which looks like a mistake in both places and is
+/// not one.
+#[test]
+fn scrolling_uses_the_wheel_axes_in_that_order() {
+    let plan = plan_stick_tick(SCROLL_AXES, (2, 7), false, &[], &[], true);
+    assert_eq!(axis_pairs(&plan), vec![(12, 2), (11, 7)]);
+}
+
+/// A stick at rest sends nothing, rather than a stream of zeroes.
+#[test]
+fn a_stick_at_rest_sends_nothing() {
+    assert!(plan_stick_tick(CURSOR_AXES, (0, 0), false, &[], &[], true).is_empty());
+}
+
+/// Inverting flips both axes, not just one.
+#[test]
+fn inverting_flips_both_axes() {
+    let plan = plan_stick_tick(CURSOR_AXES, (5, -3), true, &[], &[], true);
+    assert_eq!(axis_pairs(&plan), vec![(0, -5), (1, 3)]);
+}
+
+/// An activation modifier has to match exactly: holding an extra one switches
+/// the stick off rather than leaving it on.
+#[test]
+fn activation_modifiers_must_match_exactly() {
+    let needs_l1 = [ev(Key::BTN_TL)];
+
+    let held_right = plan_stick_tick(CURSOR_AXES, (1, 1), false, &needs_l1, &needs_l1, true);
+    assert_eq!(held_right.len(), 2);
+
+    let nothing_held = plan_stick_tick(CURSOR_AXES, (1, 1), false, &needs_l1, &[], true);
+    assert!(nothing_held.is_empty(), "the stick moved without its modifier");
+
+    let one_too_many = plan_stick_tick(
+        CURSOR_AXES, (1, 1), false, &needs_l1, &[ev(Key::BTN_TL), ev(Key::BTN_TR)], true,
+    );
+    assert!(one_too_many.is_empty(), "an extra modifier did not switch it off");
+}
+
+/// Suppressed — paused or Gaming Mode — sends nothing.
+#[test]
+fn an_inactive_stick_sends_nothing() {
+    assert!(plan_stick_tick(CURSOR_AXES, (5, 5), false, &[], &[], false).is_empty());
+}
+
+/// A key-driven loop sends only the axes that are moving, so a tick can be two
+/// frames, one, or none — unlike the analog loops, which always send both.
+#[test]
+fn a_key_tick_sends_only_the_moving_axes() {
+    let (plan, _) = plan_key_tick(CURSOR_AXES, (1, 0), 10, 1.0, 10.0, true);
+    assert_eq!(axis_pairs(&plan), vec![(0, 10)], "only X is moving");
+
+    let (plan, _) = plan_key_tick(CURSOR_AXES, (0, -1), 10, 1.0, 10.0, true);
+    assert_eq!(axis_pairs(&plan), vec![(1, -10)], "only Y is moving");
+}
+
+/// The ramp builds while a direction is held and is capped at the configured
+/// speed, so a long hold does not accelerate for ever.
+#[test]
+fn the_ramp_builds_and_is_capped() {
+    let (_, after_one) = plan_key_tick(CURSOR_AXES, (1, 0), 10, 1.0, 0.0, true);
+    assert_eq!(after_one, 1.0, "one tick of a speed-10 ramp at full acceleration");
+
+    let (_, capped) = plan_key_tick(CURSOR_AXES, (1, 0), 10, 1.0, 10.0, true);
+    assert_eq!(capped, 10.0, "the ramp does not exceed the configured speed");
+}
+
+/// Releasing collapses the ramp immediately, so the next hold starts from a
+/// standstill rather than from wherever it left off.
+#[test]
+fn releasing_collapses_the_ramp() {
+    let (plan, speed) = plan_key_tick(CURSOR_AXES, (0, 0), 10, 1.0, 9.5, true);
+    assert!(plan.is_empty());
+    assert_eq!(speed, 0.0);
+}
+
+/// Suppressed still advances the ramp and only skips the sending — which is what
+/// the old path does, so letting go of a stick during Gaming Mode does not leave
+/// a stale ramp behind.
+#[test]
+fn a_suppressed_key_tick_still_advances_the_ramp() {
+    let (plan, speed) = plan_key_tick(CURSOR_AXES, (1, 0), 10, 1.0, 0.0, false);
+    assert!(plan.is_empty(), "nothing is sent while suppressed");
+    assert_eq!(speed, 1.0, "but the ramp moved");
+}

@@ -166,9 +166,97 @@ pub fn plan_default(event: &evdev::InputEvent, paused: bool) -> Vec<OutputAction
     }
 }
 
+/// One relative-axis frame on the virtual pointer.
+fn axis_frame(code: u16, value: i32) -> OutputAction {
+    OutputAction::Frame {
+        device: OutputDevice::Axis,
+        events: vec![Ev { ev_type: EventType::RELATIVE.0, code, value }],
+    }
+}
+
+/// The axis codes a loop writes to. `REL_X`/`REL_Y` for a pointer,
+/// `REL_HWHEEL`/`REL_WHEEL` for scrolling — and note that the scroll pair is
+/// stored X-then-Y but the codes run 12 then 11, which is not a typo in either
+/// place.
+pub const CURSOR_AXES: (u16, u16) = (0, 1);
+pub const SCROLL_AXES: (u16, u16) = (12, 11);
+
+/// One tick of an analog stick loop — `cursor_loop` or `scroll_loop`.
+///
+/// Both send X and Y as two separate frames, always both, never merged: the
+/// kernel reads two motions rather than one diagonal, and that is observable.
+/// The two loops differ in nothing but their axis codes and which invert setting
+/// applies, which is why one function covers both.
+pub fn plan_stick_tick(
+    axes: (u16, u16),
+    position: (i32, i32),
+    invert: bool,
+    activation_modifiers: &[Event],
+    modifiers: &[Event],
+    active: bool,
+) -> Vec<OutputAction> {
+    // A stick at rest sends nothing at all, rather than a stream of zeroes.
+    if position == (0, 0) {
+        return Vec::new();
+    }
+    // An empty activation set means "always"; a non-empty one has to match
+    // exactly, so holding an extra modifier switches the stick off.
+    if !activation_modifiers.is_empty() && activation_modifiers != modifiers {
+        return Vec::new();
+    }
+    if !active {
+        return Vec::new();
+    }
+    let (x, y) = if invert { (-position.0, -position.1) } else { position };
+    vec![axis_frame(axes.0, x), axis_frame(axes.1, y)]
+}
+
+/// One tick of a key-driven loop — `key_cursor_loop` or `key_scroll_loop`.
+///
+/// Returns the frames and the new speed, because the acceleration ramp is state:
+/// it builds while a direction is held and collapses the moment nothing is.
+///
+/// Unlike the analog loops, each axis is sent only when it is actually moving,
+/// so a tick can produce two frames, one, or none.
+pub fn plan_key_tick(
+    axes: (u16, u16),
+    movement: (i32, i32),
+    speed: i32,
+    acceleration: f32,
+    current_speed: f32,
+    active: bool,
+) -> (Vec<OutputAction>, f32) {
+    if movement == (0, 0) {
+        // Released: the ramp starts from nothing next time.
+        return (Vec::new(), 0.0);
+    }
+    let mut current_speed = current_speed + speed as f32 * acceleration / 10.0;
+    if current_speed > speed as f32 {
+        current_speed = speed as f32;
+    }
+    if !active {
+        // The ramp still builds while suppressed, as it does today — only the
+        // sending is skipped.
+        return (Vec::new(), current_speed);
+    }
+    let mut frames = Vec::new();
+    if movement.0 != 0 {
+        frames.push(axis_frame(axes.0, movement.0 * current_speed as i32));
+    }
+    if movement.1 != 0 {
+        frames.push(axis_frame(axes.1, movement.1 * current_speed as i32));
+    }
+    (frames, current_speed)
+}
+
 /// What the old path just sent, in the new vocabulary, so the two can be compared.
 pub fn recorded(code: u16, value: i32) -> OutputAction {
     key_frame(code, value)
+}
+
+/// The same, for a relative-axis movement the old path sent.
+pub fn moved(code: u16, value: i32) -> OutputAction {
+    axis_frame(code, value)
 }
 
 /// The same, for an event the old path passed straight through.
