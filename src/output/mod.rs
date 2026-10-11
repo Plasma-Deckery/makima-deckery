@@ -20,17 +20,15 @@
 //! function, and it is an advantage for testing — a mode change is observable as
 //! an action before it is believed as state.
 //!
-//! **This module is one increment ahead of its callers.** The vocabulary and the
-//! ports are written; nothing produces actions yet, because the event reader
-//! still performs its effects at the point where it decides them. Converting it
-//! is the next step, and until then these names have no users — hence the allow
-//! below. It goes away with the first producer, and if it is still here
-//! afterwards then the conversion is unfinished.
+//! Partly ahead of its callers still. The device port carries every frame the
+//! event reader decides; the state, command and internal ports are built and
+//! tested but only reached for some kinds, because `convert_event` and
+//! `emit_nonmapped_event` still perform their own effects. The allow covers that
+//! gap and should shrink to nothing as they are converted.
 #![allow(dead_code)]
 
 pub mod action;
 pub mod outputs;
 
-// Only what callers outside this module name today. The rest is reached through
-// `output::action::…` / `output::outputs::…` until there is a caller for it.
 pub use action::OutputDevice;
+pub use outputs::Outputs;

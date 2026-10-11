@@ -80,17 +80,14 @@ impl PartialEq for Raw {
     }
 }
 
-/// One action, numbered and placed, on its way out of a port.
+/// One action, numbered, on its way out of a port.
 ///
-/// The sequence number is process-wide and monotonic, so records from different
-/// tasks have a total order even though they arrive independently. `site` names
-/// the branch that produced it, which is what turns "a frame differs" into "a
-/// frame differs here".
+/// The sequence number is process-wide and monotonic, so actions from different
+/// tasks have a total order even though they arrive independently.
 #[derive(Debug, Clone)]
 pub struct Emission {
     pub seq: u64,
     pub t_us: u128,
-    pub site: &'static str,
     pub action: OutputAction,
 }
 
@@ -191,61 +188,6 @@ pub struct LastActionSpec {
     pub value: serde_json::Value,
     pub label: Option<String>,
     pub silent: bool,
-}
-
-/// Names for the places that produce a frame.
-///
-/// One table rather than thirty-odd string literals scattered through the event
-/// reader, because whether each name sits at the right call site is the one
-/// thing in this design no test can check. A reviewer can read this table; they
-/// cannot read thirty-one literals spread over a thousand lines.
-///
-/// A wrong name does not change behaviour — it misattributes a future finding,
-/// which is worse in a different way: it costs trust in the journal.
-pub mod sites {
-    pub const RELEASE_HELD_MODIFIERS: &str = "device_tasks/release_held_modifiers";
-    pub const RELEASE_ALL_HELD: &str = "release_all_held";
-    pub const KEY_UP_CLEANUP: &str = "convert_event/key_up_cleanup";
-    pub const MODIFIER_INTERCEPT: &str = "convert_event/modifier_intercept";
-    pub const PEN_FLUSH: &str = "event_loop/pen_flush";
-
-    pub const EMIT_EVENT_MODIFIER_RELEASE: &str = "emit_event/modifier_release";
-    pub const EMIT_EVENT_IGNORE_MODIFIERS: &str = "emit_event/ignore_modifiers";
-    pub const EMIT_EVENT_MODIFIER_TAP_PRESS: &str = "emit_event/modifier_tap_press";
-    pub const EMIT_EVENT_MODIFIER_TAP_RELEASE: &str = "emit_event/modifier_tap_release";
-    pub const EMIT_EVENT_KEYS: &str = "emit_event/keys";
-
-    pub const NONMAPPED_RELEASED_KEYS: &str = "emit_nonmapped_event/released_keys";
-    pub const NONMAPPED_TAP_PRESS: &str = "emit_nonmapped_event/modifier_tap_press";
-    pub const NONMAPPED_TAP_RELEASE: &str = "emit_nonmapped_event/modifier_tap_release";
-    pub const NONMAPPED_KEY: &str = "emit_nonmapped_event/key";
-    pub const NONMAPPED_RELATIVE: &str = "emit_nonmapped_event/relative";
-    pub const NONMAPPED_ABSOLUTE: &str = "emit_nonmapped_event/absolute";
-    pub const NONMAPPED_MISC: &str = "emit_nonmapped_event/misc";
-
-    pub const DEFAULT_KEY: &str = "emit_default_event/key";
-    pub const DEFAULT_RELATIVE: &str = "emit_default_event/relative";
-    pub const DEFAULT_ABSOLUTE: &str = "emit_default_event/absolute";
-    pub const DEFAULT_MISC: &str = "emit_default_event/misc";
-
-    pub const CURSOR_LOOP_X: &str = "cursor_loop/x";
-    pub const CURSOR_LOOP_Y: &str = "cursor_loop/y";
-    pub const SCROLL_LOOP_X: &str = "scroll_loop/x";
-    pub const SCROLL_LOOP_Y: &str = "scroll_loop/y";
-    pub const KEY_CURSOR_LOOP_X: &str = "key_cursor_loop/x";
-    pub const KEY_CURSOR_LOOP_Y: &str = "key_cursor_loop/y";
-    pub const KEY_SCROLL_LOOP_X: &str = "key_scroll_loop/x";
-    pub const KEY_SCROLL_LOOP_Y: &str = "key_scroll_loop/y";
-
-    pub const PAD_FRAME: &str = "trackpad/pad_frame";
-    pub const GESTURE_FRAME: &str = "trackpad/gesture_frame";
-
-    pub const SET_GAMING_MODE: &str = "set_gaming_mode";
-    pub const GAMING_MODE_HAPTIC: &str = "set_gaming_mode/haptic";
-    pub const RUN_COMMAND: &str = "convert_event/command";
-    pub const LAST_ACTION_KEYS: &str = "set_last_emitted";
-    pub const LAST_ACTION_COMMAND: &str = "set_last_emitted_cmd";
-    pub const PUBLISH_STATE: &str = "write_state";
 }
 
 #[cfg(test)]

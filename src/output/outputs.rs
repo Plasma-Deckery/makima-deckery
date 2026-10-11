@@ -78,11 +78,10 @@ impl Tap {
     }
 
     /// Never blocks: this runs inside the owner, which may hold the device lock.
-    fn offer(&self, site: &'static str, action: &OutputAction) {
+    fn offer(&self, action: &OutputAction) {
         let emission = Emission {
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
             t_us: crate::startup_us(),
-            site,
             action: action.clone(),
         };
         if self.tx.try_send(emission).is_err() {
@@ -101,10 +100,10 @@ impl Outputs {
     }
 
     /// Push every action through its port.
-    pub async fn dispatch(&self, site: &'static str, actions: &[OutputAction]) {
+    pub async fn dispatch(&self, actions: &[OutputAction]) {
         if let Some(tap) = &self.tap {
             for action in actions {
-                tap.offer(site, action);
+                tap.offer(action);
             }
         }
 

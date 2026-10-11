@@ -63,6 +63,12 @@ pub struct EventReader {
     /// Maximum absolute axis value across all axes, queried once at open time.
     max_abs_wheel: i32,
     virt_dev: Arc<Mutex<VirtualDevices>>,
+    /// Where the decided actions go. Built from the same handles as the fields
+    /// around it, so clipping the device port out is all it takes to run this
+    /// reader against nothing — which is what makes the decisions testable
+    /// without a kernel. The trackpad session still takes `virt_dev` directly;
+    /// until it goes through a port too, that one path stays unclipped.
+    outputs: crate::output::Outputs,
     lstick_position: Arc<Mutex<Vec<i32>>>,
     rstick_position: Arc<Mutex<Vec<i32>>>,
     /// Raw hardware position of left stick (ABS_X, ABS_Y), always tracked regardless of mode.
@@ -313,6 +319,14 @@ impl EventReader {
             event_rx: Mutex::new(event_rx),
             is_tablet,
             max_abs_wheel,
+            outputs: crate::output::Outputs {
+                devices:  Some(virt_dev.clone()),
+                state:    Some(state_tx.clone()),
+                commands: Some(environment.clone()),
+                internal: Some(gaming_mode_tx.clone()),
+                haptics:  haptic_tx.clone(),
+                tap:      None,
+            },
             virt_dev,
             lstick_position,
             rstick_position,
@@ -1451,27 +1465,10 @@ impl EventReader {
     /// Y. It cannot any more. That is deliberate — the other three loops already
     /// behaved this way, and a motion split in half was never the intent.
     async fn apply_frames(&self, actions: &[crate::output::action::OutputAction]) {
-        use crate::output::action::OutputAction;
         if actions.is_empty() {
             return;
         }
-        let mut virt_dev = self.virt_dev.lock().await;
-        for action in actions {
-            match action {
-                OutputAction::Frame { device, events } => {
-                    let batch: Vec<InputEvent> = events
-                        .iter()
-                        .map(|e| InputEvent::new_now(EventType(e.ev_type), e.code, e.value))
-                        .collect();
-                    virt_dev.emit(*device, &batch).unwrap();
-                }
-                OutputAction::Forward { device, events } => {
-                    let batch: Vec<InputEvent> = events.iter().map(|r| r.0).collect();
-                    virt_dev.emit(*device, &batch).unwrap();
-                }
-                _ => {}
-            }
-        }
+        self.outputs.dispatch(actions).await;
     }
 
     /// Emit what a resolved key binding amounts to.
