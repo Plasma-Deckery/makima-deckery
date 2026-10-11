@@ -47,6 +47,19 @@ fn key_frame(code: u16, value: i32) -> OutputAction {
     }
 }
 
+/// One key at a given value, as a frame.
+///
+/// The three cleanup paths in the reader all amount to this, and all three used
+/// to spell out the same `InputEvent::new_now` by hand.
+pub fn key_at(key: Key, value: i32) -> OutputAction {
+    key_frame(key.code(), value)
+}
+
+/// One key released.
+pub fn key_up(key: Key) -> OutputAction {
+    key_frame(key.code(), 0)
+}
+
 /// Every output key that the currently held modifier set resolves to.
 ///
 /// Reads nothing but the config, so it was already pure — it just happened to be
@@ -169,6 +182,71 @@ pub fn plan_default(event: &evdev::InputEvent, paused: bool) -> Vec<OutputAction
         Some(device) => vec![OutputAction::Forward { device, events: vec![Raw(*event)] }],
         None => Vec::new(),
     }
+}
+
+/// What one `emit_nonmapped_event` amounts to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonmappedPlan {
+    pub frames: Vec<OutputAction>,
+    /// In order, and including the event's own toggle, which happens
+    /// unconditionally between the released keys and whatever is emitted.
+    pub toggles: Vec<(Event, i32)>,
+    pub modifier_was_activated: bool,
+}
+
+/// Decide what an event with no binding of its own amounts to.
+///
+/// This is the `Unbound` tail of the resolver: the event is passed through, but
+/// first any modifier output the held set resolves to is released, and a custom
+/// modifier released unused is turned into a tap instead.
+///
+/// One quirk is preserved rather than corrected: the tap is synthesised from
+/// `default_event`'s type and code but always goes to the keyboard device, even
+/// when that type is not a key. Changing it would be a behaviour change, and
+/// nothing is known to depend on it either way.
+pub fn plan_nonmapped(
+    config: &Config,
+    event: Event,
+    default_event: &evdev::InputEvent,
+    value: i32,
+    modifiers: &[Event],
+    modifier_was_activated: bool,
+) -> NonmappedPlan {
+    let mut plan = NonmappedPlan {
+        frames: Vec::new(),
+        toggles: Vec::new(),
+        modifier_was_activated,
+    };
+
+    if config.mapped_modifiers.all.contains(&event) && value != 2 {
+        for key in released_keys(modifiers, config) {
+            plan.toggles.push((Event::Key(key), 0));
+            plan.frames.push(key_frame(key.code(), 0));
+        }
+    }
+    // Always, and after the released keys — the event's own tracking does not
+    // depend on them and they do not depend on it.
+    plan.toggles.push((event, value));
+
+    if config.mapped_modifiers.custom.contains(&event) {
+        if value == 0 && !plan.modifier_was_activated {
+            plan.frames.push(key_frame(default_event.code(), 1));
+            plan.frames.push(key_frame(default_event.code(), 0));
+            plan.modifier_was_activated = true;
+        } else if value == 1 {
+            plan.modifier_was_activated = false;
+        }
+    } else {
+        plan.modifier_was_activated = true;
+        if let Some(device) = device_for(default_event.event_type()) {
+            plan.frames.push(OutputAction::Forward {
+                device,
+                events: vec![Raw(*default_event)],
+            });
+        }
+    }
+
+    plan
 }
 
 /// One relative-axis frame on the virtual pointer.

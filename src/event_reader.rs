@@ -62,7 +62,6 @@ pub struct EventReader {
     is_tablet: bool,
     /// Maximum absolute axis value across all axes, queried once at open time.
     max_abs_wheel: i32,
-    virt_dev: Arc<Mutex<VirtualDevices>>,
     /// Where the decided actions go. Built from the same handles as the fields
     /// around it, so clipping the device port out is all it takes to run this
     /// reader against nothing — which is what makes the decisions testable
@@ -327,7 +326,6 @@ impl EventReader {
                 haptics:  haptic_tx.clone(),
                 tap:      None,
             },
-            virt_dev,
             lstick_position,
             rstick_position,
             lstick_raw,
@@ -385,8 +383,18 @@ impl EventReader {
             self.state_write_loop(state_rx),
             self.ipc_command_loop(ipc_rx),
             async {
-                if let Some(s) = session {
-                    s.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()).await;
+                // The trackpad session is a producer of its own — hidraw frames,
+                // not events — so it still takes the devices directly rather
+                // than going through a port. It reads the handle out of the
+                // device port, which means an unclipped port stops it too: no
+                // devices, no trackpad session, and nothing reaches the kernel
+                // from here either.
+                match (session, self.outputs.devices.as_ref()) {
+                    (Some(s), Some(devices)) => {
+                        s.run(devices, &self.lpad, &self.rpad, &self.gesture_session,
+                              state_tx, self.gaming_mode.clone()).await;
+                    }
+                    _ => {}
                 }
             },
         );
@@ -1173,8 +1181,13 @@ impl EventReader {
                 (EventType::MISC, _, _, true) => {
                     if evdev::MiscType(event.code()) == evdev::MiscType::MSC_SERIAL {
                         pen_events.push(event);
-                        let mut virt_dev = self.virt_dev.lock().await;
-                        virt_dev.abs.emit(&pen_events).unwrap();
+                        // One frame carrying the whole accumulated report, with
+                        // the pen's own timestamps — which is why this is a
+                        // Forward and not a Frame.
+                        self.apply_frames(&[crate::output::action::OutputAction::Forward {
+                            device: crate::output::OutputDevice::Abs,
+                            events: pen_events.iter().map(|e| crate::output::action::Raw(*e)).collect(),
+                        }]).await;
                         pen_events.clear()
                     }
                 }
@@ -1213,15 +1226,16 @@ impl EventReader {
     /// actual output keys that got stuck) and clears `modifiers` and `held_keys`
     /// so combo and HUD state don't carry stale data across the reconnect.
     async fn release_all_held(&self) {
-        let mut vd = self.virt_dev.lock().await;
-        // Release all tracked emitted output keys.
-        let mut eo = self.emitted_outputs.lock().await;
-        for (_input_ev, output_keys) in eo.drain() {
-            for key in output_keys {
-                let _ = vd.keys.emit(&[InputEvent::new_now(EventType::KEY, key.code(), 0)]);
-            }
-        }
-        drop(eo);
+        // Collected before anything is sent, so the device port is held for the
+        // frames alone rather than across the three locks below.
+        let frames: Vec<crate::output::action::OutputAction> = {
+            let mut eo = self.emitted_outputs.lock().await;
+            eo.drain()
+                .flat_map(|(_input_ev, output_keys)| output_keys)
+                .map(|key| crate::machine::key_up(key))
+                .collect()
+        };
+        self.apply_frames(&frames).await;
         // Release modifier output keys (e.g. Shift held via L4).
         // `modifiers` tracks input events but those that map to output keys will
         // already be in `emitted_outputs`; we clear modifiers to reset combo state.
@@ -1282,14 +1296,11 @@ impl EventReader {
         // (e.g. base remap F10 → combo Alt+Ctrl+Z when R1 was pressed).
         if value == 0 {
             if let Event::Key(_) = event {
-                let mut eo = self.emitted_outputs.lock().await;
-                if let Some(prev_keys) = eo.remove(&event) {
-                    let mut vd = self.virt_dev.lock().await;
-                    for key in &prev_keys {
-                        let _ = vd.keys.emit(&[
-                            InputEvent::new_now(EventType::KEY, key.code(), 0),
-                        ]);
-                    }
+                let prev_keys = self.emitted_outputs.lock().await.remove(&event);
+                if let Some(prev_keys) = prev_keys {
+                    let frames: Vec<_> =
+                        prev_keys.iter().map(|key| crate::machine::key_up(*key)).collect();
+                    self.apply_frames(&frames).await;
                 }
             }
         }
@@ -1355,14 +1366,11 @@ impl EventReader {
                 // guarantees the key-up fires even when paused or gaming_mode was
                 // activated while the key was held (preventing stuck modifier keys).
                 if value != 0 && !paused && !gaming_mode {
-                    {
-                        let mut virt_dev = self.virt_dev.lock().await;
-                        for key in &out_keys {
-                            virt_dev.keys.emit(&[
-                                InputEvent::new_now(EventType::KEY, key.code(), value),
-                            ]).unwrap();
-                        }
-                    }
+                    let frames: Vec<_> = out_keys
+                        .iter()
+                        .map(|key| crate::machine::key_at(*key, value))
+                        .collect();
+                    self.apply_frames(&frames).await;
                     // Store on press so the emitted_outputs cleanup can release on key-up.
                     if value == 1 {
                         self.store_emitted_outputs(&event, &out_keys).await;
@@ -1543,47 +1551,17 @@ impl EventReader {
             }
         }
         // Passthrough keys are held state — last_action is only for combos and commands.
-        let mut virt_dev = self.virt_dev.lock().await;
-        let mut modifier_was_activated = self.modifier_was_activated.lock().await;
-        if config.mapped_modifiers.all.contains(&event) && value != 2 {
-            let released_keys: Vec<Key> = self.released_keys(&modifiers, &config).await;
-            for key in released_keys {
-                self.toggle_modifiers(Event::Key(key), 0, &config).await;
-                let virtual_event: InputEvent = InputEvent::new_now(EventType::KEY, key.code(), 0);
-                virt_dev.keys.emit(&[virtual_event]).unwrap()
-            }
-        }
-        self.toggle_modifiers(event, value, &config).await;
-        if config.mapped_modifiers.custom.contains(&event) {
-            if value == 0 && !*modifier_was_activated {
-                let virtual_event: InputEvent =
-                    InputEvent::new_now(default_event.event_type(), default_event.code(), 1);
-                virt_dev.keys.emit(&[virtual_event]).unwrap();
-                let virtual_event: InputEvent =
-                    InputEvent::new_now(default_event.event_type(), default_event.code(), 0);
-                virt_dev.keys.emit(&[virtual_event]).unwrap();
-                *modifier_was_activated = true;
-            } else if value == 1 {
-                *modifier_was_activated = false;
-            }
-        } else {
-            *modifier_was_activated = true;
-            match default_event.event_type() {
-                EventType::KEY => {
-                    virt_dev.keys.emit(&[default_event]).unwrap();
-                }
-                EventType::RELATIVE => {
-                    virt_dev.axis.emit(&[default_event]).unwrap();
-                }
-                EventType::ABSOLUTE => {
-                    virt_dev.abs.emit(&[default_event]).unwrap();
-                }
-                EventType::MISC => {
-                    let mut virt_dev = self.virt_dev.lock().await;
-                    virt_dev.abs.emit(&[default_event]).unwrap();
-                }
-                _ => {}
-            }
+        let plan = {
+            let mut modifier_was_activated = self.modifier_was_activated.lock().await;
+            let plan = crate::machine::plan_nonmapped(
+                config, event, &default_event, value, modifiers, *modifier_was_activated,
+            );
+            *modifier_was_activated = plan.modifier_was_activated;
+            plan
+        };
+        self.apply_frames(&plan.frames).await;
+        for (modifier, value) in plan.toggles {
+            self.toggle_modifiers(modifier, value, config).await;
         }
     }
 
@@ -1660,16 +1638,6 @@ impl EventReader {
             }
         } // lock released here
         self.write_state().await;
-    }
-
-    async fn released_keys(&self, modifiers: &Vec<Event>, config: &Config) -> Vec<Key> {
-        let mut released_keys: Vec<Key> = Vec::new();
-        for (_key, hashmap) in config.bindings.remap.iter() {
-            if let Some(event_list) = hashmap.get(modifiers) {
-                released_keys.extend(event_list);
-            }
-        }
-        released_keys
     }
 
     /// The focused window, however this compositor reports one.

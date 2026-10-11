@@ -123,7 +123,7 @@ pub async fn release_held_modifiers(
     let mut vd = virt_dev.lock().await;
     for modifier in &held {
         if let Event::Key(key) = modifier {
-            let _ = vd.keys.emit(&[
+            let _ = vd.emit(crate::output::OutputDevice::Keys, &[
                 evdev::InputEvent::new_now(evdev::EventType::KEY, key.code(), 0),
             ]);
         }

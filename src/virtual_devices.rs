@@ -17,16 +17,16 @@ fn deckery_input_id() -> InputId {
 }
 
 pub struct VirtualDevices {
-    pub keys: VirtualDevice,
-    pub axis: VirtualDevice,
-    pub abs: VirtualDevice,
+    keys: VirtualDevice,
+    axis: VirtualDevice,
+    abs: VirtualDevice,
     /// Whether `abs` has been rebuilt with a physical tablet's axis ranges.
     tablet_enabled: bool,
-    pub lpad: Option<VirtualDevice>,
-    pub rpad: Option<VirtualDevice>,
+    lpad: Option<VirtualDevice>,
+    rpad: Option<VirtualDevice>,
     /// Combined two-finger gesture device. Active when `combined_gesture_device = true`
     /// in the config. Receives left pad as slot 0 and right pad as slot 1.
-    pub gesture_pad: Option<VirtualDevice>,
+    gesture_pad: Option<VirtualDevice>,
 }
 
 fn build_gesture_pad_device() -> VirtualDevice {
@@ -240,6 +240,19 @@ impl VirtualDevices {
     pub fn enable_gesture_pad(&mut self) {
         if self.gesture_pad.is_none() {
             self.gesture_pad = Some(build_gesture_pad_device());
+        }
+    }
+
+    /// Whether a pad device exists.
+    ///
+    /// The pads are optional, so a caller that builds an expensive frame can ask
+    /// first rather than build it for nothing.
+    pub fn has_device(&self, device: OutputDevice) -> bool {
+        match device {
+            OutputDevice::Keys | OutputDevice::Axis | OutputDevice::Abs => true,
+            OutputDevice::LeftPad => self.lpad.is_some(),
+            OutputDevice::RightPad => self.rpad.is_some(),
+            OutputDevice::GesturePad => self.gesture_pad.is_some(),
         }
     }
 
