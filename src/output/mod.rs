@@ -20,11 +20,15 @@
 //! function, and it is an advantage for testing — a mode change is observable as
 //! an action before it is believed as state.
 //!
-//! Partly ahead of its callers still. The device port carries every frame the
-//! event reader decides; the state, command and internal ports are built and
-//! tested but only reached for some kinds, because `convert_event` and
-//! `emit_nonmapped_event` still perform their own effects. The allow covers that
-//! gap and should shrink to nothing as they are converted.
+//! Partly ahead of its callers still, and the gap is now exactly one thing: the
+//! device port carries every frame anything decides, but the `State`, `Command`,
+//! `Internal` and `Haptic` actions are never constructed, because the branches
+//! of `convert_event` still call `set_last_emitted`, `spawn_subprocess` and
+//! `set_gaming_mode` rather than returning what they want done. Routing is
+//! decided by the machine; the effects of each route are not yet.
+//!
+//! That is what the allow covers, and removing it is the test for whether the
+//! conversion is finished.
 #![allow(dead_code)]
 
 pub mod action;

@@ -21,6 +21,7 @@
 //! itself, `emit_nonmapped_event`, and the trackpad path.
 
 use crate::config::{Config, Event};
+use crate::event_reader::{gaming_mode_suppresses, gaming_mode_tracks_modifier};
 use crate::output::action::{Ev, OutputAction, OutputDevice, Raw};
 
 use evdev::{EventType, Key};
@@ -182,6 +183,158 @@ pub fn plan_default(event: &evdev::InputEvent, paused: bool) -> Vec<OutputAction
         Some(device) => vec![OutputAction::Forward { device, events: vec![Raw(*event)] }],
         None => Vec::new(),
     }
+}
+
+/// How `held_keys` changes for one event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldUpdate {
+    /// A press, tracked so the overlay can highlight it.
+    Add,
+    /// A release. Always applied, even in Gaming Mode, or a button held when
+    /// the mode was switched on would stay highlighted for ever.
+    Remove,
+    Leave,
+}
+
+/// Which of `convert_event`'s branches an event takes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Branch {
+    /// The second click of a double-click inside the window: toggle Gaming Mode
+    /// and go no further.
+    ToggleGamingMode { enabled: bool, preview: bool },
+    /// A button that is both a custom modifier and has a base remap, so it has
+    /// to act as both at once — emit the remap output as a held system key, and
+    /// track the *input* key so combos keyed on it still resolve.
+    ModifierIntercept {
+        out_keys: Vec<Key>,
+        /// False while paused or in Gaming Mode. The release is never emitted
+        /// here either way; the key-up cleanup handles it, which is what keeps a
+        /// key from sticking when the mode changed mid-hold.
+        emit: bool,
+        /// False in Gaming Mode: the overlay must not show a modifier as active
+        /// while input is passed through raw.
+        announce: bool,
+    },
+    /// Gaming Mode swallows the event.
+    Suppressed {
+        /// Modifier tracking still runs, so combo state stays consistent for
+        /// when the mode is switched off again.
+        track_modifier: bool,
+    },
+    /// Nothing special applies — hand it to the resolver.
+    Resolve,
+}
+
+/// How `held_keys` changes. Needs no config, which is why it is separate: it has
+/// to be applied before the config is re-resolved, and a value that depends on
+/// the config cannot be.
+pub fn held_update(event: Event, value: i32, gaming_mode: bool) -> HeldUpdate {
+    match (matches!(event, Event::Key(_)), value) {
+        (true, 1) if !gaming_mode => HeldUpdate::Add,
+        (true, 0) => HeldUpdate::Remove,
+        _ => HeldUpdate::Leave,
+    }
+}
+
+/// Whether this event releases whatever the button emitted last time.
+///
+/// Every release does, whatever the button resolves to now — the resolution can
+/// have changed while it was held, and the key-up has to match the key-down.
+pub fn releases_emitted(event: Event, value: i32) -> bool {
+    value == 0 && matches!(event, Event::Key(_))
+}
+
+/// What to do with one event, decided before any of it is done.
+///
+/// The ordering of the guards is the whole content of this: the double-click
+/// trigger runs before the Gaming Mode guard so the second press can switch the
+/// mode *off*; the intercept runs before the guard because a modifier has to
+/// keep working either way; and the key-up cleanup runs before everything so a
+/// key cannot stick. That ordering carries a `TODO: structural debt` in the
+/// reader precisely because it was impossible to see, let alone test, while it
+/// was spread across eighty lines of early returns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Route {
+    /// The double-click timestamp after this event.
+    pub trigger_ts: Option<std::time::Instant>,
+    pub branch: Branch,
+}
+
+/// Everything one event is decided from.
+pub struct Input<'a> {
+    pub event: Event,
+    pub value: i32,
+    pub config: &'a Config,
+    pub modifiers: &'a [Event],
+    pub gaming_mode: bool,
+    pub paused: bool,
+    /// The configured double-click trigger, if there is one.
+    pub trigger: Option<&'a crate::config::DoubleclickTrigger>,
+    /// The last first-click, if one is pending.
+    pub trigger_ts: Option<std::time::Instant>,
+    /// Passed in rather than read, so the window can be tested without sleeping.
+    pub now: std::time::Instant,
+}
+
+/// Route one event: which branch, and what changes before it.
+pub fn plan_route(input: &Input) -> Route {
+    let Input { event, value, config, modifiers, gaming_mode, paused, .. } = *input;
+
+    // The double-click trigger, before the Gaming Mode guard so the second
+    // press is never swallowed — that is how the mode gets switched off. It runs
+    // while paused too: pause and Gaming Mode are orthogonal, so the toggle has
+    // to stay reachable from both.
+    let mut trigger_ts = input.trigger_ts;
+    if let Some(trigger) = input.trigger {
+        if event == Event::Key(trigger.key) && value == 1 {
+            let within_window = trigger_ts
+                .map(|prev| input.now.duration_since(prev).as_millis() <= trigger.ms as u128)
+                .unwrap_or(false);
+            if within_window {
+                return Route {
+                    trigger_ts: None,
+                    branch: Branch::ToggleGamingMode { enabled: !gaming_mode, preview: paused },
+                };
+            }
+            // First click: remember when, and let the event go on being whatever
+            // else it is, so a single press of the trigger still does its job.
+            trigger_ts = Some(input.now);
+        }
+    }
+
+    if config.mapped_modifiers.custom.contains(&event) {
+        if let Some(out_keys) = config
+            .bindings
+            .remap
+            .get(&event)
+            .and_then(|m| m.get(&vec![]))
+            .cloned()
+        {
+            return Route {
+                trigger_ts,
+                branch: Branch::ModifierIntercept {
+                    out_keys,
+                    emit: value != 0 && !paused && !gaming_mode,
+                    announce: !gaming_mode,
+                },
+            };
+        }
+    }
+
+    if gaming_mode {
+        let is_while_gaming = config.bindings.while_gaming.contains(&(event, modifiers.to_vec()))
+            || config.bindings.while_gaming.contains(&(event, vec![]));
+        if gaming_mode_suppresses(value, is_while_gaming) {
+            return Route {
+                trigger_ts,
+                branch: Branch::Suppressed {
+                    track_modifier: gaming_mode_tracks_modifier(&event, &config.mapped_modifiers.all),
+                },
+            };
+        }
+    }
+
+    Route { trigger_ts, branch: Branch::Resolve }
 }
 
 /// What one `emit_nonmapped_event` amounts to.

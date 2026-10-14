@@ -1259,6 +1259,13 @@ impl EventReader {
         }
     }
 
+    /// Decide what one event means, and do it.
+    ///
+    /// The deciding is `machine::plan_route` — which branch applies and what
+    /// changes before it — and the ordering of those guards is the part that
+    /// used to carry a `TODO: structural debt` note. It was not that the order
+    /// was wrong; it was that it was spread over eighty lines of early returns
+    /// and could neither be read nor tested in one piece. It can now.
     async fn convert_event(
         &self,
         default_event: InputEvent,
@@ -1266,149 +1273,95 @@ impl EventReader {
         value: i32,
         send_zero: bool,
     ) {
-        // TODO: structural debt — gaming_mode is read here early because the
-        // Custom Modifier Intercept and held_keys update both sit before the
-        // Gaming Mode guard. Ideally the guard would be the first thing after
-        // emitted_outputs cleanup, and the intercept would be folded into the
-        // post-guard path. Refactor when touching this area next.
         let gaming_mode = *self.gaming_mode.lock().await;
 
-        // Track all currently held buttons so the HUD can highlight them.
-        // Only KEY events are tracked (not axis/stick movements).
-        // Presses (value=1) are suppressed while Gaming Mode is active so the
-        // HUD never shows buttons as held when input is passed through raw.
-        // Releases (value=0) always run so held_keys is cleaned up correctly
-        // when Gaming Mode is turned off mid-hold.
-        // TODO: once the guard is moved earlier (see TODO above), this
-        // guard can be removed — the early return will prevent presses from
-        // reaching here.
-        if matches!(event, Event::Key(_)) {
-            let mut held = self.held_keys.lock().await;
-            match value {
-                1 if !gaming_mode => { held.push(event); held.sort(); held.dedup(); }
-                0 => held.retain(|&x| x != event),
-                _ => {}
+        // Both of these are decided without the config and have to be applied
+        // before it is re-resolved below — a release has to clear what its press
+        // emitted even if the binding has changed since.
+        match crate::machine::held_update(event, value, gaming_mode) {
+            crate::machine::HeldUpdate::Add => {
+                let mut held = self.held_keys.lock().await;
+                held.push(event);
+                held.sort();
+                held.dedup();
             }
-        } // lock dropped before any await
+            crate::machine::HeldUpdate::Remove => {
+                self.held_keys.lock().await.retain(|&x| x != event);
+            }
+            crate::machine::HeldUpdate::Leave => {}
+        }
 
-        // On key-up (value=0), release every output key that was ever emitted
-        // for this physical button — even if the resolution changed mid-hold
-        // (e.g. base remap F10 → combo Alt+Ctrl+Z when R1 was pressed).
-        if value == 0 {
-            if let Event::Key(_) = event {
-                let prev_keys = self.emitted_outputs.lock().await.remove(&event);
-                if let Some(prev_keys) = prev_keys {
-                    let frames: Vec<_> =
-                        prev_keys.iter().map(|key| crate::machine::key_up(*key)).collect();
-                    self.apply_frames(&frames).await;
-                }
+        if crate::machine::releases_emitted(event, value) {
+            let prev_keys = self.emitted_outputs.lock().await.remove(&event);
+            if let Some(prev_keys) = prev_keys {
+                let frames: Vec<_> =
+                    prev_keys.iter().map(|key| crate::machine::key_up(*key)).collect();
+                self.apply_frames(&frames).await;
             }
         }
 
+        // A press may be the one that changed the focused window, so the config
+        // is re-resolved before anything is decided against it.
         if value == 1 {
             self.update_config().await;
-        };
-        let config = self.current_config.lock().await.clone();
+        }
+
         let paused = *self.paused.lock().await;
-        // gaming_mode already read above.
+        let config = self.current_config.lock().await.clone();
         let mut modifiers = self.modifiers.lock().await.clone();
         modifiers.sort();
         modifiers.dedup();
 
+        let route = {
+            let trigger_ts = *self.gaming_mode_trigger_ts.lock().await;
+            crate::machine::plan_route(&crate::machine::Input {
+                event,
+                value,
+                config: &config,
+                modifiers: &modifiers,
+                gaming_mode,
+                paused,
+                trigger: self.gaming_mode_config.trigger.as_ref(),
+                trigger_ts,
+                now: std::time::Instant::now(),
+            })
+        };
+        *self.gaming_mode_trigger_ts.lock().await = route.trigger_ts;
 
-        // ── Gaming Mode double-click trigger ──────────────────────────────────
-        // The configured trigger key double-pressed within `double_click_ms`
-        // toggles Gaming Mode on/off and fires haptic feedback.
-        // Skipped entirely when `trigger` is None (not configured or invalid).
-        // Runs before the Gaming Mode guard so the second press is never
-        // suppressed — even while Gaming Mode is already active (to turn it off).
-        // Intentionally runs even when paused: Gaming Mode and Pause are
-        // orthogonal meta-states and the toggle should always be reachable.
-        if let Some(ref trigger) = self.gaming_mode_config.trigger {
-            if event == Event::Key(trigger.key) && value == 1 {
-                let now = std::time::Instant::now();
-                let mut ts = self.gaming_mode_trigger_ts.lock().await;
-                let within_window = ts
-                    .map(|prev| now.duration_since(prev).as_millis() <= trigger.ms as u128)
-                    .unwrap_or(false);
-                if within_window {
-                    *ts = None;
-                    drop(ts);
-                    let new_state = !*self.gaming_mode.lock().await;
-                    println!("deckery: Gaming Mode trigger — double-click (paused={})", paused);
-                    self.set_gaming_mode(new_state, paused).await;
-                    return;
-                } else {
-                    // First click of a potential double-click — record timestamp and
-                    // let the event fall through so normal bindings still fire.
-                    *ts = Some(now);
-                }
+        match route.branch {
+            crate::machine::Branch::ToggleGamingMode { enabled, preview } => {
+                println!("deckery: Gaming Mode trigger — double-click (paused={paused})");
+                self.set_gaming_mode(enabled, preview).await;
+                return;
             }
-        }
-        // ── Custom modifier + remap intercept ──────────────────────────────────
-        // A button that is BOTH in CUSTOM_MODIFIERS and has a base remap entry
-        // acts as two things simultaneously:
-        //   1. It emits the remap output (e.g. KEY_LEFTCTRL) as a held system
-        //      key, so Ctrl+click etc. work natively while the button is held.
-        //   2. It tracks the INPUT key (e.g. BTN_TL) in self.modifiers, so
-        //      combo entries keyed on BTN_TL are found correctly.
-        // Without this intercept makima would track the OUTPUT key (KEY_LEFTCTRL)
-        // instead of the input key, causing combo lookups to never match.
-        if config.mapped_modifiers.custom.contains(&event) {
-            if let Some(out_keys) = config.bindings.remap
-                .get(&event)
-                .and_then(|m| m.get(&vec![]))
-                .cloned()
-            {
-                // Press / repeat: emit the output key only when active.
-                // Release (value=0): intentionally NOT emitted here — always handled
-                // by the emitted_outputs cleanup at the top of convert_event. That
-                // guarantees the key-up fires even when paused or gaming_mode was
-                // activated while the key was held (preventing stuck modifier keys).
-                if value != 0 && !paused && !gaming_mode {
+            crate::machine::Branch::ModifierIntercept { out_keys, emit, announce } => {
+                if emit {
                     let frames: Vec<_> = out_keys
                         .iter()
                         .map(|key| crate::machine::key_at(*key, value))
                         .collect();
                     self.apply_frames(&frames).await;
-                    // Store on press so the emitted_outputs cleanup can release on key-up.
                     if value == 1 {
                         self.store_emitted_outputs(&event, &out_keys).await;
                     }
                 }
-                // Don't write state for suppressed modifier events in Gaming Mode —
-                // the HUD must not show modifiers as active when input is raw.
-                // TODO: once the guard is moved earlier (see TODO above), this
-                // guard becomes unnecessary — suppressed events will never reach
-                // the intercept in the first place.
-                if !gaming_mode {
-                    self.set_last_emitted(&event, &out_keys, value, false, config.bindings.labels.get(&(event, vec![])).cloned(), false).await;
+                if announce {
+                    self.set_last_emitted(
+                        &event, &out_keys, value, false,
+                        config.bindings.labels.get(&(event, vec![])).cloned(), false,
+                    ).await;
                 }
                 self.toggle_modifiers(event, value, &config).await;
                 return;
             }
-        }
-        // ── Gaming Mode guard ──────────────────────────────────────────────────
-        // Must run before resolve_binding so that ALL configured bindings
-        // (Keys, Command, Movement, Hold) are suppressed, not just Unbound
-        // passthrough events. Key-up events (value=0) always pass through so
-        // held_keys / emitted_outputs are flushed and no key stays stuck.
-        //
-        // No write_state() here: the gaming_mode flag was already written to
-        // state.json when the mode was toggled. Suppressed events must not
-        // update the HUD — Gaming Mode means makima is transparent.
-        // Modifier tracking still runs so combo state stays consistent.
-        if gaming_mode {
-            let is_while_gaming = config.bindings.while_gaming.contains(&(event, modifiers.clone()))
-                || config.bindings.while_gaming.contains(&(event, vec![]));
-            if gaming_mode_suppresses(value, is_while_gaming) {
-                if gaming_mode_tracks_modifier(&event, &config.mapped_modifiers.all) {
+            crate::machine::Branch::Suppressed { track_modifier } => {
+                if track_modifier {
                     self.toggle_modifiers(event, value, &config).await;
                 }
                 return;
             }
+            crate::machine::Branch::Resolve => {}
         }
-        // ───────────────────────────────────────────────────────────────────────
 
         match resolve_binding(&config.bindings, event, &modifiers, self.settings.chain_only) {
             ResolvedBinding::Keys { keys, label, no_pause, while_gaming: _, silent, is_combo, is_fallback } => {
