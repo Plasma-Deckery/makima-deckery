@@ -2,7 +2,6 @@ use crate::active_client::*;
 use crate::config::{parse_modifiers, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::config_registry::ConfigRegistry;
 use crate::device_session::TrackpadSession;
-use crate::mt_trackpad;
 use deckery_controller::{HapticPad, HapticRequest, LizardModeHandle};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
@@ -109,9 +108,6 @@ pub struct EventReader {
     rpad: PadState,
     /// True while a combined gesture session is active.
     gesture_session: Arc<Mutex<bool>>,
-    /// Unified hidraw write channel from the controller session.
-    /// Used to fire haptics on Gaming Mode toggle. Cloned into TrackpadSession.
-    haptic_tx: Option<mpsc::Sender<HapticRequest>>,
     /// Setter handle for Lizard Mode config. Kept here for its lifetime —
     /// dropping it signals the hidraw writer to exit. Call `lizard_mode.set(cfg)`
     /// to update suppression settings live without a session reinit.
@@ -324,6 +320,8 @@ impl EventReader {
                 commands: Some(environment.clone()),
                 internal: Some(gaming_mode_tx.clone()),
                 haptics:  haptic_tx.clone(),
+                last_action: Some(last_action.clone()),
+                publish:  Some(state_write_tx.clone()),
                 tap:      None,
             },
             lstick_position,
@@ -352,7 +350,6 @@ impl EventReader {
             lpad: PadState::new(true),
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
-            haptic_tx,
             _lizard_mode: lizard_mode,
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
@@ -453,16 +450,14 @@ impl EventReader {
             println!("deckery: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
             let chain = if new_state { &self.gaming_mode_config.haptic_on }
                         else        { &self.gaming_mode_config.haptic_off };
-            mt_trackpad::fire_chain(&self.haptic_tx, HapticPad::Both, chain).await;
+            self.outputs.dispatch(&[crate::output::action::OutputAction::Haptic {
+                pad: HapticPad::Both,
+                chain: chain.clone(),
+            }]).await;
         }
-        let label = if new_state { "Gaming Mode On" } else { "Gaming Mode Off" };
-        *self.last_action.lock().await = Some(crate::state_export::LastAction {
-            r#type: "command".to_string(),
-            value: serde_json::json!(label),
-            label: Some(label.to_string()),
-            ts: crate::state_export::now_ts(),
-            silent: false,
-        });
+        // Said even while paused: the overlay shows what the press would do.
+        let announcement = crate::machine::gaming_mode_toggle(new_state, paused);
+        self.outputs.dispatch(&announcement[1..]).await;
         self.write_state().await;
     }
 
@@ -1331,7 +1326,10 @@ impl EventReader {
         match route.branch {
             crate::machine::Branch::ToggleGamingMode { enabled, preview } => {
                 println!("deckery: Gaming Mode trigger — double-click (paused={paused})");
-                self.set_gaming_mode(enabled, preview).await;
+                self.outputs
+                    .dispatch(&crate::machine::gaming_mode_toggle(enabled, preview))
+                    .await;
+                self.write_state().await;
                 return;
             }
             crate::machine::Branch::ModifierIntercept { out_keys, emit, announce } => {
@@ -1346,10 +1344,15 @@ impl EventReader {
                     }
                 }
                 if announce {
-                    self.set_last_emitted(
-                        &event, &out_keys, value, false,
-                        config.bindings.labels.get(&(event, vec![])).cloned(), false,
-                    ).await;
+                    let hint = if value == 1 { self.hint_label(&event).await } else { None };
+                    let announcement = crate::machine::keys_announcement(
+                        &out_keys, value, false,
+                        config.bindings.labels.get(&(event, vec![])).cloned(), hint, false,
+                    );
+                    if let Some(action) = announcement {
+                        self.outputs.dispatch(&[action]).await;
+                    }
+                    self.write_state().await;
                 }
                 self.toggle_modifiers(event, value, &config).await;
                 return;
@@ -1373,7 +1376,17 @@ impl EventReader {
                 //   false → fallback or base binding (modifier remains independent)
                 let release_keys    = !is_combo && !is_fallback;
                 let ignore_modifiers = is_combo;
-                self.set_last_emitted(&event, &keys, value, is_combo, label, silent).await;
+                let hint = if value == 1 && !is_combo {
+                    self.hint_label(&event).await
+                } else {
+                    None
+                };
+                if let Some(action) = crate::machine::keys_announcement(
+                    &keys, value, is_combo, label, hint, silent,
+                ) {
+                    self.outputs.dispatch(&[action]).await;
+                }
+                self.write_state().await;
                 self.emit_event(&keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
                 if send_zero {
                     let mut modifiers = self.modifiers.lock().await.clone();
@@ -1390,16 +1403,25 @@ impl EventReader {
             }
             ResolvedBinding::Command { commands, label, no_pause, while_gaming: _, silent, .. } => {
                 if value == 1 {
-                    let binding_label = label.clone();
-                    self.set_last_emitted_cmd(&event, &commands, label, silent).await;
+                    let mut actions = vec![crate::machine::command_announcement(
+                        &commands, label.clone(), silent,
+                    )];
                     if !paused || no_pause {
                         // The label travels with it so a failure can name the
                         // binding the user pressed rather than the command line.
-                        self.spawn_subprocess(&commands, binding_label).await;
+                        actions.push(crate::output::action::OutputAction::Command {
+                            argv: commands.clone(),
+                            label,
+                        });
+                        // Running a command counts as having used the modifier
+                        // that was held, so releasing it does not also tap.
+                        // Only when it actually runs, which is why this sits
+                        // inside the same condition.
+                        *self.modifier_was_activated.lock().await = true;
                     }
-                } else {
-                    self.write_state().await;
+                    self.outputs.dispatch(&actions).await;
                 }
+                self.write_state().await;
                 return;
             }
             ResolvedBinding::Movement { movement, .. } => {
@@ -1539,23 +1561,6 @@ impl EventReader {
         };
     }
 
-    /// Run a command binding. `label` is the binding's own label, used to
-    /// name it if the command fails.
-    ///
-    /// The spawning itself lives in `subprocess`; what stays here is the one
-    /// thing that belongs to the event path — a command press counts as having
-    /// used its modifier, so releasing that modifier must not also fire its own
-    /// base binding.
-    async fn spawn_subprocess(&self, command_list: &Vec<String>, label: Option<String>) {
-        *self.modifier_was_activated.lock().await = true;
-        crate::subprocess::run_command_binding(
-            &self.environment,
-            command_list,
-            label,
-            self.last_action.clone(),
-            self.state_write_tx.clone(),
-        ).await;
-    }
 
     /// Emit a single multi-touch frame for a trackpad to its virtual uinput device.
     /// `is_left`: true = lpad, false = rpad.
@@ -1795,49 +1800,22 @@ impl EventReader {
         event_state["sticks"]    = sticks;
         event_state["imu"]       = imu;
         event_state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
-        if analog_triggered {
-            // Analog events arrive at ~60 Hz; drop the update silently when the
-            // channel is full rather than blocking the event loop.
-            let _ = self.state_tx.try_send(StateCommand::SetEventState(Some(event_state)));
-        } else {
-            // Button / modifier / pause events must never be dropped — wait for
-            // the writer task to drain its queue before proceeding.
-            let _ = self.state_tx.send(StateCommand::SetEventState(Some(event_state))).await;
-        }
+        // Through the state port like everything else, carrying both the
+        // snapshot and how urgently it is meant: an analog tick at 60 Hz is
+        // dropped rather than allowed to hold up the event loop, a button or a
+        // pause must never be lost.
+        self.outputs.dispatch(&[crate::output::action::OutputAction::State(
+            crate::output::action::StateAction::Publish {
+                snapshot: Box::new(event_state),
+                urgency: if analog_triggered {
+                    crate::output::action::Urgency::Analog
+                } else {
+                    crate::output::action::Urgency::Immediate
+                },
+            },
+        )]).await;
     }
 
-    /// Record the actual emitted key output for the HUD last-event display.
-    /// Called at the emission site (not at input time) so the action reflects
-    /// what was truly sent to the virtual device.
-    async fn set_last_emitted(&self, trigger: &Event, emitted: &[Key], value: i32, is_combo: bool, label: Option<String>, silent: bool) {
-        // A hint relabels a press that resolves through the base binding, so it
-        // is never a combo and carries no label of its own — `label` is None and
-        // the toast stayed empty. The hint's text is the only thing that says
-        // what the press did, so it is what gets announced. Read-only: the
-        // resolution and the emitted keys are already decided and untouched.
-        //
-        // Only hints are added here. A plain base binding still announces
-        // nothing even when it has a label, because every button press would
-        // otherwise raise a toast.
-        let hint = if value == 1 && !is_combo {
-            self.hint_label(trigger).await
-        } else {
-            None
-        };
-        if value == 1 && (is_combo || hint.is_some()) {
-            let mut la = self.last_action.lock().await;
-            *la = Some(LastAction {
-                r#type: "keys".to_string(),
-                value: serde_json::json!(
-                    emitted.iter().map(|k| format!("{:?}", k)).collect::<Vec<_>>()
-                ),
-                ts: crate::state_export::now_ts(),
-                label: if is_combo { label } else { hint },
-                silent,
-            });
-        }
-        self.write_state().await;
-    }
 
     /// The hint `trigger` carries under the buttons held right now.
     ///
@@ -1865,20 +1843,6 @@ impl EventReader {
         }
     }
 
-    /// Record a spawned command as the last emitted action.
-    async fn set_last_emitted_cmd(&self, _trigger: &Event, commands: &[String], label: Option<String>, silent: bool) {
-        {
-            let mut la = self.last_action.lock().await;
-            *la = Some(LastAction {
-                r#type: "command".to_string(),
-                value: serde_json::Value::String(commands.join(" ")),
-                ts: crate::state_export::now_ts(),
-                label,
-                silent,
-            });
-        }
-        self.write_state().await;
-    }
 
     async fn ipc_command_loop(&self, mut rx: broadcast::Receiver<String>) {
         loop {

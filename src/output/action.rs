@@ -47,19 +47,6 @@ pub enum OutputDevice {
     GesturePad,
 }
 
-impl OutputDevice {
-    /// The name used in `DECKERY_RECORD_SINKS` and in the journal.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Keys => "keys",
-            Self::Axis => "axis",
-            Self::Abs => "abs",
-            Self::LeftPad => "lpad",
-            Self::RightPad => "rpad",
-            Self::GesturePad => "gesture_pad",
-        }
-    }
-}
 
 /// A hardware event on its way through unchanged.
 ///
@@ -84,6 +71,9 @@ impl PartialEq for Raw {
 ///
 /// The sequence number is process-wide and monotonic, so actions from different
 /// tasks have a total order even though they arrive independently.
+/// Read only by whatever is watching, and in production nothing is yet — the
+/// tests read it, and a log would. Marked here rather than muting the module.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Emission {
     pub seq: u64,

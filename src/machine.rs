@@ -22,7 +22,9 @@
 
 use crate::config::{Config, Event};
 use crate::event_reader::{gaming_mode_suppresses, gaming_mode_tracks_modifier};
-use crate::output::action::{Ev, OutputAction, OutputDevice, Raw};
+use crate::output::action::{
+    Ev, InternalCommand, LastActionSpec, OutputAction, OutputDevice, Raw, StateAction,
+};
 
 use evdev::{EventType, Key};
 
@@ -183,6 +185,68 @@ pub fn plan_default(event: &evdev::InputEvent, paused: bool) -> Vec<OutputAction
         Some(device) => vec![OutputAction::Forward { device, events: vec![Raw(*event)] }],
         None => Vec::new(),
     }
+}
+
+/// The announcement a key press makes, if it makes one.
+///
+/// Only a combo or a hint announces. A plain base binding stays silent even when
+/// it carries a label, because otherwise every button press would raise a toast.
+/// A hint is the one case where the label does not come from the binding at all —
+/// the press resolves through the base binding and the hint's text is the only
+/// thing that says what it did.
+pub fn keys_announcement(
+    emitted: &[Key],
+    value: i32,
+    is_combo: bool,
+    label: Option<String>,
+    hint: Option<String>,
+    silent: bool,
+) -> Option<OutputAction> {
+    if value != 1 || !(is_combo || hint.is_some()) {
+        return None;
+    }
+    Some(OutputAction::State(StateAction::SetLastAction(Some(LastActionSpec {
+        r#type: "keys".to_string(),
+        value: serde_json::json!(
+            emitted.iter().map(|k| format!("{:?}", k)).collect::<Vec<_>>()
+        ),
+        label: if is_combo { label } else { hint },
+        silent,
+    }))))
+}
+
+/// The announcement a command press makes.
+pub fn command_announcement(
+    commands: &[String],
+    label: Option<String>,
+    silent: bool,
+) -> OutputAction {
+    OutputAction::State(StateAction::SetLastAction(Some(LastActionSpec {
+        r#type: "command".to_string(),
+        value: serde_json::Value::String(commands.join(" ")),
+        label,
+        silent,
+    })))
+}
+
+/// What a Gaming Mode toggle amounts to: the mode change, and what the overlay
+/// says about it.
+///
+/// Two actions rather than one, and that is the preview distinction made
+/// visible: while paused the overlay is told what the press *would* do, and the
+/// mode change is withheld — the dispatch sends it onward only when `preview` is
+/// false.
+pub fn gaming_mode_toggle(enabled: bool, preview: bool) -> Vec<OutputAction> {
+    let label = if enabled { "Gaming Mode On" } else { "Gaming Mode Off" };
+    vec![
+        OutputAction::Internal(InternalCommand::SetGamingMode { enabled, preview }),
+        OutputAction::State(StateAction::SetLastAction(Some(LastActionSpec {
+            r#type: "command".to_string(),
+            value: serde_json::json!(label),
+            label: Some(label.to_string()),
+            silent: false,
+        }))),
+    ]
 }
 
 /// How `held_keys` changes for one event.

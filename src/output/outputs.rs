@@ -50,6 +50,13 @@ pub struct Outputs {
     pub internal: Option<mpsc::Sender<bool>>,
     /// Feedback to the controller.
     pub haptics: Option<mpsc::Sender<HapticRequest>>,
+    /// What the overlay says happened last. A port like the others: clip in the
+    /// reader's own cell, or a test's, or nothing.
+    pub last_action: Option<Arc<Mutex<Option<LastAction>>>>,
+    /// Asks the owner to publish a snapshot. Separate from `state`, which
+    /// carries one: a command that fails reports it long after the press, and by
+    /// then only the owner can assemble what the overlay should see.
+    pub publish: Option<mpsc::Sender<crate::trackpad_router::StateWrite>>,
     /// Sees every action, whatever the ports do with it.
     pub tap: Option<Tap>,
 }
@@ -63,6 +70,9 @@ pub struct Tap {
     dropped: Arc<AtomicU64>,
 }
 
+/// Nothing watches in production yet. The tests do, and a log would; until one
+/// does, these have no caller outside `cfg(test)`.
+#[allow(dead_code)]
 impl Tap {
     pub fn new(tx: mpsc::Sender<Emission>) -> Self {
         Self { tx, seq: Arc::new(AtomicU64::new(0)), dropped: Arc::new(AtomicU64::new(0)) }
@@ -95,6 +105,7 @@ impl Outputs {
     ///
     /// Checked before optional work is done, so a run with nothing watching and
     /// nothing to clone costs one `Option` check.
+    #[allow(dead_code)]
     pub fn watched(&self) -> bool {
         self.tap.is_some()
     }
@@ -157,13 +168,21 @@ impl Outputs {
                     }
                 }
 
-                // Not wired yet, and for a reason worth settling rather than
-                // papering over: `run_command_binding` reports a failure by
-                // writing `last_action` and asking for a state write, which is
-                // two effects performed from inside a port. It should instead
-                // produce an `OutputAction` of its own, late — which needs a way
-                // back into `dispatch`. That lands with the conversion.
-                OutputAction::Command { .. } => {}
+                OutputAction::Command { argv, label } => {
+                    match (&self.commands, &self.last_action, &self.publish) {
+                        (Some(environment), Some(last_action), Some(publish)) => {
+                            crate::subprocess::run_command_binding(
+                                environment, argv, label.clone(),
+                                last_action.clone(), publish.clone(),
+                            ).await;
+                        }
+                        // Any of the three missing means the command cannot be
+                        // run *and* reported, and running it without being able
+                        // to say that it failed is the thing this refactor is
+                        // undoing.
+                        _ => {}
+                    }
+                }
 
                 OutputAction::State(StateAction::Publish { snapshot, urgency }) => {
                     if let Some(tx) = &self.state {
@@ -178,10 +197,16 @@ impl Outputs {
                     }
                 }
 
-                // The owner holds `last_action` itself, because the next snapshot
-                // it assembles has to contain it. Pushing it through a port would
-                // mean asking the port to read it back.
-                OutputAction::State(StateAction::SetLastAction(_)) => {}
+                OutputAction::State(StateAction::SetLastAction(spec)) => {
+                    if let Some(cell) = &self.last_action {
+                        // The timestamp is attached here rather than carried in
+                        // the action: it is wall clock, and keeping it in the
+                        // action would make the same decision compare unequal to
+                        // itself a moment later.
+                        *cell.lock().await =
+                            spec.clone().map(|s| last_action_at(s, crate::state_export::now_ts()));
+                    }
+                }
             }
         }
     }

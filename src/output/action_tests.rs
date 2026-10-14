@@ -153,15 +153,3 @@ fn the_snapshot_is_part_of_the_action() {
     assert_ne!(publish(true), publish(false));
     assert_eq!(publish(true), publish(true));
 }
-
-/// Pads are excluded from recording by default; the names are what
-/// `DECKERY_RECORD_SINKS` is written in, so they are part of the interface.
-#[test]
-fn device_names_are_stable() {
-    assert_eq!(OutputDevice::Keys.as_str(), "keys");
-    assert_eq!(OutputDevice::Axis.as_str(), "axis");
-    assert_eq!(OutputDevice::Abs.as_str(), "abs");
-    assert_eq!(OutputDevice::LeftPad.as_str(), "lpad");
-    assert_eq!(OutputDevice::RightPad.as_str(), "rpad");
-    assert_eq!(OutputDevice::GesturePad.as_str(), "gesture_pad");
-}
