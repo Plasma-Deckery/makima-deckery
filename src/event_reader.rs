@@ -1478,15 +1478,13 @@ impl EventReader {
         no_pause: bool,
     ) {
         let paused = *self.paused.lock().await;
-        if paused && !no_pause {
-            return;
-        }
 
         let plan = {
             let mut modifier_was_activated = self.modifier_was_activated.lock().await;
             let plan = crate::machine::plan_emit(
                 config, event_list, value, modifiers,
                 release_keys, ignore_modifiers, *modifier_was_activated,
+                paused, no_pause,
             );
             *modifier_was_activated = plan.modifier_was_activated;
             plan

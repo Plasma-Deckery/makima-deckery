@@ -77,6 +77,16 @@ pub fn released_keys(modifiers: &[Event], config: &Config) -> Vec<Key> {
     out
 }
 
+/// Whether a binding still fires while makima is paused.
+///
+/// Pause means makima gets out of the way, so a binding sends nothing — unless
+/// it is marked `no_pause`, which is what keeps the one that un-pauses reachable.
+/// It lived as two lines at the top of `emit_event`, which meant the four cases
+/// issue #31 asks for could not be checked without a kernel.
+pub fn fires_while_paused(paused: bool, no_pause: bool) -> bool {
+    !paused || no_pause
+}
+
 /// Decide what `emit_event` sends, without sending it.
 ///
 /// Mirrors the three branches of the existing function exactly, including the
@@ -90,12 +100,19 @@ pub fn plan_emit(
     release_keys: bool,
     ignore_modifiers: bool,
     modifier_was_activated: bool,
+    paused: bool,
+    no_pause: bool,
 ) -> EmitPlan {
     let mut plan = EmitPlan {
         frames: Vec::new(),
         toggles: Vec::new(),
         modifier_was_activated,
     };
+    if !fires_while_paused(paused, no_pause) {
+        // Nothing at all, not even the bookkeeping: the press never happened as
+        // far as the rest of the system is concerned.
+        return plan;
+    }
 
     if release_keys && value != 2 && !modifiers.is_empty() {
         // Release the output keys the held modifiers resolve to, but only those

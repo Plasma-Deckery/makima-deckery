@@ -57,7 +57,7 @@ fn frames(plan: &EmitPlan) -> Vec<(u16, i32)> {
 #[test]
 fn a_plain_key_is_one_frame() {
     let config = make_config(vec![], vec![]);
-    let plan = plan_emit(&config, &[Key::KEY_A], 1, &[], true, false, true);
+    let plan = plan_emit(&config, &[Key::KEY_A], 1, &[], true, false, true, false, false);
 
     assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 1)]);
     assert!(plan.toggles.is_empty());
@@ -69,7 +69,7 @@ fn a_plain_key_is_one_frame() {
 #[test]
 fn each_key_is_its_own_frame_in_order() {
     let config = make_config(vec![], vec![]);
-    let plan = plan_emit(&config, &[Key::KEY_LEFTCTRL, Key::KEY_C], 1, &[], true, false, true);
+    let plan = plan_emit(&config, &[Key::KEY_LEFTCTRL, Key::KEY_C], 1, &[], true, false, true, false, false);
 
     assert_eq!(
         frames(&plan),
@@ -84,7 +84,7 @@ fn each_key_is_its_own_frame_in_order() {
 #[test]
 fn an_unused_modifier_taps_on_release() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&config, &[Key::BTN_TL], 0, &[], true, false, false);
+    let plan = plan_emit(&config, &[Key::BTN_TL], 0, &[], true, false, false, false, false);
 
     assert_eq!(
         frames(&plan),
@@ -99,7 +99,7 @@ fn an_unused_modifier_taps_on_release() {
 #[test]
 fn a_used_modifier_sends_nothing_on_release() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&config, &[Key::BTN_TL], 0, &[], true, false, true);
+    let plan = plan_emit(&config, &[Key::BTN_TL], 0, &[], true, false, true, false, false);
 
     assert!(frames(&plan).is_empty());
 }
@@ -109,7 +109,7 @@ fn a_used_modifier_sends_nothing_on_release() {
 #[test]
 fn pressing_a_modifier_arms_it_without_sending() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&config, &[Key::BTN_TL], 1, &[], true, false, true);
+    let plan = plan_emit(&config, &[Key::BTN_TL], 1, &[], true, false, true, false, false);
 
     assert!(frames(&plan).is_empty());
     assert!(!plan.modifier_was_activated);
@@ -124,7 +124,7 @@ fn ignore_modifiers_releases_the_output_key_not_the_input() {
         vec![(ev(Key::BTN_TL), vec![], vec![Key::KEY_LEFTCTRL])],
         vec![ev(Key::BTN_TL)],
     );
-    let plan = plan_emit(&config, &[Key::KEY_TAB], 1, &[ev(Key::BTN_TL)], false, true, true);
+    let plan = plan_emit(&config, &[Key::KEY_TAB], 1, &[ev(Key::BTN_TL)], false, true, true, false, false);
 
     assert_eq!(
         frames(&plan),
@@ -138,7 +138,7 @@ fn ignore_modifiers_releases_the_output_key_not_the_input() {
 #[test]
 fn ignore_modifiers_falls_back_to_the_modifier_code() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&config, &[Key::KEY_TAB], 1, &[ev(Key::BTN_TL)], false, true, true);
+    let plan = plan_emit(&config, &[Key::KEY_TAB], 1, &[ev(Key::BTN_TL)], false, true, true, false, false);
 
     assert_eq!(frames(&plan), vec![(Key::BTN_TL.code(), 0), (Key::KEY_TAB.code(), 1)]);
 }
@@ -152,7 +152,7 @@ fn nothing_is_released_when_no_modifier_is_held() {
         vec![(ev(Key::BTN_TR), vec![], vec![Key::KEY_LEFTSHIFT])],
         vec![ev(Key::BTN_TR)],
     );
-    let plan = plan_emit(&config, &[Key::KEY_X], 1, &[], true, false, true);
+    let plan = plan_emit(&config, &[Key::KEY_X], 1, &[], true, false, true, false, false);
 
     assert_eq!(frames(&plan), vec![(Key::KEY_X.code(), 1)]);
 }
@@ -165,7 +165,7 @@ fn a_repeat_does_not_release_or_track() {
         vec![(ev(Key::BTN_TL), vec![], vec![Key::KEY_LEFTCTRL])],
         vec![ev(Key::BTN_TL)],
     );
-    let plan = plan_emit(&config, &[Key::KEY_A], 2, &[ev(Key::BTN_TL)], true, false, true);
+    let plan = plan_emit(&config, &[Key::KEY_A], 2, &[ev(Key::BTN_TL)], true, false, true, false, false);
 
     assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 2)]);
     assert!(plan.toggles.is_empty());
@@ -184,7 +184,7 @@ fn only_modifier_outputs_are_released() {
         ],
         vec![ev(Key::BTN_TL), ev(Key::BTN_TR)],
     );
-    let plan = plan_emit(&config, &[Key::KEY_Z], 1, &[ev(Key::BTN_TL)], true, false, true);
+    let plan = plan_emit(&config, &[Key::KEY_Z], 1, &[ev(Key::BTN_TL)], true, false, true, false, false);
 
     let sent = frames(&plan);
     assert!(sent.contains(&(Key::BTN_TR.code(), 0)), "the modifier output was released: {sent:?}");
@@ -613,4 +613,36 @@ fn a_while_gaming_binding_is_not_suppressed() {
         }).branch,
         Branch::Resolve,
     );
+}
+
+/// Pause means makima gets out of the way: a binding sends nothing, not even its
+/// bookkeeping. Two of the four cases issue #31 asks for, and they were
+/// uncheckable while the guard was two lines at the top of emit_event.
+#[test]
+fn a_paused_binding_sends_nothing() {
+    let config = make_config(vec![], vec![]);
+    let plan = plan_emit(&config, &[Key::KEY_A], 1, &[], true, false, true, true, false);
+
+    assert!(frames(&plan).is_empty());
+    assert!(plan.toggles.is_empty());
+}
+
+/// Unless it is marked `no_pause`, which is what keeps the binding that
+/// un-pauses reachable while paused.
+#[test]
+fn a_no_pause_binding_fires_while_paused() {
+    let config = make_config(vec![], vec![]);
+    let plan = plan_emit(&config, &[Key::KEY_A], 1, &[], true, false, true, true, true);
+
+    assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 1)]);
+}
+
+/// The predicate on its own, because both callers read it and the double
+/// negative in "not paused or no_pause" is easy to get backwards.
+#[test]
+fn fires_while_paused_is_only_false_when_paused_and_not_exempt() {
+    assert!(fires_while_paused(false, false));
+    assert!(fires_while_paused(false, true));
+    assert!(fires_while_paused(true, true));
+    assert!(!fires_while_paused(true, false));
 }
