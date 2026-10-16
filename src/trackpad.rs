@@ -1,3 +1,4 @@
+use crate::output::OutputDevice;
 use crate::virtual_devices::VirtualDevices;
 use evdev::{EventType, InputEvent, Key};
 use std::sync::Arc;
@@ -35,11 +36,12 @@ impl PadState {
         click: Option<bool>,
     ) {
         let mut vd = virt_dev.lock().await;
-        let dev = if self.is_left { vd.lpad.as_mut() } else { vd.rpad.as_mut() };
-        let dev = match dev {
-            Some(d) => d,
-            None => return,
-        };
+        let device = if self.is_left { OutputDevice::LeftPad } else { OutputDevice::RightPad };
+        // The pad may never have been enabled, and building the frame for a
+        // device that is not there is wasted work.
+        if !vd.has_device(device) {
+            return;
+        }
         let y = -y; // Steam Deck Y increases upward; libinput expects downward.
 
         let mut events = Vec::new();
@@ -63,7 +65,7 @@ impl PadState {
         }
 
         events.push(InputEvent::new_now(EventType::SYNCHRONIZATION, 0, 0));
-        dev.emit(&events).ok();
+        vd.emit(device, &events).ok();
     }
 }
 
@@ -85,10 +87,9 @@ pub async fn emit_gesture_event(
     click: Option<bool>,
 ) {
     let mut vd = virt_dev.lock().await;
-    let dev = match vd.gesture_pad.as_mut() {
-        Some(d) => d,
-        None => return,
-    };
+    if !vd.has_device(OutputDevice::GesturePad) {
+        return;
+    }
     let ly = -ly;
     let ry = -ry;
 
@@ -129,5 +130,5 @@ pub async fn emit_gesture_event(
     }
 
     events.push(InputEvent::new_now(EventType::SYNCHRONIZATION, 0, 0));
-    dev.emit(&events).ok();
+    vd.emit(OutputDevice::GesturePad, &events).ok();
 }

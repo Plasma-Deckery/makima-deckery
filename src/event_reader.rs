@@ -2,7 +2,6 @@ use crate::active_client::*;
 use crate::config::{parse_modifiers, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::config_registry::ConfigRegistry;
 use crate::device_session::TrackpadSession;
-use crate::mt_trackpad;
 use deckery_controller::{HapticPad, HapticRequest, LizardModeHandle};
 use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
@@ -62,7 +61,12 @@ pub struct EventReader {
     is_tablet: bool,
     /// Maximum absolute axis value across all axes, queried once at open time.
     max_abs_wheel: i32,
-    virt_dev: Arc<Mutex<VirtualDevices>>,
+    /// Where the decided actions go. Built from the same handles as the fields
+    /// around it, so clipping the device port out is all it takes to run this
+    /// reader against nothing — which is what makes the decisions testable
+    /// without a kernel. The trackpad session still takes `virt_dev` directly;
+    /// until it goes through a port too, that one path stays unclipped.
+    outputs: crate::output::Outputs,
     lstick_position: Arc<Mutex<Vec<i32>>>,
     rstick_position: Arc<Mutex<Vec<i32>>>,
     /// Raw hardware position of left stick (ABS_X, ABS_Y), always tracked regardless of mode.
@@ -104,9 +108,6 @@ pub struct EventReader {
     rpad: PadState,
     /// True while a combined gesture session is active.
     gesture_session: Arc<Mutex<bool>>,
-    /// Unified hidraw write channel from the controller session.
-    /// Used to fire haptics on Gaming Mode toggle. Cloned into TrackpadSession.
-    haptic_tx: Option<mpsc::Sender<HapticRequest>>,
     /// Setter handle for Lizard Mode config. Kept here for its lifetime —
     /// dropping it signals the hidraw writer to exit. Call `lizard_mode.set(cfg)`
     /// to update suppression settings live without a session reinit.
@@ -313,7 +314,16 @@ impl EventReader {
             event_rx: Mutex::new(event_rx),
             is_tablet,
             max_abs_wheel,
-            virt_dev,
+            outputs: crate::output::Outputs {
+                devices:  Some(virt_dev.clone()),
+                state:    Some(state_tx.clone()),
+                commands: Some(environment.clone()),
+                internal: Some(gaming_mode_tx.clone()),
+                haptics:  haptic_tx.clone(),
+                last_action: Some(last_action.clone()),
+                publish:  Some(state_write_tx.clone()),
+                tap:      None,
+            },
             lstick_position,
             rstick_position,
             lstick_raw,
@@ -340,7 +350,6 @@ impl EventReader {
             lpad: PadState::new(true),
             rpad: PadState::new(false),
             gesture_session: Arc::new(Mutex::new(false)),
-            haptic_tx,
             _lizard_mode: lizard_mode,
             gaming_mode_config,
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
@@ -371,8 +380,18 @@ impl EventReader {
             self.state_write_loop(state_rx),
             self.ipc_command_loop(ipc_rx),
             async {
-                if let Some(s) = session {
-                    s.run(&self.virt_dev, &self.lpad, &self.rpad, &self.gesture_session, state_tx, self.gaming_mode.clone()).await;
+                // The trackpad session is a producer of its own — hidraw frames,
+                // not events — so it still takes the devices directly rather
+                // than going through a port. It reads the handle out of the
+                // device port, which means an unclipped port stops it too: no
+                // devices, no trackpad session, and nothing reaches the kernel
+                // from here either.
+                match (session, self.outputs.devices.as_ref()) {
+                    (Some(s), Some(devices)) => {
+                        s.run(devices, &self.lpad, &self.rpad, &self.gesture_session,
+                              state_tx, self.gaming_mode.clone()).await;
+                    }
+                    _ => {}
                 }
             },
         );
@@ -431,16 +450,14 @@ impl EventReader {
             println!("deckery: Gaming Mode {}", if new_state { "enabled" } else { "disabled" });
             let chain = if new_state { &self.gaming_mode_config.haptic_on }
                         else        { &self.gaming_mode_config.haptic_off };
-            mt_trackpad::fire_chain(&self.haptic_tx, HapticPad::Both, chain).await;
+            self.outputs.dispatch(&[crate::output::action::OutputAction::Haptic {
+                pad: HapticPad::Both,
+                chain: chain.clone(),
+            }]).await;
         }
-        let label = if new_state { "Gaming Mode On" } else { "Gaming Mode Off" };
-        *self.last_action.lock().await = Some(crate::state_export::LastAction {
-            r#type: "command".to_string(),
-            value: serde_json::json!(label),
-            label: Some(label.to_string()),
-            ts: crate::state_export::now_ts(),
-            silent: false,
-        });
+        // Said even while paused: the overlay shows what the press would do.
+        let announcement = crate::machine::gaming_mode_toggle(new_state, paused);
+        self.outputs.dispatch(&announcement[1..]).await;
         self.write_state().await;
     }
 
@@ -1159,8 +1176,13 @@ impl EventReader {
                 (EventType::MISC, _, _, true) => {
                     if evdev::MiscType(event.code()) == evdev::MiscType::MSC_SERIAL {
                         pen_events.push(event);
-                        let mut virt_dev = self.virt_dev.lock().await;
-                        virt_dev.abs.emit(&pen_events).unwrap();
+                        // One frame carrying the whole accumulated report, with
+                        // the pen's own timestamps — which is why this is a
+                        // Forward and not a Frame.
+                        self.apply_frames(&[crate::output::action::OutputAction::Forward {
+                            device: crate::output::OutputDevice::Abs,
+                            events: pen_events.iter().map(|e| crate::output::action::Raw(*e)).collect(),
+                        }]).await;
                         pen_events.clear()
                     }
                 }
@@ -1199,15 +1221,16 @@ impl EventReader {
     /// actual output keys that got stuck) and clears `modifiers` and `held_keys`
     /// so combo and HUD state don't carry stale data across the reconnect.
     async fn release_all_held(&self) {
-        let mut vd = self.virt_dev.lock().await;
-        // Release all tracked emitted output keys.
-        let mut eo = self.emitted_outputs.lock().await;
-        for (_input_ev, output_keys) in eo.drain() {
-            for key in output_keys {
-                let _ = vd.keys.emit(&[InputEvent::new_now(EventType::KEY, key.code(), 0)]);
-            }
-        }
-        drop(eo);
+        // Collected before anything is sent, so the device port is held for the
+        // frames alone rather than across the three locks below.
+        let frames: Vec<crate::output::action::OutputAction> = {
+            let mut eo = self.emitted_outputs.lock().await;
+            eo.drain()
+                .flat_map(|(_input_ev, output_keys)| output_keys)
+                .map(|key| crate::machine::key_up(key))
+                .collect()
+        };
+        self.apply_frames(&frames).await;
         // Release modifier output keys (e.g. Shift held via L4).
         // `modifiers` tracks input events but those that map to output keys will
         // already be in `emitted_outputs`; we clear modifiers to reset combo state.
@@ -1231,6 +1254,13 @@ impl EventReader {
         }
     }
 
+    /// Decide what one event means, and do it.
+    ///
+    /// The deciding is `machine::plan_route` — which branch applies and what
+    /// changes before it — and the ordering of those guards is the part that
+    /// used to carry a `TODO: structural debt` note. It was not that the order
+    /// was wrong; it was that it was spread over eighty lines of early returns
+    /// and could neither be read nor tested in one piece. It can now.
     async fn convert_event(
         &self,
         default_event: InputEvent,
@@ -1238,155 +1268,103 @@ impl EventReader {
         value: i32,
         send_zero: bool,
     ) {
-        // TODO: structural debt — gaming_mode is read here early because the
-        // Custom Modifier Intercept and held_keys update both sit before the
-        // Gaming Mode guard. Ideally the guard would be the first thing after
-        // emitted_outputs cleanup, and the intercept would be folded into the
-        // post-guard path. Refactor when touching this area next.
         let gaming_mode = *self.gaming_mode.lock().await;
 
-        // Track all currently held buttons so the HUD can highlight them.
-        // Only KEY events are tracked (not axis/stick movements).
-        // Presses (value=1) are suppressed while Gaming Mode is active so the
-        // HUD never shows buttons as held when input is passed through raw.
-        // Releases (value=0) always run so held_keys is cleaned up correctly
-        // when Gaming Mode is turned off mid-hold.
-        // TODO: once the guard is moved earlier (see TODO above), this
-        // guard can be removed — the early return will prevent presses from
-        // reaching here.
-        if matches!(event, Event::Key(_)) {
-            let mut held = self.held_keys.lock().await;
-            match value {
-                1 if !gaming_mode => { held.push(event); held.sort(); held.dedup(); }
-                0 => held.retain(|&x| x != event),
-                _ => {}
+        // Both of these are decided without the config and have to be applied
+        // before it is re-resolved below — a release has to clear what its press
+        // emitted even if the binding has changed since.
+        match crate::machine::held_update(event, value, gaming_mode) {
+            crate::machine::HeldUpdate::Add => {
+                let mut held = self.held_keys.lock().await;
+                held.push(event);
+                held.sort();
+                held.dedup();
             }
-        } // lock dropped before any await
+            crate::machine::HeldUpdate::Remove => {
+                self.held_keys.lock().await.retain(|&x| x != event);
+            }
+            crate::machine::HeldUpdate::Leave => {}
+        }
 
-        // On key-up (value=0), release every output key that was ever emitted
-        // for this physical button — even if the resolution changed mid-hold
-        // (e.g. base remap F10 → combo Alt+Ctrl+Z when R1 was pressed).
-        if value == 0 {
-            if let Event::Key(_) = event {
-                let mut eo = self.emitted_outputs.lock().await;
-                if let Some(prev_keys) = eo.remove(&event) {
-                    let mut vd = self.virt_dev.lock().await;
-                    for key in &prev_keys {
-                        let _ = vd.keys.emit(&[
-                            InputEvent::new_now(EventType::KEY, key.code(), 0),
-                        ]);
-                    }
-                }
+        if crate::machine::releases_emitted(event, value) {
+            let prev_keys = self.emitted_outputs.lock().await.remove(&event);
+            if let Some(prev_keys) = prev_keys {
+                let frames: Vec<_> =
+                    prev_keys.iter().map(|key| crate::machine::key_up(*key)).collect();
+                self.apply_frames(&frames).await;
             }
         }
 
+        // A press may be the one that changed the focused window, so the config
+        // is re-resolved before anything is decided against it.
         if value == 1 {
             self.update_config().await;
-        };
-        let config = self.current_config.lock().await.clone();
+        }
+
         let paused = *self.paused.lock().await;
-        // gaming_mode already read above.
+        let config = self.current_config.lock().await.clone();
         let mut modifiers = self.modifiers.lock().await.clone();
         modifiers.sort();
         modifiers.dedup();
 
+        let route = {
+            let trigger_ts = *self.gaming_mode_trigger_ts.lock().await;
+            crate::machine::plan_route(&crate::machine::Input {
+                event,
+                value,
+                config: &config,
+                modifiers: &modifiers,
+                gaming_mode,
+                paused,
+                trigger: self.gaming_mode_config.trigger.as_ref(),
+                trigger_ts,
+                now: std::time::Instant::now(),
+            })
+        };
+        *self.gaming_mode_trigger_ts.lock().await = route.trigger_ts;
 
-        // ── Gaming Mode double-click trigger ──────────────────────────────────
-        // The configured trigger key double-pressed within `double_click_ms`
-        // toggles Gaming Mode on/off and fires haptic feedback.
-        // Skipped entirely when `trigger` is None (not configured or invalid).
-        // Runs before the Gaming Mode guard so the second press is never
-        // suppressed — even while Gaming Mode is already active (to turn it off).
-        // Intentionally runs even when paused: Gaming Mode and Pause are
-        // orthogonal meta-states and the toggle should always be reachable.
-        if let Some(ref trigger) = self.gaming_mode_config.trigger {
-            if event == Event::Key(trigger.key) && value == 1 {
-                let now = std::time::Instant::now();
-                let mut ts = self.gaming_mode_trigger_ts.lock().await;
-                let within_window = ts
-                    .map(|prev| now.duration_since(prev).as_millis() <= trigger.ms as u128)
-                    .unwrap_or(false);
-                if within_window {
-                    *ts = None;
-                    drop(ts);
-                    let new_state = !*self.gaming_mode.lock().await;
-                    println!("deckery: Gaming Mode trigger — double-click (paused={})", paused);
-                    self.set_gaming_mode(new_state, paused).await;
-                    return;
-                } else {
-                    // First click of a potential double-click — record timestamp and
-                    // let the event fall through so normal bindings still fire.
-                    *ts = Some(now);
-                }
+        match route.branch {
+            crate::machine::Branch::ToggleGamingMode { enabled, preview } => {
+                println!("deckery: Gaming Mode trigger — double-click (paused={paused})");
+                self.outputs
+                    .dispatch(&crate::machine::gaming_mode_toggle(enabled, preview))
+                    .await;
+                self.write_state().await;
+                return;
             }
-        }
-        // ── Custom modifier + remap intercept ──────────────────────────────────
-        // A button that is BOTH in CUSTOM_MODIFIERS and has a base remap entry
-        // acts as two things simultaneously:
-        //   1. It emits the remap output (e.g. KEY_LEFTCTRL) as a held system
-        //      key, so Ctrl+click etc. work natively while the button is held.
-        //   2. It tracks the INPUT key (e.g. BTN_TL) in self.modifiers, so
-        //      combo entries keyed on BTN_TL are found correctly.
-        // Without this intercept makima would track the OUTPUT key (KEY_LEFTCTRL)
-        // instead of the input key, causing combo lookups to never match.
-        if config.mapped_modifiers.custom.contains(&event) {
-            if let Some(out_keys) = config.bindings.remap
-                .get(&event)
-                .and_then(|m| m.get(&vec![]))
-                .cloned()
-            {
-                // Press / repeat: emit the output key only when active.
-                // Release (value=0): intentionally NOT emitted here — always handled
-                // by the emitted_outputs cleanup at the top of convert_event. That
-                // guarantees the key-up fires even when paused or gaming_mode was
-                // activated while the key was held (preventing stuck modifier keys).
-                if value != 0 && !paused && !gaming_mode {
-                    {
-                        let mut virt_dev = self.virt_dev.lock().await;
-                        for key in &out_keys {
-                            virt_dev.keys.emit(&[
-                                InputEvent::new_now(EventType::KEY, key.code(), value),
-                            ]).unwrap();
-                        }
-                    }
-                    // Store on press so the emitted_outputs cleanup can release on key-up.
+            crate::machine::Branch::ModifierIntercept { out_keys, emit, announce } => {
+                if emit {
+                    let frames: Vec<_> = out_keys
+                        .iter()
+                        .map(|key| crate::machine::key_at(*key, value))
+                        .collect();
+                    self.apply_frames(&frames).await;
                     if value == 1 {
                         self.store_emitted_outputs(&event, &out_keys).await;
                     }
                 }
-                // Don't write state for suppressed modifier events in Gaming Mode —
-                // the HUD must not show modifiers as active when input is raw.
-                // TODO: once the guard is moved earlier (see TODO above), this
-                // guard becomes unnecessary — suppressed events will never reach
-                // the intercept in the first place.
-                if !gaming_mode {
-                    self.set_last_emitted(&event, &out_keys, value, false, config.bindings.labels.get(&(event, vec![])).cloned(), false).await;
+                if announce {
+                    let hint = if value == 1 { self.hint_label(&event).await } else { None };
+                    let announcement = crate::machine::keys_announcement(
+                        &out_keys, value, false,
+                        config.bindings.labels.get(&(event, vec![])).cloned(), hint, false,
+                    );
+                    if let Some(action) = announcement {
+                        self.outputs.dispatch(&[action]).await;
+                    }
+                    self.write_state().await;
                 }
                 self.toggle_modifiers(event, value, &config).await;
                 return;
             }
-        }
-        // ── Gaming Mode guard ──────────────────────────────────────────────────
-        // Must run before resolve_binding so that ALL configured bindings
-        // (Keys, Command, Movement, Hold) are suppressed, not just Unbound
-        // passthrough events. Key-up events (value=0) always pass through so
-        // held_keys / emitted_outputs are flushed and no key stays stuck.
-        //
-        // No write_state() here: the gaming_mode flag was already written to
-        // state.json when the mode was toggled. Suppressed events must not
-        // update the HUD — Gaming Mode means makima is transparent.
-        // Modifier tracking still runs so combo state stays consistent.
-        if gaming_mode {
-            let is_while_gaming = config.bindings.while_gaming.contains(&(event, modifiers.clone()))
-                || config.bindings.while_gaming.contains(&(event, vec![]));
-            if gaming_mode_suppresses(value, is_while_gaming) {
-                if gaming_mode_tracks_modifier(&event, &config.mapped_modifiers.all) {
+            crate::machine::Branch::Suppressed { track_modifier } => {
+                if track_modifier {
                     self.toggle_modifiers(event, value, &config).await;
                 }
                 return;
             }
+            crate::machine::Branch::Resolve => {}
         }
-        // ───────────────────────────────────────────────────────────────────────
 
         match resolve_binding(&config.bindings, event, &modifiers, self.settings.chain_only) {
             ResolvedBinding::Keys { keys, label, no_pause, while_gaming: _, silent, is_combo, is_fallback } => {
@@ -1398,7 +1376,17 @@ impl EventReader {
                 //   false → fallback or base binding (modifier remains independent)
                 let release_keys    = !is_combo && !is_fallback;
                 let ignore_modifiers = is_combo;
-                self.set_last_emitted(&event, &keys, value, is_combo, label, silent).await;
+                let hint = if value == 1 && !is_combo {
+                    self.hint_label(&event).await
+                } else {
+                    None
+                };
+                if let Some(action) = crate::machine::keys_announcement(
+                    &keys, value, is_combo, label, hint, silent,
+                ) {
+                    self.outputs.dispatch(&[action]).await;
+                }
+                self.write_state().await;
                 self.emit_event(&keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
                 if send_zero {
                     let mut modifiers = self.modifiers.lock().await.clone();
@@ -1415,16 +1403,25 @@ impl EventReader {
             }
             ResolvedBinding::Command { commands, label, no_pause, while_gaming: _, silent, .. } => {
                 if value == 1 {
-                    let binding_label = label.clone();
-                    self.set_last_emitted_cmd(&event, &commands, label, silent).await;
+                    let mut actions = vec![crate::machine::command_announcement(
+                        &commands, label.clone(), silent,
+                    )];
                     if !paused || no_pause {
                         // The label travels with it so a failure can name the
                         // binding the user pressed rather than the command line.
-                        self.spawn_subprocess(&commands, binding_label).await;
+                        actions.push(crate::output::action::OutputAction::Command {
+                            argv: commands.clone(),
+                            label,
+                        });
+                        // Running a command counts as having used the modifier
+                        // that was held, so releasing it does not also tap.
+                        // Only when it actually runs, which is why this sits
+                        // inside the same condition.
+                        *self.modifier_was_activated.lock().await = true;
                     }
-                } else {
-                    self.write_state().await;
+                    self.outputs.dispatch(&actions).await;
                 }
+                self.write_state().await;
                 return;
             }
             ResolvedBinding::Movement { movement, .. } => {
@@ -1439,6 +1436,37 @@ impl EventReader {
             .await;
     }
 
+    /// Send a plan's frames to the output devices.
+    ///
+    /// One lock for the whole plan, so every frame of one decision is contiguous
+    /// as the kernel reads it. `Frame` is synthesised and stamped here, which is
+    /// what the old path did; `Forward` keeps the stamp it arrived with, which is
+    /// why it is a separate kind.
+    ///
+    /// This does change one thing: `key_cursor_loop` used to take the lock once
+    /// per axis, so another producer could split a pointer motion between X and
+    /// Y. It cannot any more. That is deliberate — the other three loops already
+    /// behaved this way, and a motion split in half was never the intent.
+    async fn apply_frames(&self, actions: &[crate::output::action::OutputAction]) {
+        if actions.is_empty() {
+            return;
+        }
+        self.outputs.dispatch(actions).await;
+    }
+
+    /// Emit what a resolved key binding amounts to.
+    ///
+    /// The decision is `machine::plan_emit`, which is pure and tested; this
+    /// applies it. The two used to be one interleaved loop — read state, mutate
+    /// state, emit, repeat — and that interleaving was what made the binding
+    /// engine impossible to test without a kernel.
+    ///
+    /// The frames go out first and under one lock, so every frame of one
+    /// decision reaches the kernel contiguously. The modifier bookkeeping
+    /// follows, which is the one observable change from the old order: it used
+    /// to happen between frames, and each of those calls publishes state at its
+    /// end, so those publishes now land after the frames rather than among
+    /// them. Only the overlay sees that, and only as timing.
     async fn emit_event(
         &self,
         event_list: &Vec<Key>,
@@ -1450,79 +1478,28 @@ impl EventReader {
         no_pause: bool,
     ) {
         let paused = *self.paused.lock().await;
-        if paused && !no_pause {
-            return;
-        }
-        let mut virt_dev = self.virt_dev.lock().await;
-        let mut modifier_was_activated = self.modifier_was_activated.lock().await;
-        if release_keys && value != 2 && !modifiers.is_empty() {
-            // Only release previous modifier outputs when there are actually modifiers
-            // held. With an empty modifier set there is nothing to clean up, and
-            // iterating released_keys(&[]) would spuriously release system modifier
-            // keys (e.g. KEY_LEFTSHIFT from a back-paddle remap) that happen to share
-            // their key code with a base remap output.
-            let released_keys: Vec<Key> = self.released_keys(&modifiers, &config).await;
-            for key in released_keys {
-                if config.mapped_modifiers.all.contains(&Event::Key(key)) {
-                    self.toggle_modifiers(Event::Key(key), 0, &config).await;
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 0);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap();
-                }
-            }
-        } else if ignore_modifiers {
-            // For each active modifier, release its OUTPUT key (not the raw input
-            // code). For a custom modifier with a remap (e.g. BTN_TL → KEY_LEFTCTRL)
-            // that means releasing KEY_LEFTCTRL so the system modifier state is
-            // cleared before the combo keys are emitted.
-            for modifier in modifiers.iter() {
-                let codes: Vec<u16> = config
-                    .bindings
-                    .remap
-                    .get(modifier)
-                    .and_then(|m| m.get(&vec![]))
-                    .map(|keys| keys.iter().map(|k| k.code()).collect())
-                    .unwrap_or_else(|| match modifier {
-                        Event::Key(k) => vec![k.code()],
-                        _ => vec![],
-                    });
-                for code in codes {
-                    virt_dev.keys.emit(&[
-                        InputEvent::new_now(EventType::KEY, code, 0),
-                    ]).unwrap();
-                }
-            }
-        }
-        for key in event_list {
-            if release_keys && value != 2 {
-                // Only track CUSTOM_MODIFIERS in self.modifiers — not system modifier
-                // keys like KEY_LEFTSHIFT/CTRL/ALT that appear as remap outputs.
-                // Tracking system modifiers corrupts the modifier state and breaks
-                // subsequent combo lookups (e.g. pressing Shift after a combo would
-                // leave KEY_LEFTSHIFT stuck in self.modifiers).
-                if config.mapped_modifiers.custom.contains(&Event::Key(*key)) {
-                    self.toggle_modifiers(Event::Key(*key), value, &config)
-                        .await;
-                }
-            }
-            if config.mapped_modifiers.custom.contains(&Event::Key(*key)) {
-                if value == 0 && !*modifier_was_activated {
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 1);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap();
-                    let virtual_event: InputEvent =
-                        InputEvent::new_now(EventType::KEY, key.code(), 0);
-                    virt_dev.keys.emit(&[virtual_event]).unwrap();
-                    *modifier_was_activated = true;
-                } else if value == 1 {
-                    *modifier_was_activated = false;
-                }
-            } else {
-                let virtual_event: InputEvent =
-                    InputEvent::new_now(EventType::KEY, key.code(), value);
-                virt_dev.keys.emit(&[virtual_event]).unwrap();
-                *modifier_was_activated = true;
-            }
+
+        let plan = {
+            let mut modifier_was_activated = self.modifier_was_activated.lock().await;
+            let plan = crate::machine::plan_emit(&crate::machine::EmitRequest {
+                config,
+                event_list,
+                value,
+                modifiers,
+                release_keys,
+                ignore_modifiers,
+                modifier_was_activated: *modifier_was_activated,
+                paused,
+                no_pause,
+            });
+            *modifier_was_activated = plan.modifier_was_activated;
+            plan
+        };
+
+        self.apply_frames(&plan.frames).await;
+
+        for (modifier, value) in plan.toggles {
+            self.toggle_modifiers(modifier, value, config).await;
         }
     }
 
@@ -1553,73 +1530,24 @@ impl EventReader {
             }
         }
         // Passthrough keys are held state — last_action is only for combos and commands.
-        let mut virt_dev = self.virt_dev.lock().await;
-        let mut modifier_was_activated = self.modifier_was_activated.lock().await;
-        if config.mapped_modifiers.all.contains(&event) && value != 2 {
-            let released_keys: Vec<Key> = self.released_keys(&modifiers, &config).await;
-            for key in released_keys {
-                self.toggle_modifiers(Event::Key(key), 0, &config).await;
-                let virtual_event: InputEvent = InputEvent::new_now(EventType::KEY, key.code(), 0);
-                virt_dev.keys.emit(&[virtual_event]).unwrap()
-            }
-        }
-        self.toggle_modifiers(event, value, &config).await;
-        if config.mapped_modifiers.custom.contains(&event) {
-            if value == 0 && !*modifier_was_activated {
-                let virtual_event: InputEvent =
-                    InputEvent::new_now(default_event.event_type(), default_event.code(), 1);
-                virt_dev.keys.emit(&[virtual_event]).unwrap();
-                let virtual_event: InputEvent =
-                    InputEvent::new_now(default_event.event_type(), default_event.code(), 0);
-                virt_dev.keys.emit(&[virtual_event]).unwrap();
-                *modifier_was_activated = true;
-            } else if value == 1 {
-                *modifier_was_activated = false;
-            }
-        } else {
-            *modifier_was_activated = true;
-            match default_event.event_type() {
-                EventType::KEY => {
-                    virt_dev.keys.emit(&[default_event]).unwrap();
-                }
-                EventType::RELATIVE => {
-                    virt_dev.axis.emit(&[default_event]).unwrap();
-                }
-                EventType::ABSOLUTE => {
-                    virt_dev.abs.emit(&[default_event]).unwrap();
-                }
-                EventType::MISC => {
-                    let mut virt_dev = self.virt_dev.lock().await;
-                    virt_dev.abs.emit(&[default_event]).unwrap();
-                }
-                _ => {}
-            }
+        let plan = {
+            let mut modifier_was_activated = self.modifier_was_activated.lock().await;
+            let plan = crate::machine::plan_nonmapped(
+                config, event, &default_event, value, modifiers, *modifier_was_activated,
+            );
+            *modifier_was_activated = plan.modifier_was_activated;
+            plan
+        };
+        self.apply_frames(&plan.frames).await;
+        for (modifier, value) in plan.toggles {
+            self.toggle_modifiers(modifier, value, config).await;
         }
     }
 
+    /// Pass an event the reader has no binding for straight through.
     async fn emit_default_event(&self, event: InputEvent) {
-        if *self.paused.lock().await {
-            return;
-        }
-        match event.event_type() {
-            EventType::KEY => {
-                let mut virt_dev = self.virt_dev.lock().await;
-                virt_dev.keys.emit(&[event]).unwrap();
-            }
-            EventType::RELATIVE => {
-                let mut virt_dev = self.virt_dev.lock().await;
-                virt_dev.axis.emit(&[event]).unwrap();
-            }
-            EventType::ABSOLUTE => {
-                let mut virt_dev = self.virt_dev.lock().await;
-                virt_dev.abs.emit(&[event]).unwrap();
-            }
-            EventType::MISC => {
-                let mut virt_dev = self.virt_dev.lock().await;
-                virt_dev.abs.emit(&[event]).unwrap();
-            }
-            _ => {}
-        }
+        let paused = *self.paused.lock().await;
+        self.apply_frames(&crate::machine::plan_default(&event, paused)).await;
     }
 
     async fn emit_movement(&self, movement: &Relative, value: i32) {
@@ -1637,23 +1565,6 @@ impl EventReader {
         };
     }
 
-    /// Run a command binding. `label` is the binding's own label, used to
-    /// name it if the command fails.
-    ///
-    /// The spawning itself lives in `subprocess`; what stays here is the one
-    /// thing that belongs to the event path — a command press counts as having
-    /// used its modifier, so releasing that modifier must not also fire its own
-    /// base binding.
-    async fn spawn_subprocess(&self, command_list: &Vec<String>, label: Option<String>) {
-        *self.modifier_was_activated.lock().await = true;
-        crate::subprocess::run_command_binding(
-            &self.environment,
-            command_list,
-            label,
-            self.last_action.clone(),
-            self.state_write_tx.clone(),
-        ).await;
-    }
 
     /// Emit a single multi-touch frame for a trackpad to its virtual uinput device.
     /// `is_left`: true = lpad, false = rpad.
@@ -1689,16 +1600,6 @@ impl EventReader {
             }
         } // lock released here
         self.write_state().await;
-    }
-
-    async fn released_keys(&self, modifiers: &Vec<Event>, config: &Config) -> Vec<Key> {
-        let mut released_keys: Vec<Key> = Vec::new();
-        for (_key, hashmap) in config.bindings.remap.iter() {
-            if let Some(event_list) = hashmap.get(modifiers) {
-                released_keys.extend(event_list);
-            }
-        }
-        released_keys
     }
 
     /// The focused window, however this compositor reports one.
@@ -1903,49 +1804,22 @@ impl EventReader {
         event_state["sticks"]    = sticks;
         event_state["imu"]       = imu;
         event_state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
-        if analog_triggered {
-            // Analog events arrive at ~60 Hz; drop the update silently when the
-            // channel is full rather than blocking the event loop.
-            let _ = self.state_tx.try_send(StateCommand::SetEventState(Some(event_state)));
-        } else {
-            // Button / modifier / pause events must never be dropped — wait for
-            // the writer task to drain its queue before proceeding.
-            let _ = self.state_tx.send(StateCommand::SetEventState(Some(event_state))).await;
-        }
+        // Through the state port like everything else, carrying both the
+        // snapshot and how urgently it is meant: an analog tick at 60 Hz is
+        // dropped rather than allowed to hold up the event loop, a button or a
+        // pause must never be lost.
+        self.outputs.dispatch(&[crate::output::action::OutputAction::State(
+            crate::output::action::StateAction::Publish {
+                snapshot: Box::new(event_state),
+                urgency: if analog_triggered {
+                    crate::output::action::Urgency::Analog
+                } else {
+                    crate::output::action::Urgency::Immediate
+                },
+            },
+        )]).await;
     }
 
-    /// Record the actual emitted key output for the HUD last-event display.
-    /// Called at the emission site (not at input time) so the action reflects
-    /// what was truly sent to the virtual device.
-    async fn set_last_emitted(&self, trigger: &Event, emitted: &[Key], value: i32, is_combo: bool, label: Option<String>, silent: bool) {
-        // A hint relabels a press that resolves through the base binding, so it
-        // is never a combo and carries no label of its own — `label` is None and
-        // the toast stayed empty. The hint's text is the only thing that says
-        // what the press did, so it is what gets announced. Read-only: the
-        // resolution and the emitted keys are already decided and untouched.
-        //
-        // Only hints are added here. A plain base binding still announces
-        // nothing even when it has a label, because every button press would
-        // otherwise raise a toast.
-        let hint = if value == 1 && !is_combo {
-            self.hint_label(trigger).await
-        } else {
-            None
-        };
-        if value == 1 && (is_combo || hint.is_some()) {
-            let mut la = self.last_action.lock().await;
-            *la = Some(LastAction {
-                r#type: "keys".to_string(),
-                value: serde_json::json!(
-                    emitted.iter().map(|k| format!("{:?}", k)).collect::<Vec<_>>()
-                ),
-                ts: crate::state_export::now_ts(),
-                label: if is_combo { label } else { hint },
-                silent,
-            });
-        }
-        self.write_state().await;
-    }
 
     /// The hint `trigger` carries under the buttons held right now.
     ///
@@ -1973,20 +1847,6 @@ impl EventReader {
         }
     }
 
-    /// Record a spawned command as the last emitted action.
-    async fn set_last_emitted_cmd(&self, _trigger: &Event, commands: &[String], label: Option<String>, silent: bool) {
-        {
-            let mut la = self.last_action.lock().await;
-            *la = Some(LastAction {
-                r#type: "command".to_string(),
-                value: serde_json::Value::String(commands.join(" ")),
-                ts: crate::state_export::now_ts(),
-                label,
-                silent,
-            });
-        }
-        self.write_state().await;
-    }
 
     async fn ipc_command_loop(&self, mut rx: broadcast::Receiver<String>) {
         loop {
@@ -2123,20 +1983,13 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
-                                let (x_coord, y_coord) = if self.settings.invert_cursor_axis {
-                                    (-stick_position[0], -stick_position[1])
-                                } else {
-                                    (stick_position[0], stick_position[1])
-                                };
-                                let virtual_event_x: InputEvent =
-                                    InputEvent::new_now(EventType::RELATIVE, 0, x_coord);
-                                let virtual_event_y: InputEvent =
-                                    InputEvent::new_now(EventType::RELATIVE, 1, y_coord);
-                                let mut virt_dev = self.virt_dev.lock().await;
-                                virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                                virt_dev.axis.emit(&[virtual_event_y]).unwrap();
-                            }
+                            let active = crate::machine::stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                            self.apply_frames(&crate::machine::plan_stick_tick(
+                                crate::machine::CURSOR_AXES,
+                                (stick_position[0], stick_position[1]),
+                                self.settings.invert_cursor_axis,
+                                &activation_modifiers, &modifiers, active,
+                            )).await;
                         }
                     }
                 }
@@ -2177,20 +2030,13 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
-                                let (x_coord, y_coord) = if self.settings.invert_scroll_axis {
-                                    (-stick_position[0], -stick_position[1])
-                                } else {
-                                    (stick_position[0], stick_position[1])
-                                };
-                                let virtual_event_x: InputEvent =
-                                    InputEvent::new_now(EventType::RELATIVE, 12, x_coord);
-                                let virtual_event_y: InputEvent =
-                                    InputEvent::new_now(EventType::RELATIVE, 11, y_coord);
-                                let mut virt_dev = self.virt_dev.lock().await;
-                                virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                                virt_dev.axis.emit(&[virtual_event_y]).unwrap();
-                            }
+                            let active = crate::machine::stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                            self.apply_frames(&crate::machine::plan_stick_tick(
+                                crate::machine::SCROLL_AXES,
+                                (stick_position[0], stick_position[1]),
+                                self.settings.invert_scroll_axis,
+                                &activation_modifiers, &modifiers, active,
+                            )).await;
                         }
                     }
                 }
@@ -2218,34 +2064,16 @@ impl EventReader {
         while *self.device_is_connected.lock().await {
             {
                 let cursor_movement = self.cursor_movement.lock().await;
-                if *cursor_movement == (0, 0) {
-                    current_speed = 0.0
-                } else {
-                    current_speed += speed as f32 * acceleration / 10.0;
-                    if current_speed > speed as f32 {
-                        current_speed = speed as f32
-                    }
-                    if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
-                        if cursor_movement.0 != 0 {
-                            let mut virt_dev = self.virt_dev.lock().await;
-                            let virtual_event_x: InputEvent = InputEvent::new_now(
-                                EventType::RELATIVE,
-                                0,
-                                cursor_movement.0 * current_speed as i32,
-                            );
-                            virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                        }
-                        if cursor_movement.1 != 0 {
-                            let mut virt_dev = self.virt_dev.lock().await;
-                            let virtual_event_y: InputEvent = InputEvent::new_now(
-                                EventType::RELATIVE,
-                                1,
-                                cursor_movement.1 * current_speed as i32,
-                            );
-                            virt_dev.axis.emit(&[virtual_event_y]).unwrap();
-                        }
-                    }
-                }
+                let active = crate::machine::stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                // The ramp is part of the decision, so the plan advances it and
+                // hands back the new value — including the collapse to nothing
+                // when no direction is held.
+                let (frames, next_speed) = crate::machine::plan_key_tick(
+                    crate::machine::CURSOR_AXES, *cursor_movement,
+                    speed, acceleration, current_speed, active,
+                );
+                current_speed = next_speed;
+                self.apply_frames(&frames).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -2268,82 +2096,25 @@ impl EventReader {
         while *self.device_is_connected.lock().await {
             {
                 let scroll_movement = self.scroll_movement.lock().await;
-                if *scroll_movement == (0, 0) {
-                    current_speed = 0.0
-                } else {
-                    current_speed += speed as f32 * acceleration / 10.0;
-                    if current_speed > speed as f32 {
-                        current_speed = speed as f32
-                    }
-                    if stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await) {
-                        let mut virt_dev = self.virt_dev.lock().await;
-                        if scroll_movement.0 != 0 {
-                            let virtual_event_x: InputEvent = InputEvent::new_now(
-                                EventType::RELATIVE,
-                                12,
-                                scroll_movement.0 * current_speed as i32,
-                            );
-                            virt_dev.axis.emit(&[virtual_event_x]).unwrap();
-                        }
-                        if scroll_movement.1 != 0 {
-                            let virtual_event_y: InputEvent = InputEvent::new_now(
-                                EventType::RELATIVE,
-                                11,
-                                scroll_movement.1 * current_speed as i32,
-                            );
-                            virt_dev.axis.emit(&[virtual_event_y]).unwrap();
-                        }
-                    }
-                }
+                let active = crate::machine::stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                // The ramp is part of the decision, so the plan advances it and
+                // hands back the new value — including the collapse to nothing
+                // when no direction is held.
+                let (frames, next_speed) = crate::machine::plan_key_tick(
+                    crate::machine::SCROLL_AXES, *scroll_movement,
+                    speed, acceleration, current_speed, active,
+                );
+                current_speed = next_speed;
+                self.apply_frames(&frames).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 }
 
-// ── Pure guard helpers ────────────────────────────────────────────────────────
-//
-// These three predicates encode the key Gaming Mode invariants. Extracted from
-// the method bodies so they can be unit-tested in isolation without needing a
-// full EventReader — the caller logic in convert_event and the stick loops uses
-// these directly.
-
-/// Returns true if this event should be **suppressed** by the Gaming Mode guard.
-///
-/// Key-up events (`value == 0`) always return `false` — they must pass through
-/// the guard so `held_keys`/`emitted_outputs` are flushed and no keys remain
-/// stuck after Gaming Mode is enabled mid-hold.
-/// Bindings with `while_gaming = true` are also not suppressed (`is_while_gaming` true).
-#[inline]
-pub(crate) fn gaming_mode_suppresses(value: i32, is_while_gaming: bool) -> bool {
-    !is_while_gaming && value != 0
-}
-
-/// Returns true if a button pressed in Gaming Mode should still be **tracked as
-/// a modifier** (via `toggle_modifiers`) rather than silently dropped.
-///
-/// Modifier buttons (BTN_TL, BTN_MODE, …) are tracked even while Gaming Mode is
-/// active so that internal combo state remains consistent: if Gaming Mode is
-/// disabled mid-hold, the resolver immediately sees the correct modifier set
-/// without waiting for the user to re-press the modifier.
-#[inline]
-pub(crate) fn gaming_mode_tracks_modifier(event: &Event, mapped_modifiers: &[Event]) -> bool {
-    mapped_modifiers.contains(event)
-}
-
-/// Returns true if the stick cursor/scroll loop should emit movement events this
-/// tick.
-///
-/// Movement is suppressed when makima is paused (unless `cursor_when_paused`
-/// overrides this) **and** when Gaming Mode is active — in Gaming Mode the
-/// game reads the stick directly via Steam Input and makima must not
-/// simultaneously drive the desktop cursor.
-#[inline]
-pub(crate) fn stick_loop_active(paused: bool, cursor_when_paused: bool, gaming_mode: bool) -> bool {
-    (!paused || cursor_when_paused) && !gaming_mode
-}
-
-
-#[cfg(test)]
-#[path = "event_reader_tests.rs"]
-mod tests;
+// No test module. What was testable here lives in `machine.rs` now, and what
+// was left were five tests that built a local HashMap, inserted, removed and
+// asserted HashMap semantics — no production code in any of them. The behaviour
+// they meant to pin, that a release clears what its press emitted even when a
+// combo overwrote it mid-hold, is covered by `machine::releases_emitted` and
+// the key-up frames it produces.

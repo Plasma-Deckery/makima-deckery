@@ -11,7 +11,9 @@ mod kde_input_defaults;
 mod resume_watcher;
 mod steam_detector;
 mod subprocess;
+mod machine;
 mod mt_trackpad;
+mod output;
 mod preferences;
 mod resolver;
 mod scroll_pad;
@@ -42,6 +44,14 @@ static START: OnceLock<Instant> = OnceLock::new();
 /// Milliseconds elapsed since process start, for startup-profiling log lines.
 pub fn startup_ms() -> u128 {
     START.get().map(|s| s.elapsed().as_millis()).unwrap_or(0)
+}
+
+/// Microseconds elapsed since process start.
+///
+/// Same clock as `startup_ms` and as `trace_record`'s `t_us`, so a recorded
+/// input trace and a recorded action journal can be laid over each other.
+pub fn startup_us() -> u128 {
+    START.get().map(|s| s.elapsed().as_micros()).unwrap_or(0)
 }
 
 fn wait_for_config_dir(path: &std::path::Path) {
