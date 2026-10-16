@@ -871,3 +871,93 @@ fn stick_loop_suppressed_when_both_paused_and_gaming_mode() {
     assert!(!stick_loop_active(true, false, true));
     assert!(!stick_loop_active(true, true, true));
 }
+
+// ── decoding a stick ──────────────────────────────────────────────────────
+
+fn axes(events: &[(Axis, i32)]) -> Vec<(Axis, i32)> {
+    events.to_vec()
+}
+
+/// Pushing into a direction fires once, and pushing further fires nothing —
+/// events are transitions, not states.
+#[test]
+fn a_stick_fires_once_per_direction() {
+    let (events, values) = decode_stick_bind(Stick::Left, false, -1, (0, 0));
+    assert_eq!(axes(&events), vec![(Axis::LSTICK_UP, 1)]);
+    assert_eq!(values, (0, -1));
+
+    let (again, values) = decode_stick_bind(Stick::Left, false, -1, values);
+    assert!(again.is_empty(), "pushing further in the same direction fired again");
+    assert_eq!(values, (0, -1));
+}
+
+/// Returning to centre releases whichever direction was held — and only that
+/// one, not both ends of the axis.
+#[test]
+fn returning_to_centre_releases_what_was_held() {
+    let (events, values) = decode_stick_bind(Stick::Left, false, 0, (0, -1));
+    assert_eq!(axes(&events), vec![(Axis::LSTICK_UP, 0)]);
+    assert_eq!(values, (0, 0));
+
+    let (events, _) = decode_stick_bind(Stick::Left, false, 0, (0, 1));
+    assert_eq!(axes(&events), vec![(Axis::LSTICK_DOWN, 0)]);
+}
+
+/// Up is negative Y, because evdev counts downward. This is the one thing a
+/// reader is likely to expect the other way round.
+#[test]
+fn up_is_negative_y() {
+    let (up, _) = decode_stick_bind(Stick::Left, false, -1, (0, 0));
+    let (down, _) = decode_stick_bind(Stick::Left, false, 1, (0, 0));
+    assert_eq!(axes(&up), vec![(Axis::LSTICK_UP, 1)]);
+    assert_eq!(axes(&down), vec![(Axis::LSTICK_DOWN, 1)]);
+}
+
+/// The two axes of one stick are tracked independently: holding up and then
+/// pushing left must not release up.
+#[test]
+fn the_two_axes_do_not_interfere() {
+    let (_, values) = decode_stick_bind(Stick::Left, false, -1, (0, 0));
+    let (events, values) = decode_stick_bind(Stick::Left, true, -1, values);
+
+    assert_eq!(axes(&events), vec![(Axis::LSTICK_LEFT, 1)]);
+    assert_eq!(values, (-1, -1), "both directions are held at once");
+}
+
+/// The right stick is the same decision with different names, which is the
+/// whole reason one function replaced two arms.
+#[test]
+fn the_right_stick_names_its_own_directions() {
+    let (y, _) = decode_stick_bind(Stick::Right, false, -1, (0, 0));
+    let (x, _) = decode_stick_bind(Stick::Right, true, 1, (0, 0));
+    assert_eq!(axes(&y), vec![(Axis::RSTICK_UP, 1)]);
+    assert_eq!(axes(&x), vec![(Axis::RSTICK_RIGHT, 1)]);
+}
+
+/// The axis codes the sides answer to: 0/1 for the left stick, 3/4 for the
+/// right. Getting this wrong would route X to Y.
+#[test]
+fn the_sides_answer_to_their_own_codes() {
+    assert_eq!(Stick::Left.base_code(), 0);
+    assert_eq!(Stick::Right.base_code(), 3);
+}
+
+/// The deadzone swallows small movement entirely, and the scaling is what the
+/// reader's own method did — it awaited nothing and read one setting.
+#[test]
+fn the_deadzone_swallows_small_movement() {
+    assert_eq!(axis_value(0, 10, true), 0, "dead centre");
+    assert_eq!(axis_value(1500, 10, true), 0, "inside a deadzone of 10");
+    assert_eq!(axis_value(-1500, 10, true), 0);
+    assert!(axis_value(20000, 10, true) > 0, "outside it");
+    assert!(axis_value(-20000, 10, true) < 0);
+}
+
+/// An 8-bit stick is centred at 128 rather than 0, so the same raw number means
+/// opposite things depending on the setting.
+#[test]
+fn eight_bit_sticks_are_centred_at_128() {
+    assert_eq!(axis_value(128, 0, false), 0, "128 is centre on an 8-bit axis");
+    assert!(axis_value(255, 0, false) > 0);
+    assert!(axis_value(0, 0, false) < 0);
+}

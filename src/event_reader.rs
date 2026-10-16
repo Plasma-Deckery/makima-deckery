@@ -709,470 +709,121 @@ impl EventReader {
                 (
                     EventType::ABSOLUTE,
                     _,
-                    AbsoluteAxisType::ABS_X | AbsoluteAxisType::ABS_Y,
+                    AbsoluteAxisType::ABS_X
+                    | AbsoluteAxisType::ABS_Y
+                    | AbsoluteAxisType::ABS_RX
+                    | AbsoluteAxisType::ABS_RY,
                     false,
                 ) => {
-                    // Always store raw hardware value for state export, regardless of mode.
+                    // One arm for both sticks. It used to be two of 140 lines
+                    // each that differed only in the axis offset, the `Axis`
+                    // variants they named, and whether a guard sat in the
+                    // pattern or inside the arm — copy-paste twins with no
+                    // behavioural difference between them.
+                    let (stick, settings, position, raw_cell, values) =
+                        if event.code() < 3 {
+                            (crate::machine::Stick::Left, &self.settings.lstick,
+                             &self.lstick_position, &self.lstick_raw, &mut lstick_values)
+                        } else {
+                            (crate::machine::Stick::Right, &self.settings.rstick,
+                             &self.rstick_position, &self.rstick_raw, &mut rstick_values)
+                        };
+                    let is_x = event.code() == stick.base_code();
+
+                    // The raw value is recorded whatever the stick is for, so the
+                    // overlay can draw it even when nothing is bound.
                     {
                         let raw = event.value() as i32;
-                        let mut lr = self.lstick_raw.lock().await;
-                        if event.code() == 0 { lr.0 = raw; } else { lr.1 = raw; }
-                        lstick_dirty = true;
-                    }
-                    match self.settings.lstick.function.as_str() {
-                    "cursor" | "scroll" => {
-                        let axis_value = self
-                            .get_axis_value(&event, &self.settings.lstick.deadzone)
-                            .await;
-                        let mut lstick_position = self.lstick_position.lock().await;
-                        lstick_position[event.code() as usize] = axis_value;
-                    }
-                    "bind" => {
-                        let axis_value = self
-                            .get_axis_value(&event, &self.settings.lstick.deadzone)
-                            .await;
-                        let clamped_value = if axis_value < 0 {
-                            -1
-                        } else if axis_value > 0 {
-                            1
+                        let mut cell = raw_cell.lock().await;
+                        if is_x { cell.0 = raw; } else { cell.1 = raw; }
+                        if stick == crate::machine::Stick::Left {
+                            lstick_dirty = true;
                         } else {
-                            0
-                        };
-                        match AbsoluteAxisType(event.code()) {
-                            AbsoluteAxisType::ABS_Y => match clamped_value {
-                                -1 if lstick_values.1 != -1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::LSTICK_UP),
-                                        1,
-                                        false,
-                                    )
-                                    .await;
-                                    lstick_values.1 = -1
-                                }
-                                1 if lstick_values.1 != 1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::LSTICK_DOWN),
-                                        1,
-                                        false,
-                                    )
-                                    .await;
-                                    lstick_values.1 = 1
-                                }
-                                0 => {
-                                    if lstick_values.1 != 0 {
-                                        match lstick_values.1 {
-                                            -1 => {
-                                                self.convert_event(
-                                                    event,
-                                                    Event::Axis(Axis::LSTICK_UP),
-                                                    0,
-                                                    false,
-                                                )
-                                                .await
-                                            }
-                                            1 => {
-                                                self.convert_event(
-                                                    event,
-                                                    Event::Axis(Axis::LSTICK_DOWN),
-                                                    0,
-                                                    false,
-                                                )
-                                                .await
-                                            }
-                                            _ => {}
-                                        }
-                                        lstick_values.1 = 0;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            AbsoluteAxisType::ABS_X => match clamped_value {
-                                -1 if lstick_values.0 != -1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::LSTICK_LEFT),
-                                        1,
-                                        false,
-                                    )
-                                    .await;
-                                    lstick_values.0 = -1
-                                }
-                                1 => {
-                                    if lstick_values.0 != 1 {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::LSTICK_RIGHT),
-                                            1,
-                                            false,
-                                        )
-                                        .await;
-                                        lstick_values.0 = 1
-                                    }
-                                }
-                                0 => {
-                                    if lstick_values.0 != 0 {
-                                        match lstick_values.0 {
-                                            -1 => {
-                                                self.convert_event(
-                                                    event,
-                                                    Event::Axis(Axis::LSTICK_LEFT),
-                                                    0,
-                                                    false,
-                                                )
-                                                .await
-                                            }
-                                            1 => {
-                                                self.convert_event(
-                                                    event,
-                                                    Event::Axis(Axis::LSTICK_RIGHT),
-                                                    0,
-                                                    false,
-                                                )
-                                                .await
-                                            }
-                                            _ => {}
-                                        }
-                                        lstick_values.0 = 0;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            _ => {}
+                            rstick_dirty = true;
                         }
                     }
-                    _ => {}
-                    } // end match lstick function
-                },
+
+                    let value = crate::machine::axis_value(
+                        event.value() as i32, settings.deadzone, self.settings.axis_16_bit,
+                    );
+                    match settings.function.as_str() {
+                        "cursor" | "scroll" => {
+                            position.lock().await[(event.code() - stick.base_code()) as usize]
+                                = value;
+                        }
+                        "bind" => {
+                            let clamped = value.signum();
+                            let (events, next) =
+                                crate::machine::decode_stick_bind(stick, is_x, clamped, *values);
+                            *values = next;
+                            for (axis, v) in events {
+                                self.convert_event(event, Event::Axis(axis), v, false).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 (
                     EventType::ABSOLUTE,
                     _,
-                    AbsoluteAxisType::ABS_RX | AbsoluteAxisType::ABS_RY,
+                    AbsoluteAxisType::ABS_Z | AbsoluteAxisType::ABS_RZ,
                     false,
                 ) => {
-                    // Always store raw hardware value for state export, regardless of mode.
-                    {
-                        let raw = event.value() as i32;
-                        let mut rr = self.rstick_raw.lock().await;
-                        // ABS_RX = code 3, ABS_RY = code 4
-                        if event.code() == 3 { rr.0 = raw; } else { rr.1 = raw; }
-                        rstick_dirty = true;
-                    }
-                    match self.settings.rstick.function.as_str() {
-                    "cursor" | "scroll" => {
-                        let axis_value = self
-                            .get_axis_value(&event, &self.settings.rstick.deadzone)
-                            .await;
-                        let mut rstick_position = self.rstick_position.lock().await;
-                        rstick_position[event.code() as usize - 3] = axis_value;
-                    }
-                    "bind" => {
-                        let axis_value = self
-                            .get_axis_value(&event, &self.settings.rstick.deadzone)
-                            .await;
-                        let clamped_value = if axis_value < 0 {
-                            -1
-                        } else if axis_value > 0 {
-                            1
-                        } else {
-                            0
+                    // One arm for both triggers, and the same for the Stadia
+                    // case, where these two axes *are* the right stick. That
+                    // second half used to be a third copy of the stick bind
+                    // logic, after the two in the stick arms.
+                    let is_left = event.code() == AbsoluteAxisType::ABS_Z.0;
+                    if !self.settings.stadia {
+                        // A trigger is a button with a travel: it fires once on
+                        // the way in and once on the way back to rest.
+                        let held = if is_left { triggers_values.0 } else { triggers_values.1 };
+                        let axis = if is_left { Axis::ABS_Z } else { Axis::ABS_RZ };
+                        let next = match (event.value(), held) {
+                            (0, 1) => {
+                                self.convert_event(event, Event::Axis(axis), 0, false).await;
+                                Some(0)
+                            }
+                            (_, 0) => {
+                                self.convert_event(event, Event::Axis(axis), 1, false).await;
+                                Some(1)
+                            }
+                            _ => None,
                         };
-                        match AbsoluteAxisType(event.code()) {
-                            AbsoluteAxisType::ABS_RY => match clamped_value {
-                                -1 => {
-                                    if rstick_values.1 != -1 {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::RSTICK_UP),
-                                            1,
-                                            false,
-                                        )
-                                        .await;
-                                        rstick_values.1 = -1
-                                    }
-                                }
-                                1 => {
-                                    if rstick_values.1 != 1 {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::RSTICK_DOWN),
-                                            1,
-                                            false,
-                                        )
-                                        .await;
-                                        rstick_values.1 = 1
-                                    }
-                                }
-                                0 => {
-                                    if rstick_values.1 != 0 {
-                                        match rstick_values.1 {
-                                            -1 => {
-                                                self.convert_event(
-                                                    event,
-                                                    Event::Axis(Axis::RSTICK_UP),
-                                                    0,
-                                                    false,
-                                                )
-                                                .await
-                                            }
-                                            1 => {
-                                                self.convert_event(
-                                                    event,
-                                                    Event::Axis(Axis::RSTICK_DOWN),
-                                                    0,
-                                                    false,
-                                                )
-                                                .await
-                                            }
-                                            _ => {}
-                                        }
-                                        rstick_values.1 = 0;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            AbsoluteAxisType::ABS_RX => match clamped_value {
-                                -1 if rstick_values.0 != -1 => {
-                                    self.convert_event(
-                                        event,
-                                        Event::Axis(Axis::RSTICK_LEFT),
-                                        1,
-                                        false,
-                                    )
-                                    .await;
-                                    rstick_values.0 = -1
-                                }
-                                1 => {
-                                    if rstick_values.0 != 1 {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::RSTICK_RIGHT),
-                                            1,
-                                            false,
-                                        )
-                                        .await;
-                                        rstick_values.0 = 1
-                                    }
-                                }
-                                0 => {
-                                    if rstick_values.0 != 0 {
-                                        match rstick_values.0 {
-                                            -1 => {
-                                                self.convert_event(
-                                                    event,
-                                                    Event::Axis(Axis::RSTICK_LEFT),
-                                                    0,
-                                                    false,
-                                                )
-                                                .await
-                                            }
-                                            1 => {
-                                                self.convert_event(
-                                                    event,
-                                                    Event::Axis(Axis::RSTICK_RIGHT),
-                                                    0,
-                                                    false,
-                                                )
-                                                .await
-                                            }
-                                            _ => {}
-                                        }
-                                        rstick_values.0 = 0;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                    } // end match rstick function
-                },
-                (EventType::ABSOLUTE, _, AbsoluteAxisType::ABS_Z, false) => {
-                    if !self.settings.stadia {
-                        match (event.value(), triggers_values.0) {
-                            (0, 1) => {
-                                self.convert_event(event, Event::Axis(Axis::ABS_Z), 0, false)
-                                    .await;
-                                triggers_values.0 = 0;
-                            }
-                            (_, 0) => {
-                                self.convert_event(event, Event::Axis(Axis::ABS_Z), 1, false)
-                                    .await;
-                                triggers_values.0 = 1;
-                            }
-                            _ => {}
+                        if let Some(next) = next {
+                            if is_left { triggers_values.0 = next } else { triggers_values.1 = next }
                         }
                     } else {
+                        // On a Stadia controller these are the right stick's
+                        // axes, so the same decision applies as for a stick.
+                        let value = crate::machine::axis_value(
+                            event.value() as i32,
+                            self.settings.rstick.deadzone,
+                            self.settings.axis_16_bit,
+                        );
                         match self.settings.rstick.function.as_str() {
                             "cursor" | "scroll" => {
-                                let axis_value = self
-                                    .get_axis_value(&event, &self.settings.rstick.deadzone)
-                                    .await;
-                                let mut rstick_position = self.rstick_position.lock().await;
-                                rstick_position[0] = axis_value;
+                                self.rstick_position.lock().await[if is_left { 0 } else { 1 }]
+                                    = value;
                             }
                             "bind" => {
-                                let axis_value = self
-                                    .get_axis_value(&event, &self.settings.rstick.deadzone)
-                                    .await;
-                                let clamped_value = if axis_value < 0 {
-                                    -1
-                                } else if axis_value > 0 {
-                                    1
-                                } else {
-                                    0
-                                };
-                                match clamped_value {
-                                    -1 if rstick_values.0 != -1 => {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::RSTICK_LEFT),
-                                            1,
-                                            false,
-                                        )
-                                        .await;
-                                        rstick_values.0 = -1
-                                    }
-                                    1 => {
-                                        if rstick_values.0 != 1 {
-                                            self.convert_event(
-                                                event,
-                                                Event::Axis(Axis::RSTICK_RIGHT),
-                                                1,
-                                                false,
-                                            )
-                                            .await;
-                                            rstick_values.0 = 1
-                                        }
-                                    }
-                                    0 => {
-                                        if rstick_values.0 != 0 {
-                                            match rstick_values.0 {
-                                                -1 => {
-                                                    self.convert_event(
-                                                        event,
-                                                        Event::Axis(Axis::RSTICK_LEFT),
-                                                        0,
-                                                        false,
-                                                    )
-                                                    .await
-                                                }
-                                                1 => {
-                                                    self.convert_event(
-                                                        event,
-                                                        Event::Axis(Axis::RSTICK_RIGHT),
-                                                        0,
-                                                        false,
-                                                    )
-                                                    .await
-                                                }
-                                                _ => {}
-                                            }
-                                            rstick_values.0 = 0;
-                                        }
-                                    }
-                                    _ => {}
+                                let (events, next) = crate::machine::decode_stick_bind(
+                                    crate::machine::Stick::Right,
+                                    is_left,
+                                    value.signum(),
+                                    rstick_values,
+                                );
+                                rstick_values = next;
+                                for (axis, v) in events {
+                                    self.convert_event(event, Event::Axis(axis), v, false).await;
                                 }
                             }
                             _ => {}
                         }
                     }
                 }
-                (EventType::ABSOLUTE, _, AbsoluteAxisType::ABS_RZ, false) => {
-                    if !self.settings.stadia {
-                        match (event.value(), triggers_values.1) {
-                            (0, 1) => {
-                                self.convert_event(event, Event::Axis(Axis::ABS_RZ), 0, false)
-                                    .await;
-                                triggers_values.1 = 0;
-                            }
-                            (_, 0) => {
-                                self.convert_event(event, Event::Axis(Axis::ABS_RZ), 1, false)
-                                    .await;
-                                triggers_values.1 = 1;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match self.settings.rstick.function.as_str() {
-                            "cursor" | "scroll" => {
-                                let axis_value = self
-                                    .get_axis_value(&event, &self.settings.rstick.deadzone)
-                                    .await;
-                                let mut rstick_position = self.rstick_position.lock().await;
-                                rstick_position[1] = axis_value;
-                            }
-                            "bind" => {
-                                let axis_value = self
-                                    .get_axis_value(&event, &self.settings.rstick.deadzone)
-                                    .await;
-                                let clamped_value = if axis_value < 0 {
-                                    -1
-                                } else if axis_value > 0 {
-                                    1
-                                } else {
-                                    0
-                                };
-                                match clamped_value {
-                                    -1 => {
-                                        if rstick_values.1 != -1 {
-                                            self.convert_event(
-                                                event,
-                                                Event::Axis(Axis::RSTICK_UP),
-                                                1,
-                                                false,
-                                            )
-                                            .await;
-                                            rstick_values.1 = -1
-                                        }
-                                    }
-                                    1 => {
-                                        if rstick_values.1 != 1 {
-                                            self.convert_event(
-                                                event,
-                                                Event::Axis(Axis::RSTICK_DOWN),
-                                                1,
-                                                false,
-                                            )
-                                            .await;
-                                            rstick_values.1 = 1
-                                        }
-                                    }
-                                    0 => {
-                                        if rstick_values.1 != 0 {
-                                            match rstick_values.1 {
-                                                -1 => {
-                                                    self.convert_event(
-                                                        event,
-                                                        Event::Axis(Axis::RSTICK_UP),
-                                                        0,
-                                                        false,
-                                                    )
-                                                    .await
-                                                }
-                                                1 => {
-                                                    self.convert_event(
-                                                        event,
-                                                        Event::Axis(Axis::RSTICK_DOWN),
-                                                        0,
-                                                        false,
-                                                    )
-                                                    .await
-                                                }
-                                                _ => {}
-                                            }
-                                            rstick_values.1 = 0;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+
                 (EventType::MISC, _, _, true) => {
                     if evdev::MiscType(event.code()) == evdev::MiscType::MSC_SERIAL {
                         pen_events.push(event);
@@ -1566,23 +1217,6 @@ impl EventReader {
     }
 
 
-    /// Emit a single multi-touch frame for a trackpad to its virtual uinput device.
-    /// `is_left`: true = lpad, false = rpad.
-    /// `x, y`: raw coordinates (0,0 means finger lifted).
-    /// `click`: physical press state (BTN_LEFT).
-    /// Emit a two-finger frame to the gesture pad device.
-    /// Left pad → slot 0, right pad → slot 1.
-    async fn get_axis_value(&self, event: &InputEvent, deadzone: &i32) -> i32 {
-        let distance_from_center: i32 = match self.settings.axis_16_bit {
-            false => (event.value() as i32 - 128) * 200,
-            _ => event.value() as i32,
-        };
-        if distance_from_center.abs() <= deadzone * 200 {
-            0
-        } else {
-            (distance_from_center + 2000 - 1) / 2000
-        }
-    }
 
     async fn toggle_modifiers(&self, modifier: Event, value: i32, config: &Config) {
         {

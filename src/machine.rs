@@ -22,7 +22,7 @@
 //! frames rather than by events, and converting it is a separate refactor with
 //! its own justification rather than a remainder of this one.
 
-use crate::config::{Config, Event};
+use crate::config::{Axis, Config, Event};
 use crate::output::action::{
     Ev, InternalCommand, LastActionSpec, OutputAction, OutputDevice, Raw, StateAction,
 };
@@ -582,6 +582,105 @@ pub fn plan_key_tick(
         frames.push(axis_frame(axes.1, movement.1 * current_speed as i32));
     }
     (frames, current_speed)
+}
+
+// ── Decoding raw hardware into events ────────────────────────────────────────
+//
+// `event_loop` is 744 lines, and not because the decoding is complicated: the
+// left stick and the right stick are written twice, and so are the two
+// triggers. Normalised, the two stick arms differ in three things — the axis
+// code offset, which `Axis` variants they name, and whether a guard sits in the
+// pattern or inside the arm. No behavioural difference at all. These twins are
+// where the bulk is.
+
+/// Which stick, and everything that follows from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stick {
+    Left,
+    Right,
+}
+
+impl Stick {
+    /// The evdev code of this stick's X axis; Y is the next one up.
+    ///
+    /// `ABS_X`/`ABS_Y` are 0 and 1, `ABS_RX`/`ABS_RY` are 3 and 4.
+    pub fn base_code(self) -> u16 {
+        match self {
+            Stick::Left => 0,
+            Stick::Right => 3,
+        }
+    }
+
+    /// The directional event for one axis and one sign.
+    ///
+    /// Up is negative Y, because evdev counts downward — which is the one place
+    /// a reader of this is likely to expect the opposite.
+    fn direction(self, is_x: bool, sign: i32) -> Option<Axis> {
+        Some(match (self, is_x, sign) {
+            (Stick::Left, false, -1) => Axis::LSTICK_UP,
+            (Stick::Left, false, 1) => Axis::LSTICK_DOWN,
+            (Stick::Left, true, -1) => Axis::LSTICK_LEFT,
+            (Stick::Left, true, 1) => Axis::LSTICK_RIGHT,
+            (Stick::Right, false, -1) => Axis::RSTICK_UP,
+            (Stick::Right, false, 1) => Axis::RSTICK_DOWN,
+            (Stick::Right, true, -1) => Axis::RSTICK_LEFT,
+            (Stick::Right, true, 1) => Axis::RSTICK_RIGHT,
+            _ => return None,
+        })
+    }
+}
+
+/// The deadzoned, scaled value of one axis.
+///
+/// Was an `async fn` on the reader that awaited nothing and read one setting.
+pub fn axis_value(raw: i32, deadzone: i32, axis_16_bit: bool) -> i32 {
+    let distance_from_center = if axis_16_bit { raw } else { (raw - 128) * 200 };
+    if distance_from_center.abs() <= deadzone * 200 {
+        0
+    } else {
+        (distance_from_center + 2000 - 1) / 2000
+    }
+}
+
+/// What a stick movement means when the stick is bound to directions.
+///
+/// Events fire on *transitions* only: pushing further in a direction already
+/// held sends nothing, and returning to centre releases whichever direction was
+/// held. That is why the previous clamped value has to come in and the new one
+/// has to come out.
+pub fn decode_stick_bind(
+    stick: Stick,
+    is_x: bool,
+    clamped: i32,
+    values: (i32, i32),
+) -> (Vec<(Axis, i32)>, (i32, i32)) {
+    let mut events = Vec::new();
+    let mut values = values;
+    let held = if is_x { values.0 } else { values.1 };
+
+    if clamped == held {
+        return (events, values);
+    }
+    match clamped {
+        -1 | 1 => {
+            if let Some(axis) = stick.direction(is_x, clamped) {
+                events.push((axis, 1));
+            }
+        }
+        0 => {
+            // Releasing whichever direction was held, not both.
+            if let Some(axis) = stick.direction(is_x, held) {
+                events.push((axis, 0));
+            }
+        }
+        _ => return (events, values),
+    }
+    if is_x {
+        values.0 = clamped;
+    } else {
+        values.1 = clamped;
+    }
+    (events, values)
 }
 
 // ── Guards ────────────────────────────────────────────────────────────────────
