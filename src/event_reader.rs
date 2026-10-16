@@ -1481,11 +1481,17 @@ impl EventReader {
 
         let plan = {
             let mut modifier_was_activated = self.modifier_was_activated.lock().await;
-            let plan = crate::machine::plan_emit(
-                config, event_list, value, modifiers,
-                release_keys, ignore_modifiers, *modifier_was_activated,
-                paused, no_pause,
-            );
+            let plan = crate::machine::plan_emit(&crate::machine::EmitRequest {
+                config,
+                event_list,
+                value,
+                modifiers,
+                release_keys,
+                ignore_modifiers,
+                modifier_was_activated: *modifier_was_activated,
+                paused,
+                no_pause,
+            });
             *modifier_was_activated = plan.modifier_was_activated;
             plan
         };
@@ -1977,7 +1983,7 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                            let active = crate::machine::stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
                             self.apply_frames(&crate::machine::plan_stick_tick(
                                 crate::machine::CURSOR_AXES,
                                 (stick_position[0], stick_position[1]),
@@ -2024,7 +2030,7 @@ impl EventReader {
                     if stick_position[0] != 0 || stick_position[1] != 0 {
                         let modifiers = self.modifiers.lock().await;
                         if activation_modifiers.len() == 0 || activation_modifiers == *modifiers {
-                            let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                            let active = crate::machine::stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
                             self.apply_frames(&crate::machine::plan_stick_tick(
                                 crate::machine::SCROLL_AXES,
                                 (stick_position[0], stick_position[1]),
@@ -2058,7 +2064,7 @@ impl EventReader {
         while *self.device_is_connected.lock().await {
             {
                 let cursor_movement = self.cursor_movement.lock().await;
-                let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                let active = crate::machine::stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
                 // The ramp is part of the decision, so the plan advances it and
                 // hands back the new value — including the collapse to nothing
                 // when no direction is held.
@@ -2090,7 +2096,7 @@ impl EventReader {
         while *self.device_is_connected.lock().await {
             {
                 let scroll_movement = self.scroll_movement.lock().await;
-                let active = stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
+                let active = crate::machine::stick_loop_active(*self.paused.lock().await, self.settings.cursor_when_paused, *self.gaming_mode.lock().await);
                 // The ramp is part of the decision, so the plan advances it and
                 // hands back the new value — including the collapse to nothing
                 // when no direction is held.
@@ -2106,49 +2112,9 @@ impl EventReader {
     }
 }
 
-// ── Pure guard helpers ────────────────────────────────────────────────────────
-//
-// These three predicates encode the key Gaming Mode invariants. Extracted from
-// the method bodies so they can be unit-tested in isolation without needing a
-// full EventReader — the caller logic in convert_event and the stick loops uses
-// these directly.
-
-/// Returns true if this event should be **suppressed** by the Gaming Mode guard.
-///
-/// Key-up events (`value == 0`) always return `false` — they must pass through
-/// the guard so `held_keys`/`emitted_outputs` are flushed and no keys remain
-/// stuck after Gaming Mode is enabled mid-hold.
-/// Bindings with `while_gaming = true` are also not suppressed (`is_while_gaming` true).
-#[inline]
-pub(crate) fn gaming_mode_suppresses(value: i32, is_while_gaming: bool) -> bool {
-    !is_while_gaming && value != 0
-}
-
-/// Returns true if a button pressed in Gaming Mode should still be **tracked as
-/// a modifier** (via `toggle_modifiers`) rather than silently dropped.
-///
-/// Modifier buttons (BTN_TL, BTN_MODE, …) are tracked even while Gaming Mode is
-/// active so that internal combo state remains consistent: if Gaming Mode is
-/// disabled mid-hold, the resolver immediately sees the correct modifier set
-/// without waiting for the user to re-press the modifier.
-#[inline]
-pub(crate) fn gaming_mode_tracks_modifier(event: &Event, mapped_modifiers: &[Event]) -> bool {
-    mapped_modifiers.contains(event)
-}
-
-/// Returns true if the stick cursor/scroll loop should emit movement events this
-/// tick.
-///
-/// Movement is suppressed when makima is paused (unless `cursor_when_paused`
-/// overrides this) **and** when Gaming Mode is active — in Gaming Mode the
-/// game reads the stick directly via Steam Input and makima must not
-/// simultaneously drive the desktop cursor.
-#[inline]
-pub(crate) fn stick_loop_active(paused: bool, cursor_when_paused: bool, gaming_mode: bool) -> bool {
-    (!paused || cursor_when_paused) && !gaming_mode
-}
-
-
-#[cfg(test)]
-#[path = "event_reader_tests.rs"]
-mod tests;
+// No test module. What was testable here lives in `machine.rs` now, and what
+// was left were five tests that built a local HashMap, inserted, removed and
+// asserted HashMap semantics — no production code in any of them. The behaviour
+// they meant to pin, that a release clears what its press emitted even when a
+// combo overwrote it mid-hold, is covered by `machine::releases_emitted` and
+// the key-up frames it produces.

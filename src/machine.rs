@@ -17,11 +17,12 @@
 //! it — keeping a second implementation of every branch in order to check the
 //! first is only worth it until the check has passed.
 //!
-//! Still performed where it is decided, and so still untestable: `convert_event`
-//! itself, `emit_nonmapped_event`, and the trackpad path.
+//! One thing is still performed where it is decided, and so still untestable
+//! this way: the trackpad path. It is a producer of its own, driven by hidraw
+//! frames rather than by events, and converting it is a separate refactor with
+//! its own justification rather than a remainder of this one.
 
 use crate::config::{Config, Event};
-use crate::event_reader::{gaming_mode_suppresses, gaming_mode_tracks_modifier};
 use crate::output::action::{
     Ev, InternalCommand, LastActionSpec, OutputAction, OutputDevice, Raw, StateAction,
 };
@@ -87,22 +88,39 @@ pub fn fires_while_paused(paused: bool, no_pause: bool) -> bool {
     !paused || no_pause
 }
 
+/// Everything one `emit_event` is decided from.
+///
+/// A struct rather than nine positional arguments, and for the reason
+/// `DeviceSession` exists: six of these are booleans, and six booleans in a row
+/// is an invitation to pass them in the wrong order with nothing to notice it.
+pub struct EmitRequest<'a> {
+    pub config: &'a Config,
+    /// The output keys the binding resolved to.
+    pub event_list: &'a [Key],
+    pub value: i32,
+    pub modifiers: &'a [Event],
+    /// Release the held modifiers' output keys first. True for a base binding
+    /// with nothing held, false for a combo or a fallback, where they stay down.
+    pub release_keys: bool,
+    /// The combo consumed its modifier, so the modifier's own output goes down
+    /// before the combo's keys go out.
+    pub ignore_modifiers: bool,
+    pub modifier_was_activated: bool,
+    pub paused: bool,
+    /// The binding is exempt from pause.
+    pub no_pause: bool,
+}
+
 /// Decide what `emit_event` sends, without sending it.
 ///
 /// Mirrors the three branches of the existing function exactly, including the
 /// order the frames go out in — a plan that agreed about the set but not the
 /// sequence would be agreeing about something the kernel does not see.
-pub fn plan_emit(
-    config: &Config,
-    event_list: &[Key],
-    value: i32,
-    modifiers: &[Event],
-    release_keys: bool,
-    ignore_modifiers: bool,
-    modifier_was_activated: bool,
-    paused: bool,
-    no_pause: bool,
-) -> EmitPlan {
+pub fn plan_emit(req: &EmitRequest) -> EmitPlan {
+    let EmitRequest {
+        config, event_list, value, modifiers,
+        release_keys, ignore_modifiers, modifier_was_activated, paused, no_pause,
+    } = *req;
     let mut plan = EmitPlan {
         frames: Vec::new(),
         toggles: Vec::new(),
@@ -564,6 +582,51 @@ pub fn plan_key_tick(
         frames.push(axis_frame(axes.1, movement.1 * current_speed as i32));
     }
     (frames, current_speed)
+}
+
+// ── Guards ────────────────────────────────────────────────────────────────────
+//
+// The three predicates that encode the Gaming Mode invariants. They were the
+// first thing extracted from the reader for testability, long before the rest of
+// this module existed, and they stayed there afterwards — which left the pure
+// core importing from the impure orchestrator it is supposed to be independent
+// of. They are pure, the machine is where pure belongs, and that is the whole
+// reason they moved. (The same misplacement, for the same reason, is what
+// `session.rs` was created to undo for `Client`/`Server`/`Environment`.)
+
+/// Returns true if this event should be **suppressed** by the Gaming Mode guard.
+///
+/// Key-up events (`value == 0`) always return `false` — they must pass through
+/// the guard so `held_keys`/`emitted_outputs` are flushed and no keys remain
+/// stuck after Gaming Mode is enabled mid-hold.
+/// Bindings with `while_gaming = true` are also not suppressed (`is_while_gaming` true).
+#[inline]
+pub fn gaming_mode_suppresses(value: i32, is_while_gaming: bool) -> bool {
+    !is_while_gaming && value != 0
+}
+
+/// Returns true if a button pressed in Gaming Mode should still be **tracked as
+/// a modifier** (via `toggle_modifiers`) rather than silently dropped.
+///
+/// Modifier buttons (BTN_TL, BTN_MODE, …) are tracked even while Gaming Mode is
+/// active so that internal combo state remains consistent: if Gaming Mode is
+/// disabled mid-hold, the resolver immediately sees the correct modifier set
+/// without waiting for the user to re-press the modifier.
+#[inline]
+pub fn gaming_mode_tracks_modifier(event: &Event, mapped_modifiers: &[Event]) -> bool {
+    mapped_modifiers.contains(event)
+}
+
+/// Returns true if the stick cursor/scroll loop should emit movement events this
+/// tick.
+///
+/// Movement is suppressed when makima is paused (unless `cursor_when_paused`
+/// overrides this) **and** when Gaming Mode is active — in Gaming Mode the
+/// game reads the stick directly via Steam Input and makima must not
+/// simultaneously drive the desktop cursor.
+#[inline]
+pub fn stick_loop_active(paused: bool, cursor_when_paused: bool, gaming_mode: bool) -> bool {
+    (!paused || cursor_when_paused) && !gaming_mode
 }
 
 #[cfg(test)]

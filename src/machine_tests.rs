@@ -57,7 +57,17 @@ fn frames(plan: &EmitPlan) -> Vec<(u16, i32)> {
 #[test]
 fn a_plain_key_is_one_frame() {
     let config = make_config(vec![], vec![]);
-    let plan = plan_emit(&config, &[Key::KEY_A], 1, &[], true, false, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_A],
+        value: 1,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 1)]);
     assert!(plan.toggles.is_empty());
@@ -69,7 +79,17 @@ fn a_plain_key_is_one_frame() {
 #[test]
 fn each_key_is_its_own_frame_in_order() {
     let config = make_config(vec![], vec![]);
-    let plan = plan_emit(&config, &[Key::KEY_LEFTCTRL, Key::KEY_C], 1, &[], true, false, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_LEFTCTRL, Key::KEY_C],
+        value: 1,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     assert_eq!(
         frames(&plan),
@@ -84,7 +104,17 @@ fn each_key_is_its_own_frame_in_order() {
 #[test]
 fn an_unused_modifier_taps_on_release() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&config, &[Key::BTN_TL], 0, &[], true, false, false, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::BTN_TL],
+        value: 0,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: false,
+        paused: false,
+        no_pause: false,
+    });
 
     assert_eq!(
         frames(&plan),
@@ -99,7 +129,17 @@ fn an_unused_modifier_taps_on_release() {
 #[test]
 fn a_used_modifier_sends_nothing_on_release() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&config, &[Key::BTN_TL], 0, &[], true, false, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::BTN_TL],
+        value: 0,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     assert!(frames(&plan).is_empty());
 }
@@ -109,7 +149,17 @@ fn a_used_modifier_sends_nothing_on_release() {
 #[test]
 fn pressing_a_modifier_arms_it_without_sending() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&config, &[Key::BTN_TL], 1, &[], true, false, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::BTN_TL],
+        value: 1,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     assert!(frames(&plan).is_empty());
     assert!(!plan.modifier_was_activated);
@@ -124,7 +174,17 @@ fn ignore_modifiers_releases_the_output_key_not_the_input() {
         vec![(ev(Key::BTN_TL), vec![], vec![Key::KEY_LEFTCTRL])],
         vec![ev(Key::BTN_TL)],
     );
-    let plan = plan_emit(&config, &[Key::KEY_TAB], 1, &[ev(Key::BTN_TL)], false, true, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_TAB],
+        value: 1,
+        modifiers: &[ev(Key::BTN_TL)],
+        release_keys: false,
+        ignore_modifiers: true,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     assert_eq!(
         frames(&plan),
@@ -138,7 +198,17 @@ fn ignore_modifiers_releases_the_output_key_not_the_input() {
 #[test]
 fn ignore_modifiers_falls_back_to_the_modifier_code() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&config, &[Key::KEY_TAB], 1, &[ev(Key::BTN_TL)], false, true, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_TAB],
+        value: 1,
+        modifiers: &[ev(Key::BTN_TL)],
+        release_keys: false,
+        ignore_modifiers: true,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     assert_eq!(frames(&plan), vec![(Key::BTN_TL.code(), 0), (Key::KEY_TAB.code(), 1)]);
 }
@@ -152,7 +222,17 @@ fn nothing_is_released_when_no_modifier_is_held() {
         vec![(ev(Key::BTN_TR), vec![], vec![Key::KEY_LEFTSHIFT])],
         vec![ev(Key::BTN_TR)],
     );
-    let plan = plan_emit(&config, &[Key::KEY_X], 1, &[], true, false, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_X],
+        value: 1,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     assert_eq!(frames(&plan), vec![(Key::KEY_X.code(), 1)]);
 }
@@ -165,7 +245,17 @@ fn a_repeat_does_not_release_or_track() {
         vec![(ev(Key::BTN_TL), vec![], vec![Key::KEY_LEFTCTRL])],
         vec![ev(Key::BTN_TL)],
     );
-    let plan = plan_emit(&config, &[Key::KEY_A], 2, &[ev(Key::BTN_TL)], true, false, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_A],
+        value: 2,
+        modifiers: &[ev(Key::BTN_TL)],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 2)]);
     assert!(plan.toggles.is_empty());
@@ -184,7 +274,17 @@ fn only_modifier_outputs_are_released() {
         ],
         vec![ev(Key::BTN_TL), ev(Key::BTN_TR)],
     );
-    let plan = plan_emit(&config, &[Key::KEY_Z], 1, &[ev(Key::BTN_TL)], true, false, true, false, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_Z],
+        value: 1,
+        modifiers: &[ev(Key::BTN_TL)],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    });
 
     let sent = frames(&plan);
     assert!(sent.contains(&(Key::BTN_TR.code(), 0)), "the modifier output was released: {sent:?}");
@@ -621,7 +721,17 @@ fn a_while_gaming_binding_is_not_suppressed() {
 #[test]
 fn a_paused_binding_sends_nothing() {
     let config = make_config(vec![], vec![]);
-    let plan = plan_emit(&config, &[Key::KEY_A], 1, &[], true, false, true, true, false);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_A],
+        value: 1,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: true,
+        no_pause: false,
+    });
 
     assert!(frames(&plan).is_empty());
     assert!(plan.toggles.is_empty());
@@ -632,7 +742,17 @@ fn a_paused_binding_sends_nothing() {
 #[test]
 fn a_no_pause_binding_fires_while_paused() {
     let config = make_config(vec![], vec![]);
-    let plan = plan_emit(&config, &[Key::KEY_A], 1, &[], true, false, true, true, true);
+    let plan = plan_emit(&EmitRequest {
+        config: &config,
+        event_list: &[Key::KEY_A],
+        value: 1,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: true,
+        no_pause: true,
+    });
 
     assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 1)]);
 }
@@ -645,4 +765,109 @@ fn fires_while_paused_is_only_false_when_paused_and_not_exempt() {
     assert!(fires_while_paused(false, true));
     assert!(fires_while_paused(true, true));
     assert!(!fires_while_paused(true, false));
+}
+
+// ── gaming_mode_suppresses ────────────────────────────────────────────────
+
+/// Key-up (value=0) must NEVER be suppressed regardless of while_gaming.
+/// Without this, releasing a held button in Gaming Mode leaves it stuck.
+#[test]
+fn key_up_never_suppressed() {
+    assert!(!gaming_mode_suppresses(0, false),
+        "key-up without while_gaming must not be suppressed");
+    assert!(!gaming_mode_suppresses(0, true),
+        "key-up with while_gaming must not be suppressed either");
+}
+
+/// Key-down of a normal (non-while_gaming) binding must be suppressed.
+#[test]
+fn key_down_suppressed_without_while_gaming() {
+    assert!(gaming_mode_suppresses(1, false),
+        "key-down without while_gaming must be suppressed");
+}
+
+/// Key-repeat (value=2) of a normal binding must also be suppressed.
+#[test]
+fn key_repeat_suppressed_without_while_gaming() {
+    assert!(gaming_mode_suppresses(2, false),
+        "key-repeat without while_gaming must be suppressed");
+}
+
+/// while_gaming bindings must pass through on both press and repeat.
+#[test]
+fn while_gaming_binding_not_suppressed() {
+    assert!(!gaming_mode_suppresses(1, true),
+        "key-down with while_gaming=true must NOT be suppressed");
+    assert!(!gaming_mode_suppresses(2, true),
+        "key-repeat with while_gaming=true must NOT be suppressed");
+}
+
+// ── gaming_mode_tracks_modifier ───────────────────────────────────────────
+
+/// A mapped modifier (e.g. BTN_TL) must be tracked even in Gaming Mode
+/// so combo state is consistent when Gaming Mode is disabled mid-hold.
+#[test]
+fn modifier_event_is_tracked_in_gaming_mode() {
+    let btn_tl = Event::Key(Key::BTN_TL);
+    let mapped = vec![btn_tl, Event::Key(Key::BTN_TR)];
+    assert!(gaming_mode_tracks_modifier(&btn_tl, &mapped),
+        "BTN_TL in mapped_modifiers must return true");
+}
+
+/// A non-modifier button must NOT be tracked as a modifier.
+#[test]
+fn non_modifier_event_not_tracked_in_gaming_mode() {
+    let btn_south = Event::Key(Key::BTN_SOUTH);
+    let mapped = vec![Event::Key(Key::BTN_TL), Event::Key(Key::BTN_TR)];
+    assert!(!gaming_mode_tracks_modifier(&btn_south, &mapped),
+        "BTN_SOUTH not in mapped_modifiers must return false");
+}
+
+/// Empty mapped_modifiers list → nothing is ever tracked.
+#[test]
+fn no_mapped_modifiers_nothing_tracked() {
+    let btn_tl = Event::Key(Key::BTN_TL);
+    assert!(!gaming_mode_tracks_modifier(&btn_tl, &[]),
+        "empty mapped_modifiers must never match");
+}
+
+// ── stick_loop_active ─────────────────────────────────────────────────────
+
+/// Normal operating state — not paused, not gaming: stick loop runs.
+#[test]
+fn stick_loop_active_normally() {
+    assert!(stick_loop_active(false, false, false));
+}
+
+/// Gaming Mode active → stick loop must be suppressed.
+#[test]
+fn stick_loop_suppressed_in_gaming_mode() {
+    assert!(!stick_loop_active(false, false, true),
+        "gaming_mode=true must suppress stick loop");
+    // Even cursor_when_paused cannot override gaming_mode suppression.
+    assert!(!stick_loop_active(false, true, true),
+        "cursor_when_paused does not override gaming_mode");
+}
+
+/// Paused without cursor_when_paused → stick loop suppressed.
+#[test]
+fn stick_loop_suppressed_when_paused() {
+    assert!(!stick_loop_active(true, false, false),
+        "paused=true without cursor_when_paused must suppress stick loop");
+}
+
+/// cursor_when_paused restores stick loop while paused, but not in Gaming Mode.
+#[test]
+fn stick_loop_cursor_when_paused_overrides_pause_but_not_gaming_mode() {
+    assert!(stick_loop_active(true, true, false),
+        "cursor_when_paused must allow stick loop while paused");
+    assert!(!stick_loop_active(true, true, true),
+        "cursor_when_paused must NOT allow stick loop in Gaming Mode");
+}
+
+/// Both paused and gaming_mode — stick loop suppressed.
+#[test]
+fn stick_loop_suppressed_when_both_paused_and_gaming_mode() {
+    assert!(!stick_loop_active(true, false, true));
+    assert!(!stick_loop_active(true, true, true));
 }
