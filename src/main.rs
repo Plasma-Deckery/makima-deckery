@@ -4,7 +4,7 @@ mod config;
 mod config_registry;
 mod device_session;
 mod device_tasks;
-mod event_reader;
+mod event_loop;
 mod gesture_pad;
 mod compositor;
 mod kde_input_defaults;

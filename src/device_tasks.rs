@@ -13,7 +13,7 @@
 use crate::config::{DeviceClass, Event};
 use crate::config_registry::ConfigRegistry;
 use crate::device_session::TrackpadSession;
-use crate::event_reader::EventReader;
+use crate::event_loop::EventReader;
 use crate::session::{Client, Environment};
 use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle};
 use crate::virtual_devices::VirtualDevices;
