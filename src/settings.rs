@@ -60,6 +60,13 @@ pub struct Settings {
     pub chain_only: bool,
     /// Cursor and scroll loops keep running while makima is paused.
     pub cursor_when_paused: bool,
+    /// Take the evdev device exclusively, so nothing else sees its events.
+    pub grab_device: bool,
+    /// Which parts of the controller's own firmware behaviour to suppress.
+    ///
+    /// A free string, parsed by `LizardModeSuppression::from_setting`, so there
+    /// is no spelling of it this layer could call wrong.
+    pub suppress_lizard_mode: String,
 }
 
 /// What a value falls back to when it is absent — and when it is wrong.
@@ -85,6 +92,8 @@ mod default {
     /// True, so that a paused makima still moves the pointer — pausing is for
     /// handing the buttons to something else, not for losing the mouse.
     pub const CURSOR_WHEN_PAUSED: bool = true;
+    pub const GRAB_DEVICE: bool = false;
+    pub const SUPPRESS_LIZARD_MODE: &str = "buttons,mouse";
 }
 
 /// Every key that can produce a problem.
@@ -94,8 +103,9 @@ mod default {
 /// cleared outlives the mistake that caused it, and that is not a hypothetical:
 /// it is what the first version of this did.
 ///
-/// `LSTICK` and `RSTICK` are deliberately absent. They are free strings with no
-/// parse to fail, so they can never be reported and never need clearing.
+/// `LSTICK`, `RSTICK` and `SUPPRESS_LIZARD_MODE` are deliberately absent. They
+/// are free strings with no parse to fail here, so they can never be reported
+/// and never need clearing.
 pub const REPORTABLE_KEYS: &[&str] = &[
     "LSTICK_SENSITIVITY",
     "LSTICK_DEADZONE",
@@ -111,6 +121,7 @@ pub const REPORTABLE_KEYS: &[&str] = &[
     "SCROLL_ACCEL",
     "CHAIN_ONLY",
     "CURSOR_WHEN_PAUSED",
+    "GRAB_DEVICE",
 ];
 
 /// The state-file id a problem with this key is reported under.
@@ -232,6 +243,12 @@ impl Settings {
             chain_only: flag(config, "CHAIN_ONLY", default::CHAIN_ONLY, &mut problems),
             cursor_when_paused: flag(config, "CURSOR_WHEN_PAUSED",
                                      default::CURSOR_WHEN_PAUSED, &mut problems),
+            grab_device: flag(config, "GRAB_DEVICE", default::GRAB_DEVICE, &mut problems),
+            suppress_lizard_mode: config
+                .settings
+                .get("SUPPRESS_LIZARD_MODE")
+                .cloned()
+                .unwrap_or_else(|| default::SUPPRESS_LIZARD_MODE.to_string()),
         };
         (settings, problems)
     }

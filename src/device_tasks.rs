@@ -103,13 +103,14 @@ fn spawn_event_reader(
 }
 
 /// Compute the Lizard Mode suppression config from a device's base config.
+///
+/// The default no longer lives here. It is `settings::default::SUPPRESS_LIZARD_MODE`,
+/// like every other one — a default at a call site is a default the config layer
+/// cannot tell anyone about.
 fn lizard_cfg_from_base(base: Option<crate::config::Config>) -> Option<LizardModeSuppression> {
-    let setting = base
-        .as_ref()
-        .and_then(|c| c.settings.get("SUPPRESS_LIZARD_MODE"))
-        .map(|s| s.as_str())
-        .unwrap_or("buttons,mouse");
-    LizardModeSuppression::from_setting(setting)
+    let base = base?;
+    let (settings, _) = crate::settings::Settings::from_config(&base);
+    LizardModeSuppression::from_setting(&settings.suppress_lizard_mode)
 }
 
 pub async fn release_held_modifiers(
@@ -219,7 +220,8 @@ pub async fn launch_tasks(
         let is_hid_steam = decl.class == DeviceClass::HidSteam;
 
         let lizard_cfg = lizard_cfg_from_base(Some(base_config.clone()));
-        let grab = base_config.settings.get("GRAB_DEVICE").map_or(false, |v| v == "true");
+        let (device_settings, _) = crate::settings::Settings::from_config(&base_config);
+        let grab = device_settings.grab_device;
         let trackpad_config = base_config.trackpad.clone();
         let config_name = base_config.name.clone();
 

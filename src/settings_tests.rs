@@ -130,3 +130,28 @@ fn the_stick_function_keys_cannot_be_wrong() {
     assert!(!REPORTABLE_KEYS.contains(&"LSTICK"));
     assert!(!REPORTABLE_KEYS.contains(&"RSTICK"));
 }
+
+/// The two that the August note on issue #32 named, and that survived the first
+/// pass at this: a default at a call site is one the config layer cannot report.
+#[test]
+fn the_defaults_that_used_to_live_at_call_sites() {
+    let (settings, problems) = Settings::from_config(&with(&[]));
+
+    assert!(problems.is_empty());
+    assert!(!settings.grab_device, "GRAB_DEVICE, from device_tasks");
+    assert_eq!(settings.suppress_lizard_mode, "buttons,mouse",
+               "SUPPRESS_LIZARD_MODE, from what used to be udev_monitor");
+}
+
+/// Both are still read from the config when it sets them.
+#[test]
+fn the_moved_defaults_can_still_be_overridden() {
+    let (settings, problems) = Settings::from_config(&with(&[
+        ("GRAB_DEVICE", "true"),
+        ("SUPPRESS_LIZARD_MODE", "buttons"),
+    ]));
+
+    assert!(problems.is_empty());
+    assert!(settings.grab_device);
+    assert_eq!(settings.suppress_lizard_mode, "buttons");
+}
