@@ -17,6 +17,7 @@ mod output;
 mod preferences;
 mod resolver;
 mod scroll_pad;
+mod settings;
 mod session;
 mod state_export;
 mod state_writer;

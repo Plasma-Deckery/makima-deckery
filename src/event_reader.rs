@@ -1,5 +1,5 @@
 use crate::active_client::*;
-use crate::config::{parse_modifiers, Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
+use crate::config::{Axis, Cursor, Event, GamingModeConfig, Relative, Scroll, TrackpadConfig};
 use crate::config_registry::ConfigRegistry;
 use crate::device_session::TrackpadSession;
 use deckery_controller::{HapticPad, HapticRequest, LizardModeHandle};
@@ -18,34 +18,11 @@ use std::{
     option::Option,
     sync::Arc,
 };
+use crate::settings::Settings;
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
-struct Stick {
-    function: String,
-    sensitivity: u64,
-    deadzone: i32,
-    activation_modifiers: Vec<Event>,
-}
 
-struct Movement {
-    speed: i32,
-    acceleration: f32,
-}
 
-struct Settings {
-    lstick: Stick,
-    rstick: Stick,
-    invert_cursor_axis: bool,
-    invert_scroll_axis: bool,
-    axis_16_bit: bool,
-    stadia: bool,
-    cursor: Movement,
-    scroll: Movement,
-    chain_only: bool,
-    /// If true, cursor/scroll loops keep running even while makima is paused.
-    /// Default: true. Set CURSOR_WHEN_PAUSED = "false" in [settings] to disable.
-    cursor_when_paused: bool,
-}
 
 pub struct EventReader {
     registry: Arc<ConfigRegistry>,
@@ -177,136 +154,30 @@ impl EventReader {
         let current_config: Arc<Mutex<Arc<Config>>> =
             Arc::new(Mutex::new(Arc::new(base_config.clone())));
 
-        let lstick_function = base_config.settings
-            .get("LSTICK")
-            .unwrap_or(&"disabled".to_string())
-            .to_string();
-        let lstick_sensitivity: u64 = base_config.settings
-            .get("LSTICK_SENSITIVITY")
-            .unwrap_or(&"0".to_string())
-            .parse::<u64>()
-            .expect("Invalid value for LSTICK_SENSITIVITY, please use an integer value >= 0");
-        let lstick_deadzone: i32 = base_config.settings
-            .get("LSTICK_DEADZONE")
-            .unwrap_or(&"5".to_string())
-            .parse::<i32>()
-            .expect("Invalid value for LSTICK_DEADZONE, please use an integer between 0 and 128.");
-        let lstick_activation_modifiers: Vec<Event> =
-            parse_modifiers(&base_config.settings, "LSTICK_ACTIVATION_MODIFIERS", &base_config.aliases);
-        let lstick = Stick {
-            function: lstick_function,
-            sensitivity: lstick_sensitivity,
-            deadzone: lstick_deadzone,
-            activation_modifiers: lstick_activation_modifiers,
-        };
+        // The settings are typed by the config layer now, which is where the
+        // defaults live too. Anything unusable is a problem to report rather
+        // than a panic — see `settings.rs` for why that distinction mattered.
+        let (settings, setting_problems) = crate::settings::Settings::from_config(&base_config);
+        for key in crate::settings::REPORTABLE_KEYS {
+            let id = crate::settings::error_id(key);
+            match setting_problems.iter().find(|p| p.key == *key) {
+                Some(problem) => {
+                    eprintln!("deckery: {problem}");
+                    let _ = state_tx.try_send(StateCommand::SetError {
+                        id,
+                        message: problem.to_string(),
+                        severity: "warning",
+                    });
+                }
+                // Cleared whether or not it was ever set, because this runs on
+                // every reinit and the config may have been fixed since.
+                None => { let _ = state_tx.try_send(StateCommand::ClearError { id }); }
+            }
+        }
 
-        let rstick_function: String = base_config.settings
-            .get("RSTICK")
-            .unwrap_or(&"scroll".to_string())
-            .to_string();
-        let rstick_sensitivity: u64 = base_config.settings
-            .get("RSTICK_SENSITIVITY")
-            .unwrap_or(&"0".to_string())
-            .parse::<u64>()
-            .expect("Invalid value for RSTICK_SENSITIVITY, please use an integer value >= 0");
-        let rstick_deadzone: i32 = base_config.settings
-            .get("RSTICK_DEADZONE")
-            .unwrap_or(&"5".to_string())
-            .parse::<i32>()
-            .expect("Invalid value for RSTICK_DEADZONE, please use an integer between 0 and 128.");
-        let rstick_activation_modifiers: Vec<Event> =
-            parse_modifiers(&base_config.settings, "RSTICK_ACTIVATION_MODIFIERS", &base_config.aliases);
-        let rstick = Stick {
-            function: rstick_function,
-            sensitivity: rstick_sensitivity,
-            deadzone: rstick_deadzone,
-            activation_modifiers: rstick_activation_modifiers,
-        };
-
-        let axis_16_bit: bool = base_config.settings
-            .get("16_BIT_AXIS")
-            .unwrap_or(&"false".to_string())
-            .parse()
-            .expect("16_BIT_AXIS can only be true or false.");
-
-        let stadia: bool = base_config.settings
-            .get("STADIA")
-            .unwrap_or(&"false".to_string())
-            .parse()
-            .expect("STADIA can only be true or false.");
-
-        let chain_only: bool = base_config.settings
-            .get("CHAIN_ONLY")
-            .unwrap_or(&"true".to_string())
-            .parse()
-            .expect("CHAIN_ONLY can only be true or false.");
-
-        let invert_cursor_axis: bool = base_config.settings
-            .get("INVERT_CURSOR_AXIS")
-            .unwrap_or(&"false".to_string())
-            .parse()
-            .expect("INVERT_CURSOR_AXIS can only be true or false.");
-
-        let invert_scroll_axis: bool = base_config.settings
-            .get("INVERT_SCROLL_AXIS")
-            .unwrap_or(&"false".to_string())
-            .parse()
-            .expect("INVERT_SCROLL_AXIS can only be true or false.");
-
-        let cursor_speed: i32 = base_config.settings
-            .get("CURSOR_SPEED")
-            .unwrap_or(&"0".to_string())
-            .parse()
-            .expect("Invalid value for CURSOR_SPEED, please use an integer value.");
-
-        let cursor_acceleration: f32 = base_config.settings
-            .get("CURSOR_ACCEL")
-            .unwrap_or(&"1".to_string())
-            .parse()
-            .expect("Invalid value for CURSOR_ACCEL, please use an float value between 0 and 1.");
-
-        let scroll_speed: i32 = base_config.settings
-            .get("SCROLL_SPEED")
-            .unwrap_or(&"0".to_string())
-            .parse()
-            .expect("Invalid value for SCROLL_SPEED, please use an integer value.");
-
-        let scroll_acceleration: f32 = base_config.settings
-            .get("SCROLL_ACCEL")
-            .unwrap_or(&"1".to_string())
-            .parse()
-            .expect("Invalid value for SCROLL_ACCEL, please use a float value between 0 and 1.");
-
-        let cursor = Movement {
-            speed: cursor_speed,
-            acceleration: cursor_acceleration,
-        };
-
-        let scroll = Movement {
-            speed: scroll_speed,
-            acceleration: scroll_acceleration,
-        };
-        let cursor_when_paused: bool = base_config.settings
-            .get("CURSOR_WHEN_PAUSED")
-            .unwrap_or(&"true".to_string())
-            .parse()
-            .expect("CURSOR_WHEN_PAUSED can only be true or false.");
 
         let trackpad = base_config.trackpad.clone();
         let gaming_mode_config = base_config.gaming_mode_config.clone();
-
-        let settings = Settings {
-            lstick,
-            rstick,
-            invert_cursor_axis,
-            invert_scroll_axis,
-            axis_16_bit,
-            stadia,
-            cursor,
-            scroll,
-            chain_only,
-            cursor_when_paused,
-        };
 
         Self {
             registry,
