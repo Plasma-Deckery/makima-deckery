@@ -177,14 +177,14 @@ impl TrackpadSession {
         //
         // An unclipped device port stops the session entirely: no devices, no
         // trackpad session, and nothing reaches the kernel from here either.
-        let (Some(virt_dev), Some(state_tx)) =
-            (outputs.devices.as_ref(), outputs.publish.clone())
-        else {
+        // Each task reads the ports it needs out of `outputs` itself, so this
+        // checks the device port only to keep one rule intact: no device port,
+        // no trackpad session at all. Without it the router would still run and
+        // go on publishing pad state for devices that cannot exist.
+        if outputs.devices.is_none() {
             return;
-        };
-        let left_haptic    = outputs.haptics.clone();
-        let right_haptic   = outputs.haptics.clone();
-        let gesture_haptic = outputs.haptics.clone();
+        }
+        let Some(state_tx) = outputs.publish.clone() else { return };
 
         tokio::join!(
             async {
@@ -200,8 +200,8 @@ impl TrackpadSession {
             async {
                 if let Some(rx) = self.left_rx {
                     mt_trackpad::run_single(
-                        rx, virt_dev, lpad,
-                        left_haptic, HapticPad::Left,
+                        rx, outputs, lpad,
+                        HapticPad::Left,
                         self.left_press_chain,
                         self.left_release_chain,
                         self.left_movement_pulse,
@@ -212,8 +212,8 @@ impl TrackpadSession {
             async {
                 if let Some(rx) = self.right_rx {
                     mt_trackpad::run_single(
-                        rx, virt_dev, rpad,
-                        right_haptic, HapticPad::Right,
+                        rx, outputs, rpad,
+                        HapticPad::Right,
                         self.right_press_chain,
                         self.right_release_chain,
                         self.right_movement_pulse,
@@ -223,7 +223,7 @@ impl TrackpadSession {
             },
             async {
                 if let Some(rx) = self.combined_rx {
-                    gesture_pad::run(rx, virt_dev, gesture_haptic, self.gesture_pad_config).await;
+                    gesture_pad::run(rx, outputs, self.gesture_pad_config).await;
                 }
             },
         );

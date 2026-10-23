@@ -19,7 +19,9 @@
 //! self-parsed from `[trackpad.gestures]` exactly like
 //! `mt_trackpad::MtTrackpadConfig` parses `[trackpad.left]`/`[trackpad.right]`.
 use crate::mt_trackpad::pulse;
-use deckery_controller::{HapticPad, HapticPulse, HapticRequest};
+use deckery_controller::{HapticPad, HapticPulse};
+use crate::output::action::OutputAction;
+use crate::output::Outputs;
 use crate::trackpad::emit_gesture_event;
 use crate::trackpad_router::{CombinedPadFrame, GestureEvent};
 use crate::virtual_devices::VirtualDevices;
@@ -139,12 +141,13 @@ fn frame_distance(prev: CombinedPadFrame, curr: CombinedPadFrame) -> f64 {
 /// the lifecycle tag `trackpad_router` attaches to each `GestureEvent`.
 pub async fn run(
     mut rx: mpsc::Receiver<GestureEvent>,
-    virt_dev: &Arc<Mutex<VirtualDevices>>,
-    haptic_tx: Option<mpsc::Sender<HapticRequest>>,
+    outputs: &Outputs,
     config: GesturePadConfig,
 ) {
-    let mut prev_move_frame: Option<CombinedPadFrame> = None;
-    let mut move_accum: f64 = 0.0;
+    // Emission is still direct — the last step of issue #57.
+    let Some(virt_dev) = outputs.devices.as_ref() else { return };
+
+    let mut progress = GestureProgress::default();
 
     async fn emit(virt_dev: &Arc<Mutex<VirtualDevices>>, frame: CombinedPadFrame) {
         let click = frame.lclick || frame.rclick;
@@ -156,35 +159,73 @@ pub async fn run(
 
     while let Some(event) = rx.recv().await {
         match event {
-            GestureEvent::Start(frame) => {
+            GestureEvent::Start(frame) | GestureEvent::Move(frame) => {
                 emit(virt_dev, frame).await;
-                if let Some(p) = config.start_pulse() {
-                    pulse(&haptic_tx, HapticPad::Both, p).await;
-                }
-                prev_move_frame = Some(frame);
-                move_accum = 0.0;
-            }
-            GestureEvent::Move(frame) => {
-                emit(virt_dev, frame).await;
-                if let Some(m) = config.move_pulse() {
-                    if let Some(prev) = prev_move_frame {
-                        move_accum += frame_distance(prev, frame);
-                    }
-                    if move_accum >= m.pixel_interval as f64 {
-                        pulse(&haptic_tx, HapticPad::Both, m.pulse).await;
-                        move_accum = 0.0;
-                    }
-                }
-                prev_move_frame = Some(frame);
             }
             GestureEvent::End => {
                 emit_gesture_event(virt_dev, 0, 0, 0, 0, false, false, Some(false)).await;
-                if let Some(p) = config.end_pulse() {
-                    pulse(&haptic_tx, HapticPad::Both, p).await;
-                }
-                prev_move_frame = None;
-                move_accum = 0.0;
             }
         }
+
+        let (next, actions) = plan_haptics(progress, event, &config);
+        progress = next;
+        outputs.dispatch(&actions).await;
     }
 }
+
+/// What the gesture's movement haptic has to remember between frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GestureProgress {
+    prev_move_frame: Option<CombinedPadFrame>,
+    move_accum: f64,
+}
+
+/// Decide what one gesture event should feel like.
+///
+/// Pure, and keyed on the lifecycle tag `trackpad_router` attaches to each
+/// event rather than on the click bit: a click during a two-finger gesture has
+/// no established touchpad semantics, so there is deliberately no click haptic
+/// here at all. What is meaningful is start, movement and end.
+pub fn plan_haptics(
+    progress: GestureProgress,
+    event: GestureEvent,
+    config: &GesturePadConfig,
+) -> (GestureProgress, Vec<OutputAction>) {
+    let mut next = progress;
+    let mut actions = Vec::new();
+
+    match event {
+        GestureEvent::Start(frame) => {
+            if let Some(p) = config.start_pulse() {
+                actions.push(pulse(HapticPad::Both, p));
+            }
+            next.prev_move_frame = Some(frame);
+            next.move_accum = 0.0;
+        }
+        GestureEvent::Move(frame) => {
+            if let Some(m) = config.move_pulse() {
+                if let Some(prev) = progress.prev_move_frame {
+                    next.move_accum += frame_distance(prev, frame);
+                }
+                if next.move_accum >= m.pixel_interval as f64 {
+                    actions.push(pulse(HapticPad::Both, m.pulse));
+                    next.move_accum = 0.0;
+                }
+            }
+            next.prev_move_frame = Some(frame);
+        }
+        GestureEvent::End => {
+            if let Some(p) = config.end_pulse() {
+                actions.push(pulse(HapticPad::Both, p));
+            }
+            next.prev_move_frame = None;
+            next.move_accum = 0.0;
+        }
+    }
+
+    (next, actions)
+}
+
+#[cfg(test)]
+#[path = "gesture_pad_tests.rs"]
+mod tests;
