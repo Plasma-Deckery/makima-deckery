@@ -294,7 +294,7 @@ pub async fn launch_tasks(
         };
 
         let session = if is_hid_steam {
-            Some(TrackpadSession::setup(&trackpad_config, &virt_dev, pad_rx, haptic_tx.clone(), click_pressure).await)
+            Some(TrackpadSession::setup(&trackpad_config, &virt_dev, pad_rx, click_pressure).await)
         } else {
             None
         };

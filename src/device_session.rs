@@ -18,16 +18,16 @@ use crate::gesture_pad::{self, GesturePadConfig};
 use crate::kde_input_defaults::{self, GestureKdeConfig, PadKdeConfig};
 use crate::mt_trackpad::{self, MovementHaptic, MtTrackpadConfig};
 use deckery_controller::HapticChain;
-use deckery_controller::{ClickPressureConfig, ClickPressureHandle, HapticPad, HapticRequest, PadFrame};
+use deckery_controller::{ClickPressureConfig, ClickPressureHandle, HapticPad, PadFrame};
+use crate::output::Outputs;
 use crate::trackpad::PadState;
-use crate::trackpad_router::{self, GestureEvent, SinglePadFrame, StateWrite};
+use crate::trackpad_router::{self, GestureEvent, SinglePadFrame};
 use crate::virtual_devices::VirtualDevices;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 pub struct TrackpadSession {
     pad_rx:      Option<mpsc::Receiver<PadFrame>>,
-    haptic_tx:   Option<mpsc::Sender<HapticRequest>>,
     left_tx:     Option<mpsc::Sender<SinglePadFrame>>,
     left_rx:     Option<mpsc::Receiver<SinglePadFrame>>,
     right_tx:    Option<mpsc::Sender<SinglePadFrame>>,
@@ -56,8 +56,10 @@ impl TrackpadSession {
     /// writes KDE libinput defaults, creates virtual MT uinput nodes,
     /// and builds the routing channels. Call this before `run`.
     ///
-    /// `pad_rx` and `haptic_tx` come from `ControllerSession` — the controller
-    /// already owns the hidraw fd and tasks. No hidraw path is opened here.
+    /// `pad_rx` comes from `ControllerSession` — the controller already owns
+    /// the hidraw fd and tasks. No hidraw path is opened here. The haptic
+    /// sender is no longer taken here; `run` reads it out of the `haptics`
+    /// port along with the other two handles it needs.
     ///
     /// `click_pressure` is the `ClickPressureHandle` from `ControllerSession`.
     /// If the user configured click-pressure thresholds in the trackpad config,
@@ -67,7 +69,6 @@ impl TrackpadSession {
         trackpad: &TrackpadConfig,
         virt_dev: &Arc<Mutex<VirtualDevices>>,
         pad_rx: Option<mpsc::Receiver<PadFrame>>,
-        haptic_tx: Option<mpsc::Sender<HapticRequest>>,
         click_pressure: Option<ClickPressureHandle>,
     ) -> Self {
         // Validate modes early so the warning appears before any device work.
@@ -141,7 +142,6 @@ impl TrackpadSession {
 
         Self {
             pad_rx,
-            haptic_tx,
             left_tx,
             left_rx,
             right_tx,
@@ -163,16 +163,28 @@ impl TrackpadSession {
     /// ends (hidraw channel closes). Consumes `self`.
     pub async fn run(
         self,
-        virt_dev: &Arc<Mutex<VirtualDevices>>,
+        outputs: &Outputs,
         lpad: &PadState,
         rpad: &PadState,
         gesture_session: &Arc<Mutex<bool>>,
-        state_tx: mpsc::Sender<StateWrite>,
         gaming_mode: Arc<Mutex<bool>>,
     ) {
-        let left_haptic    = self.haptic_tx.clone();
-        let right_haptic   = self.haptic_tx.clone();
-        let gesture_haptic = self.haptic_tx;
+        // The three handles the pads need are three of the reader's ports:
+        // `devices` for the MT frames, `publish` for the state.json writes,
+        // `haptics` for the click feedback. Taking them from one `Outputs`
+        // rather than as three parameters is what lets the pads later return
+        // actions instead of performing them — see issue #57.
+        //
+        // An unclipped device port stops the session entirely: no devices, no
+        // trackpad session, and nothing reaches the kernel from here either.
+        let (Some(virt_dev), Some(state_tx)) =
+            (outputs.devices.as_ref(), outputs.publish.clone())
+        else {
+            return;
+        };
+        let left_haptic    = outputs.haptics.clone();
+        let right_haptic   = outputs.haptics.clone();
+        let gesture_haptic = outputs.haptics.clone();
 
         tokio::join!(
             async {

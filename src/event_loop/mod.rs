@@ -127,11 +127,10 @@ pub struct EventReader {
     /// Channel to the central state writer task. All state.json writes go
     /// through this sender — EventReader never touches the file directly.
     state_tx: StateWriterHandle,
-    /// Asks `state_write_loop` for a state write. Created here rather than in
-    /// `start()` so a detached task — one waiting on a spawned command — can
-    /// hold a clone and make its result visible without borrowing `self`.
-    state_write_tx: mpsc::Sender<crate::trackpad_router::StateWrite>,
-    /// Receiver half of the above, taken once by `start()`.
+    /// Receiver half of the `publish` port, taken once by `start()`. The
+    /// sender lives in `outputs.publish`, which is where everything that wants
+    /// a state write now asks for one — including a detached task waiting on a
+    /// spawned command, which holds a clone of the whole `Outputs`.
     state_write_rx: Mutex<Option<mpsc::Receiver<crate::trackpad_router::StateWrite>>>,
 }
 
@@ -250,7 +249,6 @@ impl EventReader {
             gaming_mode_trigger_ts: Arc::new(Mutex::new(None)),
             gaming_mode_tx,
             state_tx,
-            state_write_tx,
             state_write_rx: Mutex::new(Some(state_write_rx)),
         }
     }
@@ -259,7 +257,6 @@ impl EventReader {
         let name = self.base_name.clone();
         let name = &name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
-        let state_tx = self.state_write_tx.clone();
         let state_rx = self.state_write_rx.lock().await.take()
             .expect("start() runs once per EventReader");
         self.write_state().await;
@@ -275,18 +272,15 @@ impl EventReader {
             self.state_write_loop(state_rx),
             self.ipc_command_loop(ipc_rx),
             async {
-                // The trackpad session is a producer of its own — hidraw frames,
-                // not events — so it still takes the devices directly rather
-                // than going through a port. It reads the handle out of the
-                // device port, which means an unclipped port stops it too: no
-                // devices, no trackpad session, and nothing reaches the kernel
-                // from here either.
-                match (session, self.outputs.devices.as_ref()) {
-                    (Some(s), Some(devices)) => {
-                        s.run(devices, &self.lpad, &self.rpad, &self.gesture_session,
-                              state_tx, self.gaming_mode.clone()).await;
-                    }
-                    _ => {}
+                // The trackpad session is a producer of its own — hidraw
+                // frames, not events — and still performs its own effects. It
+                // now takes the ports as one `Outputs`, which is the first step
+                // towards it returning actions like the rest of the path does
+                // (issue #57). The session declines to start if the device port
+                // is unclipped; that check lives in `run`.
+                if let Some(s) = session {
+                    s.run(&self.outputs, &self.lpad, &self.rpad,
+                          &self.gesture_session, self.gaming_mode.clone()).await;
                 }
             },
         );
