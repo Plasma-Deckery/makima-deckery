@@ -60,37 +60,88 @@ pub enum ResolvedBinding {
 /// `modifiers` must be sorted and deduplicated before calling.
 /// `chain_only` mirrors the `CHAIN_ONLY` setting (Hold bindings only fire when
 /// a modifier is held if true).
+/// The flags a binding can carry, resolved the way every lookup resolves them:
+/// a value set on the exact modifier combination, or on the base entry
+/// (`combo = []`).
+///
+/// They are gathered in one place because adding a fifth flag must not mean
+/// remembering four call sites. `silent` was the fourth, and it did mean
+/// exactly that.
+struct Flags {
+    no_pause: bool,
+    while_gaming: bool,
+    silent: bool,
+    label: Option<String>,
+}
+
+fn flags(bindings: &Bindings, event: Event, mods: &[Event]) -> Flags {
+    let exact = mods.to_vec();
+    Flags {
+        no_pause: bindings.no_pause.contains(&(event, exact.clone()))
+            || bindings.no_pause.contains(&(event, vec![])),
+        while_gaming: bindings.while_gaming.contains(&(event, exact.clone()))
+            || bindings.while_gaming.contains(&(event, vec![])),
+        silent: bindings.silent.contains(&(event, exact.clone()))
+            || bindings.silent.contains(&(event, vec![])),
+        label: bindings.labels.get(&(event, exact)).cloned(),
+    }
+}
+
+/// A command binding with an exact modifier match.
+///
+/// This lookup appears twice in the resolution order — nested under a `remap`
+/// block, and again at top level — and has to behave identically in both
+/// positions. Only *where* it is tried differs, so only that stays at the call
+/// site.
+fn resolve_command(bindings: &Bindings, event: Event, mods: &[Event]) -> Option<ResolvedBinding> {
+    let commands = bindings.commands.get(&event)?.get(mods)?.clone();
+    let f = flags(bindings, event, mods);
+    Some(ResolvedBinding::Command {
+        commands,
+        label: f.label,
+        no_pause: f.no_pause,
+        while_gaming: f.while_gaming,
+        silent: f.silent,
+        is_combo: !mods.is_empty(),
+    })
+}
+
+/// A movement binding with an exact modifier match — tried in the same two
+/// positions as `resolve_command`, and carrying no flags.
+fn resolve_movement(bindings: &Bindings, event: Event, mods: &[Event]) -> Option<ResolvedBinding> {
+    let movement = *bindings.movements.get(&event)?.get(mods)?;
+    Some(ResolvedBinding::Movement {
+        movement,
+        is_combo: !mods.is_empty(),
+    })
+}
+
 pub fn resolve_binding(
     bindings: &Bindings,
     event: Event,
     modifiers: &[Event],
     chain_only: bool,
 ) -> ResolvedBinding {
-    let mods = modifiers.to_vec();
+    let mods = modifiers;
+    let no_mods: &[Event] = &[];
 
     if let Some(remap_map) = bindings.remap.get(&event) {
         // 1. Exact combo remap match.
-        if let Some(keys) = remap_map.get(&mods) {
-            let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
-                || bindings.no_pause.contains(&(event, vec![]));
-            let while_gaming = bindings.while_gaming.contains(&(event, mods.clone()))
-                || bindings.while_gaming.contains(&(event, vec![]));
-            let silent = bindings.silent.contains(&(event, mods.clone()))
-                || bindings.silent.contains(&(event, vec![]));
-            let label = bindings.labels.get(&(event, mods.clone())).cloned();
+        if let Some(keys) = remap_map.get(mods) {
+            let f = flags(bindings, event, mods);
             return ResolvedBinding::Keys {
                 keys: keys.clone(),
-                label,
-                no_pause,
-                while_gaming,
-                silent,
+                label: f.label,
+                no_pause: f.no_pause,
+                while_gaming: f.while_gaming,
+                silent: f.silent,
                 is_combo: !mods.is_empty(),
                 is_fallback: false,
             };
         }
 
         // 2. Hold binding — fires when modifiers are held (or chain_only=false).
-        if let Some(hold_keys) = remap_map.get(&vec![Event::Hold]) {
+        if let Some(hold_keys) = remap_map.get([Event::Hold].as_slice()) {
             if !mods.is_empty() || !chain_only {
                 return ResolvedBinding::Hold {
                     keys: hold_keys.clone(),
@@ -100,50 +151,30 @@ pub fn resolve_binding(
 
         // 3. Command with exact modifier match (nested under remap block in
         //    convert_event's lookup order).
-        if let Some(cmd_map) = bindings.commands.get(&event) {
-            if let Some(commands) = cmd_map.get(&mods) {
-                let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
-                    || bindings.no_pause.contains(&(event, vec![]));
-                let while_gaming = bindings.while_gaming.contains(&(event, mods.clone()))
-                    || bindings.while_gaming.contains(&(event, vec![]));
-                let silent = bindings.silent.contains(&(event, mods.clone()))
-                    || bindings.silent.contains(&(event, vec![]));
-                let label = bindings.labels.get(&(event, mods.clone())).cloned();
-                return ResolvedBinding::Command {
-                    commands: commands.clone(),
-                    label,
-                    no_pause,
-                    while_gaming,
-                    silent,
-                    is_combo: !mods.is_empty(),
-                };
-            }
+        if let Some(resolved) = resolve_command(bindings, event, mods) {
+            return resolved;
         }
 
         // 4. Movement with exact modifier match.
-        if let Some(mov_map) = bindings.movements.get(&event) {
-            if let Some(movement) = mov_map.get(&mods) {
-                return ResolvedBinding::Movement {
-                    movement: *movement,
-                    is_combo: !mods.is_empty(),
-                };
-            }
+        if let Some(resolved) = resolve_movement(bindings, event, mods) {
+            return resolved;
         }
 
         // 5. Fallback: base remap (combo=[]) while modifiers are held.
         //    The held modifier output keys must NOT be released — the caller
         //    is responsible for keeping them held (e.g. Ctrl+Enter).
-        if let Some(keys) = remap_map.get(&vec![]) {
-            let no_pause = bindings.no_pause.contains(&(event, vec![]));
-            let while_gaming = bindings.while_gaming.contains(&(event, vec![]));
-            let silent = bindings.silent.contains(&(event, vec![]));
-            let label = bindings.labels.get(&(event, vec![])).cloned();
+        //
+        //    The flags come from the base entry, not from the held combination:
+        //    this is the base binding firing, so it is the base binding's
+        //    properties that apply.
+        if let Some(keys) = remap_map.get(no_mods) {
+            let f = flags(bindings, event, no_mods);
             return ResolvedBinding::Keys {
                 keys: keys.clone(),
-                label,
-                no_pause,
-                while_gaming,
-                silent,
+                label: f.label,
+                no_pause: f.no_pause,
+                while_gaming: f.while_gaming,
+                silent: f.silent,
                 is_combo: false,
                 is_fallback: !mods.is_empty(),
             };
@@ -151,34 +182,13 @@ pub fn resolve_binding(
     }
 
     // 6. Command with exact modifier match (top-level, outside remap block).
-    if let Some(cmd_map) = bindings.commands.get(&event) {
-        if let Some(commands) = cmd_map.get(&mods) {
-            let no_pause = bindings.no_pause.contains(&(event, mods.clone()))
-                || bindings.no_pause.contains(&(event, vec![]));
-            let while_gaming = bindings.while_gaming.contains(&(event, mods.clone()))
-                || bindings.while_gaming.contains(&(event, vec![]));
-            let silent = bindings.silent.contains(&(event, mods.clone()))
-                || bindings.silent.contains(&(event, vec![]));
-            let label = bindings.labels.get(&(event, mods.clone())).cloned();
-            return ResolvedBinding::Command {
-                commands: commands.clone(),
-                label,
-                no_pause,
-                while_gaming,
-                silent,
-                is_combo: !mods.is_empty(),
-            };
-        }
+    if let Some(resolved) = resolve_command(bindings, event, mods) {
+        return resolved;
     }
 
     // 7. Movement with exact modifier match (top-level).
-    if let Some(mov_map) = bindings.movements.get(&event) {
-        if let Some(movement) = mov_map.get(&mods) {
-            return ResolvedBinding::Movement {
-                movement: *movement,
-                is_combo: !mods.is_empty(),
-            };
-        }
+    if let Some(resolved) = resolve_movement(bindings, event, mods) {
+        return resolved;
     }
 
     ResolvedBinding::Unbound
