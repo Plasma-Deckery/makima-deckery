@@ -17,7 +17,7 @@
 
 use crate::session::Environment;
 use crate::state_export::LastAction;
-use crate::trackpad_router::StateWrite;
+use crate::output::action::Urgency;
 
 use fork::{fork, setsid, Fork};
 use std::process::{Command, Stdio};
@@ -34,7 +34,7 @@ pub async fn run_command_binding(
     command_list: &[String],
     label: Option<String>,
     last_action: Arc<Mutex<Option<LastAction>>>,
-    state_write_tx: mpsc::Sender<StateWrite>,
+    state_write_tx: mpsc::Sender<Urgency>,
 ) {
     let (user, running_as_root) = if let Ok(sudo_user) = &environment.sudo_user {
         (Some(sudo_user), true)
@@ -124,7 +124,7 @@ async fn report_command_failure(
     label: Option<String>,
     command: String,
     last_action: Arc<Mutex<Option<LastAction>>>,
-    state_write_tx: mpsc::Sender<StateWrite>,
+    state_write_tx: mpsc::Sender<Urgency>,
 ) {
     let name = label.unwrap_or_else(|| command.clone());
 
@@ -146,7 +146,7 @@ async fn report_command_failure(
         ts: crate::state_export::now_ts(),
         silent: false,
     });
-    let _ = state_write_tx.send(StateWrite::Immediate).await;
+    let _ = state_write_tx.send(Urgency::Immediate).await;
 }
 
 /// Turn an exit status and stderr into one line worth showing.

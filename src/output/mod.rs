@@ -22,9 +22,11 @@
 //!
 //! Every kind of action is now produced by something: frames, commands, the
 //! Gaming Mode change, the haptic, the snapshot and `last_action` all leave the
-//! event reader through a port. The only thing with no production caller is the
-//! tap, because nothing watches yet — the tests do, and a log would. That is
-//! marked where it lives rather than across the module.
+//! event reader through a port. The trackpads reach the same ports — their
+//! haptics and their publish requests are actions too (issue #57), and the pad
+//! frames themselves are the last step left. The only thing with no production
+//! caller is the tap, because nothing watches yet — the tests do, and a log
+//! would. That is marked where it lives rather than across the module.
 
 pub mod action;
 pub mod outputs;

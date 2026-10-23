@@ -31,7 +31,6 @@ use crate::resolver::{resolve_binding, ResolvedBinding};
 use crate::state_export::LastAction;
 use crate::state_writer::{StateWriterHandle, StateCommand};
 use crate::trackpad::PadState;
-use crate::trackpad_router;
 use crate::session::{Client, Environment, Server};
 use crate::virtual_devices::VirtualDevices;
 use crate::config::Config;
@@ -131,7 +130,7 @@ pub struct EventReader {
     /// sender lives in `outputs.publish`, which is where everything that wants
     /// a state write now asks for one — including a detached task waiting on a
     /// spawned command, which holds a clone of the whole `Outputs`.
-    state_write_rx: Mutex<Option<mpsc::Receiver<crate::trackpad_router::StateWrite>>>,
+    state_write_rx: Mutex<Option<mpsc::Receiver<crate::output::action::Urgency>>>,
 }
 
 
@@ -396,11 +395,11 @@ impl EventReader {
     /// sticks/IMU/config/modifiers, which live here. Keeping this as a
     /// separate small loop (instead of passing `&self` into `trackpad_router`)
     /// is what keeps that module decoupled from the rest of makima's state.
-    async fn state_write_loop(&self, mut rx: mpsc::Receiver<trackpad_router::StateWrite>) {
+    async fn state_write_loop(&self, mut rx: mpsc::Receiver<crate::output::action::Urgency>) {
         while let Some(req) = rx.recv().await {
             match req {
-                trackpad_router::StateWrite::Immediate => self.write_state().await,
-                trackpad_router::StateWrite::Analog => self.write_state_analog().await,
+                crate::output::action::Urgency::Immediate => self.write_state().await,
+                crate::output::action::Urgency::Analog => self.write_state_analog().await,
             }
         }
     }

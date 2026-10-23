@@ -184,14 +184,16 @@ impl TrackpadSession {
         if outputs.devices.is_none() {
             return;
         }
-        let Some(state_tx) = outputs.publish.clone() else { return };
+        if outputs.publish.is_none() {
+            return;
+        }
 
         tokio::join!(
             async {
                 if let Some(rx) = self.pad_rx {
                     trackpad_router::run(
                         rx, lpad, rpad, gesture_session,
-                        state_tx, self.left_tx, self.right_tx, self.combined_tx,
+                        outputs, self.left_tx, self.right_tx, self.combined_tx,
                         gaming_mode,
                     )
                     .await;
