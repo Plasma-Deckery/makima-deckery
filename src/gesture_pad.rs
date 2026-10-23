@@ -22,11 +22,9 @@ use crate::mt_trackpad::pulse;
 use deckery_controller::{HapticPad, HapticPulse};
 use crate::output::action::OutputAction;
 use crate::output::Outputs;
-use crate::trackpad::emit_gesture_event;
+use crate::trackpad::plan_gesture_frame;
 use crate::trackpad_router::{CombinedPadFrame, GestureEvent};
-use crate::virtual_devices::VirtualDevices;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 /// Raw-unit distance a finger must travel (summed across both pads, see
 /// `frame_distance`) since the last `on_gesture_move` pulse before another
@@ -144,26 +142,24 @@ pub async fn run(
     outputs: &Outputs,
     config: GesturePadConfig,
 ) {
-    // Emission is still direct — the last step of issue #57.
-    let Some(virt_dev) = outputs.devices.as_ref() else { return };
-
     let mut progress = GestureProgress::default();
 
-    async fn emit(virt_dev: &Arc<Mutex<VirtualDevices>>, frame: CombinedPadFrame) {
-        let click = frame.lclick || frame.rclick;
-        emit_gesture_event(
-            virt_dev, frame.lx, frame.ly, frame.rx, frame.ry, frame.ltouch, frame.rtouch,
-            Some(click),
-        ).await;
+    /// A physical click on either half reads as one click on the combined
+    /// device.
+    fn frame_actions(frame: CombinedPadFrame) -> Vec<OutputAction> {
+        plan_gesture_frame(
+            frame.lx, frame.ly, frame.rx, frame.ry, frame.ltouch, frame.rtouch,
+            Some(frame.lclick || frame.rclick),
+        )
     }
 
     while let Some(event) = rx.recv().await {
         match event {
             GestureEvent::Start(frame) | GestureEvent::Move(frame) => {
-                emit(virt_dev, frame).await;
+                outputs.dispatch(&frame_actions(frame)).await;
             }
             GestureEvent::End => {
-                emit_gesture_event(virt_dev, 0, 0, 0, 0, false, false, Some(false)).await;
+                outputs.dispatch(&plan_gesture_frame(0, 0, 0, 0, false, false, Some(false))).await;
             }
         }
 

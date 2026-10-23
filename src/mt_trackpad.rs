@@ -194,15 +194,13 @@ pub async fn run_single(
     release_chain:   Option<HapticChain>,
     movement_pulse:  Option<MovementHaptic>,
 ) {
-    // The emission still goes straight to the device; that is the last step of
-    // issue #57, and it is the one that needs `PadState::emit` taken apart.
-    let Some(virt_dev) = outputs.devices.as_ref() else { return };
-
     let mut progress    = HapticProgress::default();
     let mut first_frame = true;
 
     while let Some(frame) = rx.recv().await {
-        pad.emit(virt_dev, frame.x, frame.y, frame.touching, Some(frame.click)).await;
+        outputs.dispatch(&crate::trackpad::plan_pad_frame(
+            pad.device(), frame.x, frame.y, frame.touching, Some(frame.click),
+        )).await;
         if first_frame {
             first_frame = false;
             println!(

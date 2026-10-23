@@ -243,19 +243,6 @@ impl VirtualDevices {
         }
     }
 
-    /// Whether a pad device exists.
-    ///
-    /// The pads are optional, so a caller that builds an expensive frame can ask
-    /// first rather than build it for nothing.
-    pub fn has_device(&self, device: OutputDevice) -> bool {
-        match device {
-            OutputDevice::Keys | OutputDevice::Axis | OutputDevice::Abs => true,
-            OutputDevice::LeftPad => self.lpad.is_some(),
-            OutputDevice::RightPad => self.rpad.is_some(),
-            OutputDevice::GesturePad => self.gesture_pad.is_some(),
-        }
-    }
-
     /// Send one frame to one device.
     ///
     /// One call is one frame as the kernel reads it: `evdev` appends a SYN_REPORT
