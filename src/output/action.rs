@@ -164,6 +164,14 @@ pub enum StateAction {
     /// whatever is clipped in writes it down. The snapshot is assembled by
     /// whoever has the live state, at the moment the action is produced.
     Publish { snapshot: Box<serde_json::Value>, urgency: Urgency },
+    /// Ask whoever owns the live state to publish a snapshot.
+    ///
+    /// The counterpart to `Publish`, for a decider that holds none of the state
+    /// a snapshot is made of. The trackpad router knows *that* the overlay
+    /// should be updated — a pad was touched, a gesture began — and nothing
+    /// about modifiers, held keys or the active config. So it asks, and whoever
+    /// has those assembles the snapshot.
+    Request { urgency: Urgency },
     /// Replace `last_action`, or clear it.
     SetLastAction(Option<LastActionSpec>),
 }

@@ -12,8 +12,8 @@
 //!   - routing each frame to the correct per-channel handler input
 //!     (`left_tx`/`right_tx`/`combined_tx`), skipping channels that have no
 //!     handler attached (`None`) so a disabled channel never blocks the loop.
-//!   - signaling `state.json` writes via `StateWrite`, rate-limited for
-//!     analog movement but immediate for digital transitions.
+//!   - asking for `state.json` writes via `StateAction::Request`, rate-limited
+//!     for analog movement but immediate for digital transitions.
 //!
 //! ## Position discontinuity at gesture boundaries
 //!
@@ -28,8 +28,11 @@
 //! debounce in `run` mitigates brief session restarts that would otherwise
 //! multiply the effect.
 use deckery_controller::PadFrame;
+use crate::output::action::{OutputAction, StateAction, Urgency};
+use crate::output::Outputs;
 use crate::trackpad::PadState;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
 /// Result of comparing two consecutive `PadFrame`s: which pad(s) actually
@@ -102,19 +105,6 @@ pub enum GestureEvent {
     End,
 }
 
-/// A request to persist current state to `state.json`. The router knows
-/// *when* pad state changed and needs writing, but not *how* — it just
-/// signals intent and lets the caller's `state_write_loop` do the actual
-/// write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateWrite {
-    /// Digital state change (touch transition, gesture enter/exit) — write
-    /// immediately, bypassing rate limiting.
-    Immediate,
-    /// Analog movement tick — already rate-limited to ~60 Hz by the caller.
-    Analog,
-}
-
 /// Identifies one physical trackpad, used by `decide_gesture_transition` to
 /// say which pad "survives" when a combined gesture session ends with only
 /// one finger still down.
@@ -178,6 +168,31 @@ pub fn decide_gesture_transition(was_active: bool, frame: PadFrame) -> GestureTr
     }
 }
 
+/// Analog pad movement is published at most this often. A touch transition
+/// bypasses it entirely.
+const STATE_WRITE_INTERVAL_MS: u128 = 16;
+
+/// Asking for a snapshot, as an action.
+fn request(urgency: Urgency) -> OutputAction {
+    OutputAction::State(StateAction::Request { urgency })
+}
+
+/// How urgently state.json should be written for this frame, if at all.
+///
+/// A touch transition bypasses the rate limit, so `touching: false` always
+/// reaches the overlay promptly rather than up to 16ms late — a pointer still
+/// showing a finger that has lifted is the one stale value anybody notices.
+/// Everything else is analog movement, gated to ~60 Hz.
+pub fn plan_state_write(touch_transition: bool, since_last: Duration) -> Option<Urgency> {
+    if touch_transition {
+        Some(Urgency::Immediate)
+    } else if since_last.as_millis() >= STATE_WRITE_INTERVAL_MS {
+        Some(Urgency::Analog)
+    } else {
+        None
+    }
+}
+
 /// Runs the Core trackpad router until `rx` closes (device unplugged /
 /// reader task ended). Always updates `lpad`/`rpad` raw state for state.json
 /// export; additionally routes frames to whichever handler channels are
@@ -194,7 +209,7 @@ pub async fn run(
     lpad: &PadState,
     rpad: &PadState,
     gesture_session: &Arc<Mutex<bool>>,
-    state_tx: mpsc::Sender<StateWrite>,
+    outputs: &Outputs,
     left_tx: Option<mpsc::Sender<SinglePadFrame>>,
     right_tx: Option<mpsc::Sender<SinglePadFrame>>,
     combined_tx: Option<mpsc::Sender<GestureEvent>>,
@@ -330,7 +345,7 @@ pub async fn run(
                 // Gesture entry/exit is a digital state change — always
                 // write state.json immediately.
                 if gesture_active != was_gesture_active {
-                    let _ = state_tx.send(StateWrite::Immediate).await;
+                    outputs.dispatch(&[request(Urgency::Immediate)]).await;
                 }
             }
         }
@@ -384,14 +399,9 @@ pub async fn run(
             }
         }
 
-        // Signal state.json write, rate-limited to ~60 Hz. Touch transitions
-        // bypass the rate limit so touching=false is always written promptly.
-        if touch_transition {
+        if let Some(urgency) = plan_state_write(touch_transition, last_state_write.elapsed()) {
             last_state_write = std::time::Instant::now();
-            let _ = state_tx.send(StateWrite::Immediate).await;
-        } else if last_state_write.elapsed().as_millis() >= 16 {
-            last_state_write = std::time::Instant::now();
-            let _ = state_tx.send(StateWrite::Analog).await;
+            outputs.dispatch(&[request(urgency)]).await;
         }
     }
 }
@@ -399,6 +409,27 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::action::Emission;
+    use crate::output::outputs::Tap;
+
+    /// Ports that record instead of acting: nothing is emitted, nothing is
+    /// written, and every decision the router made is readable afterwards.
+    ///
+    /// Before issue #57 these tests built a `state_tx` whose receiver was
+    /// dropped on the next line, so they could see that the router had not
+    /// crashed and nothing else. The tap is what makes the decision visible.
+    fn watched_outputs() -> (Outputs, mpsc::Receiver<Emission>) {
+        let (tx, rx) = mpsc::channel::<Emission>(64);
+        (Outputs { tap: Some(Tap::new(tx)), ..Default::default() }, rx)
+    }
+
+    fn decisions(rx: &mut mpsc::Receiver<Emission>) -> Vec<OutputAction> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e.action);
+        }
+        out
+    }
 
     /// Shorthand for building a `PadFrame` straight from touch state, for
     /// the gesture-transition tests below where exact position doesn't
@@ -562,7 +593,7 @@ mod tests {
         let (right_tx,    mut right_rx) = mpsc::channel::<SinglePadFrame>(8);
         let (combined_tx, mut comb_rx)  = mpsc::channel::<GestureEvent>(8);
         let (pad_tx,          pad_rx)   = mpsc::channel::<PadFrame>(8);
-        let (state_tx,   _state_rx)     = mpsc::channel::<StateWrite>(8);
+        let (outputs, mut emissions)    = watched_outputs();
 
         let gaming_mode     = Arc::new(Mutex::new(true)); // already active
         let gesture_session = Arc::new(Mutex::new(false));
@@ -575,7 +606,7 @@ mod tests {
         drop(pad_tx); // close rx so run() exits after this one frame
 
         run(
-            pad_rx, &lpad, &rpad, &gesture_session, state_tx,
+            pad_rx, &lpad, &rpad, &gesture_session, &outputs,
             Some(left_tx), Some(right_tx), Some(combined_tx), gaming_mode,
         ).await;
 
@@ -585,6 +616,9 @@ mod tests {
             "right pad: synthetic lift (touching=false) must be sent on Gaming Mode activation");
         assert_eq!(comb_rx.try_recv().unwrap(), GestureEvent::End,
             "gesture device: GestureEvent::End must be sent on Gaming Mode activation");
+        assert!(decisions(&mut emissions).is_empty(),
+            "Gaming Mode skips the rest of the loop, so the router asks for no \
+             publish — the synthetic lift reaches the handlers, not state.json");
     }
 
     /// The synthetic lift must be sent **only once** when Gaming Mode is
@@ -594,7 +628,7 @@ mod tests {
     async fn gaming_mode_lift_fires_only_once_across_multiple_frames() {
         let (left_tx,  mut left_rx) = mpsc::channel::<SinglePadFrame>(8);
         let (pad_tx,       pad_rx)  = mpsc::channel::<PadFrame>(8);
-        let (state_tx, _state_rx)   = mpsc::channel::<StateWrite>(8);
+        let (outputs, mut emissions) = watched_outputs();
 
         let gaming_mode     = Arc::new(Mutex::new(true));
         let gesture_session = Arc::new(Mutex::new(false));
@@ -608,7 +642,7 @@ mod tests {
         drop(pad_tx);
 
         run(
-            pad_rx, &lpad, &rpad, &gesture_session, state_tx,
+            pad_rx, &lpad, &rpad, &gesture_session, &outputs,
             Some(left_tx), None, None, gaming_mode,
         ).await;
 
@@ -617,6 +651,8 @@ mod tests {
             "first frame: lift must arrive");
         assert!(left_rx.try_recv().is_err(),
             "frames 2 and 3 must not produce additional lifts");
+        assert!(decisions(&mut emissions).is_empty(),
+            "nor may the repeat frames ask for a publish");
     }
 
     /// While Gaming Mode is active, normal pad frames must NOT be forwarded
@@ -625,7 +661,7 @@ mod tests {
     async fn gaming_mode_suppresses_normal_pad_frames() {
         let (left_tx,  mut left_rx) = mpsc::channel::<SinglePadFrame>(8);
         let (pad_tx,       pad_rx)  = mpsc::channel::<PadFrame>(8);
-        let (state_tx, _state_rx)   = mpsc::channel::<StateWrite>(8);
+        let (outputs, mut emissions) = watched_outputs();
 
         // Start with gaming_mode already active AND gaming_mode_was_active
         // already true — simulate steady state, not the activation transition.
@@ -643,7 +679,7 @@ mod tests {
         drop(pad_tx);
 
         run(
-            pad_rx, &lpad, &rpad, &gesture_session, state_tx,
+            pad_rx, &lpad, &rpad, &gesture_session, &outputs,
             Some(left_tx), None, None, gaming_mode,
         ).await;
 
@@ -653,5 +689,58 @@ mod tests {
         // Frame 2 must NOT have produced a routing event.
         assert!(left_rx.try_recv().is_err(),
             "pad frame during steady-state Gaming Mode must not be forwarded to the handler");
+        assert!(decisions(&mut emissions).is_empty(),
+            "a touch during Gaming Mode is suppressed whole: no routing and no publish");
+    }
+
+    /// The property the three tests above could never see: the router asks for
+    /// a snapshot, and says how urgently.
+    #[tokio::test]
+    async fn a_touch_transition_asks_for_an_immediate_publish() {
+        let (left_tx,  _left_rx) = mpsc::channel::<SinglePadFrame>(8);
+        let (pad_tx,    pad_rx)  = mpsc::channel::<PadFrame>(8);
+        let (outputs, mut emissions) = watched_outputs();
+
+        let gaming_mode     = Arc::new(Mutex::new(false));
+        let gesture_session = Arc::new(Mutex::new(false));
+        let lpad            = PadState::new(true);
+        let rpad            = PadState::new(false);
+
+        // A finger lands on the left pad: a digital transition, which must not
+        // wait on the ~60 Hz gate.
+        pad_tx.send(PadFrame { lx: 100, ly: 100, ltouch: true, ..PadFrame::default() })
+            .await.unwrap();
+        drop(pad_tx);
+
+        run(
+            pad_rx, &lpad, &rpad, &gesture_session, &outputs,
+            Some(left_tx), None, None, gaming_mode,
+        ).await;
+
+        assert_eq!(
+            decisions(&mut emissions),
+            vec![OutputAction::State(StateAction::Request { urgency: Urgency::Immediate })],
+        );
+    }
+
+    // ── The publish rate limit ────────────────────────────────────────────────
+
+    #[test]
+    fn a_touch_transition_bypasses_the_rate_limit() {
+        assert_eq!(
+            plan_state_write(true, Duration::from_millis(0)),
+            Some(Urgency::Immediate),
+            "a lift that arrives 16ms late is the one stale value anybody notices",
+        );
+    }
+
+    #[test]
+    fn analog_movement_waits_for_the_gate() {
+        assert_eq!(plan_state_write(false, Duration::from_millis(15)), None);
+        assert_eq!(
+            plan_state_write(false, Duration::from_millis(16)),
+            Some(Urgency::Analog),
+            "the gate is inclusive, so ~60 Hz means 16ms and not 17",
+        );
     }
 }

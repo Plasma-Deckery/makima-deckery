@@ -56,7 +56,7 @@ pub struct Outputs {
     /// Asks the owner to publish a snapshot. Separate from `state`, which
     /// carries one: a command that fails reports it long after the press, and by
     /// then only the owner can assemble what the overlay should see.
-    pub publish: Option<mpsc::Sender<crate::trackpad_router::StateWrite>>,
+    pub publish: Option<mpsc::Sender<Urgency>>,
     /// Sees every action, whatever the ports do with it.
     pub tap: Option<Tap>,
 }
@@ -194,6 +194,16 @@ impl Outputs {
                             // A discrete event: must not be lost.
                             Urgency::Immediate => { let _ = tx.send(command).await; }
                         }
+                    }
+                }
+
+                OutputAction::State(StateAction::Request { urgency }) => {
+                    if let Some(tx) = &self.publish {
+                        // Awaited for both urgencies, unlike `Publish`: this is
+                        // a request to look at live state, not a snapshot that
+                        // can go stale, so dropping one loses the update
+                        // outright instead of merely delaying it.
+                        let _ = tx.send(*urgency).await;
                     }
                 }
 

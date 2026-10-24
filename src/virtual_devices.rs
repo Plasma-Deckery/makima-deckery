@@ -52,7 +52,8 @@ fn build_gesture_pad_device() -> VirtualDevice {
     // No INPUT_PROP_BUTTONPAD: Steam Deck pads have no physical click button
     // under the surface. BUTTONPAD would cause libinput to default to
     // button-areas click method, reserving the bottom strip. Clicks come from
-    // explicit BTN_LEFT emissions in emit_gesture_event, not libinput's logic.
+    // explicit BTN_LEFT emissions planned by `trackpad::plan_gesture_frame`,
+    // not from libinput's own logic.
 
     VirtualDeviceBuilder::new()
         .expect("Unable to create gesture pad device")
@@ -240,19 +241,6 @@ impl VirtualDevices {
     pub fn enable_gesture_pad(&mut self) {
         if self.gesture_pad.is_none() {
             self.gesture_pad = Some(build_gesture_pad_device());
-        }
-    }
-
-    /// Whether a pad device exists.
-    ///
-    /// The pads are optional, so a caller that builds an expensive frame can ask
-    /// first rather than build it for nothing.
-    pub fn has_device(&self, device: OutputDevice) -> bool {
-        match device {
-            OutputDevice::Keys | OutputDevice::Axis | OutputDevice::Abs => true,
-            OutputDevice::LeftPad => self.lpad.is_some(),
-            OutputDevice::RightPad => self.rpad.is_some(),
-            OutputDevice::GesturePad => self.gesture_pad.is_some(),
         }
     }
 
