@@ -168,17 +168,6 @@ pub fn decide_gesture_transition(was_active: bool, frame: PadFrame) -> GestureTr
     }
 }
 
-/// Runs the Core trackpad router until `rx` closes (device unplugged /
-/// reader task ended). Always updates `lpad`/`rpad` raw state for state.json
-/// export; additionally routes frames to whichever handler channels are
-/// `Some` — a `None` channel means no handler is attached for that pad/mode
-/// and is skipped entirely (never sent into), so a disabled channel can
-/// never block this loop once its buffer fills.
-///
-/// Not spawned as an independent task — called from `EventReader::run`
-/// inside `tokio::join!`, so it can borrow `PadState`/`gesture_session` etc.
-/// for its whole lifetime without needing `'static` bounds or extra Arc
-/// cloning.
 /// Analog pad movement is published at most this often. A touch transition
 /// bypasses it entirely.
 const STATE_WRITE_INTERVAL_MS: u128 = 16;
@@ -204,6 +193,17 @@ pub fn plan_state_write(touch_transition: bool, since_last: Duration) -> Option<
     }
 }
 
+/// Runs the Core trackpad router until `rx` closes (device unplugged /
+/// reader task ended). Always updates `lpad`/`rpad` raw state for state.json
+/// export; additionally routes frames to whichever handler channels are
+/// `Some` — a `None` channel means no handler is attached for that pad/mode
+/// and is skipped entirely (never sent into), so a disabled channel can
+/// never block this loop once its buffer fills.
+///
+/// Not spawned as an independent task — called from `EventReader::run`
+/// inside `tokio::join!`, so it can borrow `PadState`/`gesture_session` etc.
+/// for its whole lifetime without needing `'static` bounds or extra Arc
+/// cloning.
 pub async fn run(
     mut rx: mpsc::Receiver<PadFrame>,
     lpad: &PadState,
@@ -412,6 +412,25 @@ mod tests {
     use crate::output::action::Emission;
     use crate::output::outputs::Tap;
 
+    /// Ports that record instead of acting: nothing is emitted, nothing is
+    /// written, and every decision the router made is readable afterwards.
+    ///
+    /// Before issue #57 these tests built a `state_tx` whose receiver was
+    /// dropped on the next line, so they could see that the router had not
+    /// crashed and nothing else. The tap is what makes the decision visible.
+    fn watched_outputs() -> (Outputs, mpsc::Receiver<Emission>) {
+        let (tx, rx) = mpsc::channel::<Emission>(64);
+        (Outputs { tap: Some(Tap::new(tx)), ..Default::default() }, rx)
+    }
+
+    fn decisions(rx: &mut mpsc::Receiver<Emission>) -> Vec<OutputAction> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e.action);
+        }
+        out
+    }
+
     /// Shorthand for building a `PadFrame` straight from touch state, for
     /// the gesture-transition tests below where exact position doesn't
     /// matter.
@@ -568,25 +587,6 @@ mod tests {
 
     /// Enabling Gaming Mode must immediately send a synthetic lift to every
     /// virtual device so no touch gets stuck in the kernel.
-    /// Ports that record instead of acting: nothing is emitted, nothing is
-    /// written, and every decision the router made is readable afterwards.
-    ///
-    /// Before issue #57 these tests built a `state_tx` whose receiver was
-    /// dropped on the next line, so they could see that the router had not
-    /// crashed and nothing else. The tap is what makes the decision visible.
-    fn watched_outputs() -> (Outputs, mpsc::Receiver<Emission>) {
-        let (tx, rx) = mpsc::channel::<Emission>(64);
-        (Outputs { tap: Some(Tap::new(tx)), ..Default::default() }, rx)
-    }
-
-    fn decisions(rx: &mut mpsc::Receiver<Emission>) -> Vec<OutputAction> {
-        let mut out = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            out.push(e.action);
-        }
-        out
-    }
-
     #[tokio::test]
     async fn gaming_mode_activation_sends_synthetic_lift_to_all_devices() {
         let (left_tx,     mut left_rx)  = mpsc::channel::<SinglePadFrame>(8);

@@ -1,9 +1,9 @@
 //! Combined two-finger gesture handler.
 //!
 //! Consumes `CombinedPadFrame`s routed by `trackpad_router::run` while a
-//! gesture session is active (both pads touching simultaneously) and emits
-//! them to the combined "Deckery Gesture Pad" virtual device — see
-//! `trackpad.rs::emit_gesture_event`. libinput derives everything it needs
+//! gesture session is active (both pads touching simultaneously) and
+//! decides the frames for the combined "Deckery Gesture Pad" virtual device —
+//! see `trackpad::plan_gesture_frame`. libinput derives everything it needs
 //! (two-finger scroll/pan, pinch-zoom) purely from the two ABS_MT_POSITION
 //! slots we send; there is no separate gesture-type input we produce.
 //!

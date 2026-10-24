@@ -175,16 +175,17 @@ impl TrackpadSession {
         // rather than as three parameters is what lets the pads later return
         // actions instead of performing them — see issue #57.
         //
-        // An unclipped device port stops the session entirely: no devices, no
-        // trackpad session, and nothing reaches the kernel from here either.
-        // Each task reads the ports it needs out of `outputs` itself, so this
-        // checks the device port only to keep one rule intact: no device port,
-        // no trackpad session at all. Without it the router would still run and
-        // go on publishing pad state for devices that cannot exist.
+        // Each task reads the ports it needs out of `outputs` itself, so the
+        // only check left here is the device port, and it is there to keep one
+        // rule intact: no device port, no trackpad session at all. Without it
+        // the router would still run and go on publishing pad state for devices
+        // that cannot exist.
+        //
+        // The publish port is deliberately *not* checked. An empty port means
+        // the action has nowhere to go, so the overlay simply stops updating —
+        // whereas returning here would also stop the pads working, which is a
+        // worse answer to a missing snapshot channel than no snapshots.
         if outputs.devices.is_none() {
-            return;
-        }
-        if outputs.publish.is_none() {
             return;
         }
 
