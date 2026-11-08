@@ -352,6 +352,9 @@ pub struct RawGamingModeConfig {
     /// (process tree walk: focused PID → reaper → steam) or Steam Big Picture
     /// Mode is focused. Default: true. Set to false to disable auto-detection.
     pub auto_detect_steam_games: Option<bool>,
+    /// Mute a running Steam game while its window is not focused, and unmute it
+    /// when it is focused again. Default: false.
+    pub auto_mute: Option<bool>,
 }
 
 /// Parsed Gaming Mode configuration, ready for use at runtime.
@@ -365,6 +368,12 @@ pub struct GamingModeConfig {
     pub haptic_off: HapticChain,
     /// Whether Steam game auto-detection is active. Default: true.
     pub auto_detect_steam_games: bool,
+    /// Whether a running game is muted while its window is not focused.
+    ///
+    /// Off unless the config says otherwise: this reaches into the user's audio
+    /// mixer, which nobody expects a controller remapper to do unasked. The
+    /// shipped base config turns it on.
+    pub auto_mute: bool,
 }
 
 impl Default for GamingModeConfig {
@@ -386,6 +395,7 @@ impl Default for GamingModeConfig {
             haptic_on:  default_chain.clone(),
             haptic_off: default_chain,
             auto_detect_steam_games: true,
+            auto_mute: false,
         }
     }
 }
@@ -415,8 +425,9 @@ impl GamingModeConfig {
         let haptic_off = raw.haptic_off.unwrap_or(default_chain.haptic_off);
 
         let auto_detect_steam_games = raw.auto_detect_steam_games.unwrap_or(true);
+        let auto_mute = raw.auto_mute.unwrap_or(false);
 
-        GamingModeConfig { trigger, haptic_on, haptic_off, auto_detect_steam_games }
+        GamingModeConfig { trigger, haptic_on, haptic_off, auto_detect_steam_games, auto_mute }
     }
 }
 

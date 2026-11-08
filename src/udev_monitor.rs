@@ -65,6 +65,14 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec
     // Everything a device generation needs, assembled once. The task list is
     // the only thing that does not belong in it — that is replaced on every
     // reinit, which is exactly what the other fields are not.
+    // Once per process, not per device generation: it remembers which streams it
+    // muted, and a reinit — every config reload is one — must not forget that.
+    tokio::spawn(crate::auto_mute::auto_mute_task(
+        registry.clone(),
+        window_changed.clone(),
+        active_client.clone(),
+    ));
+
     let session = DeviceSession {
         registry:            registry.clone(),
         environment,
