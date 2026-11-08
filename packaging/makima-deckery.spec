@@ -1,5 +1,5 @@
 Name:           makima-deckery
-Version:        0.4.1
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
@@ -91,6 +91,12 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Sun Nov 08 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 0.5.0-1
+- Input path rebuilt around a pure decision core; every effect leaves through one port
+- Trackpads decide and dispatch the same way: haptics, publish requests and pad frames
+- A mistyped value in [settings] is a tray warning instead of a crash at start
+- License field corrected to GPL-3.0-only (was MIT)
+
 * Sun Sep 27 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 0.4.1-1
 - Command bindings report failures: journal entry plus an error toast in the HUD
 - Shell operators in a command binding are no longer split by the spawn path
