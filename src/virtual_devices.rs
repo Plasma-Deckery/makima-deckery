@@ -1,3 +1,5 @@
+use crate::output::OutputDevice;
+
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
     AbsoluteAxisType, AbsInfo, BusType, InputId, Key, PropType, UinputAbsSetup,
@@ -15,14 +17,16 @@ fn deckery_input_id() -> InputId {
 }
 
 pub struct VirtualDevices {
-    pub keys: VirtualDevice,
-    pub axis: VirtualDevice,
-    pub abs: VirtualDevice,
-    pub lpad: Option<VirtualDevice>,
-    pub rpad: Option<VirtualDevice>,
+    keys: VirtualDevice,
+    axis: VirtualDevice,
+    abs: VirtualDevice,
+    /// Whether `abs` has been rebuilt with a physical tablet's axis ranges.
+    tablet_enabled: bool,
+    lpad: Option<VirtualDevice>,
+    rpad: Option<VirtualDevice>,
     /// Combined two-finger gesture device. Active when `combined_gesture_device = true`
     /// in the config. Receives left pad as slot 0 and right pad as slot 1.
-    pub gesture_pad: Option<VirtualDevice>,
+    gesture_pad: Option<VirtualDevice>,
 }
 
 fn build_gesture_pad_device() -> VirtualDevice {
@@ -48,7 +52,8 @@ fn build_gesture_pad_device() -> VirtualDevice {
     // No INPUT_PROP_BUTTONPAD: Steam Deck pads have no physical click button
     // under the surface. BUTTONPAD would cause libinput to default to
     // button-areas click method, reserving the bottom strip. Clicks come from
-    // explicit BTN_LEFT emissions in emit_gesture_event, not libinput's logic.
+    // explicit BTN_LEFT emissions planned by `trackpad::plan_gesture_frame`,
+    // not from libinput's own logic.
 
     VirtualDeviceBuilder::new()
         .expect("Unable to create gesture pad device")
@@ -111,8 +116,66 @@ fn build_trackpad_device(name: &str) -> VirtualDevice {
         .unwrap()
 }
 
+/// Abs axes mirrored from a physical tablet: position, tilt, pressure,
+/// distance and wheel. Anything else the pen reports is not forwarded.
+const TABLET_ABS_AXES: &[usize] = &[0, 1, 2, 5, 6, 8, 24, 25, 26, 27, 40];
+
+fn tablet_key_capabilities() -> evdev::AttributeSet<Key> {
+    let mut caps = evdev::AttributeSet::new();
+    for i in 272..277 { caps.insert(Key(i)); }
+    for i in 320..325 { caps.insert(Key(i)); }
+    for i in 326..328 { caps.insert(Key(i)); }
+    for i in 330..333 { caps.insert(Key(i)); }
+    caps
+}
+
+/// Build the pen/tablet output device. Without a `source` the device carries no
+/// abs axes — enough to exist, not enough to carry pen input. A real tablet is
+/// only known once discovery has run, so `enable_tablet()` rebuilds it then.
+fn build_tablet_device(source: Option<&evdev::Device>) -> VirtualDevice {
+    let mut tab_rel = evdev::AttributeSet::new();
+    tab_rel.insert(evdev::RelativeAxisType(8));
+    let mut tab_msc = evdev::AttributeSet::new();
+    tab_msc.insert(evdev::MiscType(0));
+
+    let mut builder = VirtualDeviceBuilder::new()
+        .expect("Unable to create virtual device through uinput. Take a look at the Troubleshooting section for more info.")
+        .name("Makima Virtual Pen/Tablet")
+        .with_msc(&tab_msc).unwrap()
+        .with_relative_axes(&tab_rel).unwrap()
+        .with_keys(&tablet_key_capabilities()).unwrap();
+
+    if let Some(device) = source {
+        let properties = device.properties();
+        builder = builder.with_properties(&properties).unwrap();
+        if let Ok(absinfo) = device.get_abs_state() {
+            for (axis, info) in absinfo.iter().enumerate() {
+                if !TABLET_ABS_AXES.contains(&axis) {
+                    continue;
+                }
+                let setup = UinputAbsSetup::new(
+                    AbsoluteAxisType(axis as u16),
+                    AbsInfo::new(info.value, info.minimum, info.maximum,
+                                 info.fuzz, info.flat, info.resolution),
+                );
+                builder = builder.with_absolute_axis(&setup).unwrap();
+            }
+        }
+    }
+    builder.build().unwrap()
+}
+
 impl VirtualDevices {
-    pub fn new(device: evdev::Device) -> Self {
+    /// Create the output device layer.
+    ///
+    /// Independent of any physical input device: the layer is built once at
+    /// startup and outlives every controller connect/disconnect cycle. Keyboard
+    /// and relative-mouse devices are fully functional immediately.
+    ///
+    /// Trackpad devices (`lpad`, `rpad`, `gesture_pad`) start as `None` and are
+    /// enabled later via `enable_trackpads()` / `enable_gesture_pad()` once the
+    /// physical controller is detected and its trackpad config is known.
+    pub fn new() -> Self {
         let mut key_capabilities = evdev::AttributeSet::new();
         for i in 1..334 {
             key_capabilities.insert(Key(i));
@@ -121,72 +184,40 @@ impl VirtualDevices {
         for i in 0..13 {
             axis_capabilities.insert(evdev::RelativeAxisType(i));
         }
-        let mut tablet_abs_capabilities: Vec<evdev::UinputAbsSetup> = Vec::new();
-        if let Ok(absinfo) = device.get_abs_state() {
-            for (axis_type, info) in absinfo.iter().enumerate() {
-                if [0, 1, 2, 5, 6, 8, 24, 25, 26, 27, 40].contains(&axis_type) {
-                    let new_absinfo = evdev::AbsInfo::new(
-                        info.value,
-                        info.minimum,
-                        info.maximum,
-                        info.fuzz,
-                        info.flat,
-                        info.resolution,
-                    );
-                    tablet_abs_capabilities.push(evdev::UinputAbsSetup::new(
-                        evdev::AbsoluteAxisType(axis_type.try_into().unwrap()),
-                        new_absinfo,
-                    ))
-                }
-            }
-        }
-        let mut tablet_capabilities = evdev::AttributeSet::new();
-        for i in 272..277 {
-            tablet_capabilities.insert(evdev::Key(i));
-        }
-        for i in 320..325 {
-            tablet_capabilities.insert(evdev::Key(i));
-        }
-        for i in 326..328 {
-            tablet_capabilities.insert(evdev::Key(i));
-        }
-        for i in 330..333 {
-            tablet_capabilities.insert(evdev::Key(i));
-        }
-        let mut tab_rel = evdev::AttributeSet::new();
-        tab_rel.insert(evdev::RelativeAxisType(8));
-        let mut tab_msc = evdev::AttributeSet::new();
-        tab_msc.insert(evdev::MiscType(0));
-        let pointer_prop = device.properties();
-        let keys_builder = VirtualDeviceBuilder::new()
+
+        let keys = VirtualDeviceBuilder::new()
             .expect("Unable to create virtual device through uinput. Take a look at the Troubleshooting section for more info.")
             .name("Makima Virtual Keyboard/Mouse")
-            .with_keys(&key_capabilities).unwrap();
-        let axis_builder = VirtualDeviceBuilder::new()
+            .with_keys(&key_capabilities).unwrap()
+            .build().unwrap();
+        let axis = VirtualDeviceBuilder::new()
             .expect("Unable to create virtual device through uinput. Take a look at the Troubleshooting section for more info.")
             .name("Makima Virtual Pointer")
-            .with_relative_axes(&axis_capabilities).unwrap();
-        let mut abs_builder = VirtualDeviceBuilder::new()
-            .expect("Unable to create virtual device through uinput. Take a look at the Troubleshooting section for more info.")
-            .name("Makima Virtual Pen/Tablet")
-            .with_properties(&pointer_prop).unwrap()
-            .with_msc(&tab_msc).unwrap()
-            .with_relative_axes(&tab_rel).unwrap()
-            .with_keys(&tablet_capabilities).unwrap()
-            .input_id(device.input_id());
-        for abs_setup in tablet_abs_capabilities {
-            abs_builder = abs_builder.with_absolute_axis(&abs_setup).unwrap();
-        }
-        let virtual_device_keys = keys_builder.build().unwrap();
-        let virtual_device_axis = axis_builder.build().unwrap();
-        let virtual_device_abs = abs_builder.build().unwrap();
+            .with_relative_axes(&axis_capabilities).unwrap()
+            .build().unwrap();
+        let abs = build_tablet_device(None);
+
         Self {
-            keys: virtual_device_keys,
-            axis: virtual_device_axis,
-            abs: virtual_device_abs,
+            keys,
+            axis,
+            abs,
+            tablet_enabled: false,
             lpad: None,
             rpad: None,
             gesture_pad: None,
+        }
+    }
+
+    /// Rebuild the pen/tablet device with the abs axes of a physical tablet.
+    ///
+    /// The output layer is created before any device is known, so the axis
+    /// ranges of a pen — which are device-specific — cannot be set up front.
+    /// Idempotent for the same reason as `enable_trackpads`: rebuilding would
+    /// tear down the uinput node and force libinput to rediscover it.
+    pub fn enable_tablet(&mut self, source: &evdev::Device) {
+        if !self.tablet_enabled {
+            self.abs = build_tablet_device(Some(source));
+            self.tablet_enabled = true;
         }
     }
 
@@ -210,6 +241,37 @@ impl VirtualDevices {
     pub fn enable_gesture_pad(&mut self) {
         if self.gesture_pad.is_none() {
             self.gesture_pad = Some(build_gesture_pad_device());
+        }
+    }
+
+    /// Send one frame to one device.
+    ///
+    /// One call is one frame as the kernel reads it: `evdev` appends a SYN_REPORT
+    /// per `emit`, so `events` is a frame and not a list of things to send. They
+    /// go out exactly as given, timestamps included, which is what lets a
+    /// forwarded hardware event stay the event it was.
+    ///
+    /// A pad that was never enabled has nowhere to put the frame, and that is not
+    /// an error — it is a device the config switched off.
+    pub fn emit(
+        &mut self,
+        device: OutputDevice,
+        events: &[evdev::InputEvent],
+    ) -> std::io::Result<()> {
+        match self.device_mut(device) {
+            Some(dev) => dev.emit(events),
+            None => Ok(()),
+        }
+    }
+
+    fn device_mut(&mut self, device: OutputDevice) -> Option<&mut VirtualDevice> {
+        match device {
+            OutputDevice::Keys => Some(&mut self.keys),
+            OutputDevice::Axis => Some(&mut self.axis),
+            OutputDevice::Abs => Some(&mut self.abs),
+            OutputDevice::LeftPad => self.lpad.as_mut(),
+            OutputDevice::RightPad => self.rpad.as_mut(),
+            OutputDevice::GesturePad => self.gesture_pad.as_mut(),
         }
     }
 }

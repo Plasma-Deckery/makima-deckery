@@ -7,7 +7,7 @@ BindsTo=deckery-tray.service
 ExecStart=%h/.local/bin/makima-deckery
 Restart=on-failure
 RestartSec=3
-Environment=MAKIMA_CONFIG=%h/.config/makima
+Environment=DECKERY_CONFIG=%h/.config/deckery
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=DISPLAY=:0
 Environment=XDG_SESSION_TYPE=wayland

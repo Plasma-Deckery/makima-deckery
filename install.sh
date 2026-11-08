@@ -1,10 +1,6 @@
 #!/bin/bash
 # install.sh — one-time setup + initial build for makima-deckery.
 # For subsequent code changes, use redeploy.sh instead.
-#
-# Prerequisites (manual, one-time):
-#   sudo usermod -aG input $USER   # grants access to /dev/input/* and /dev/uinput
-#   (log out and back in for the group to take effect)
 
 set -e
 REPO="$(dirname "$(readlink -f "$0")")"
@@ -12,11 +8,34 @@ BUILD_PACKAGES="rust pkgconf gcc systemd-libs rpm-tools make copr-cli"
 
 echo "Repo: $REPO"
 
-# ── 1. Distrobox container + packages ────────────────────────────────────────
-distrobox create --name deckery --image archlinux:latest || true
-distrobox enter deckery -- sudo pacman -S --needed --noconfirm $BUILD_PACKAGES
+# ── 1. udev rule ─────────────────────────────────────────────────────────────
+#
+# Grants the active login session access to /dev/uinput via TAG+="uaccess"
+# (logind-scoped, narrower than adding the user to the input group).
+# Idempotent: sudo is only called when the installed rule differs from the
+# source, so updates never prompt for a password.
 
-# ── 2. Systemd user services (no sudo) ───────────────────────────────────────
+_UDEV_SRC="$REPO/udev/50-makima.rules"
+_UDEV_DST="/etc/udev/rules.d/50-makima.rules"
+
+if ! diff -q "$_UDEV_SRC" "$_UDEV_DST" 2>/dev/null; then
+    echo "Installing udev rule (requires sudo once)..."
+    sudo install -Dm644 "$_UDEV_SRC" "$_UDEV_DST"
+    sudo modprobe uinput 2>/dev/null || true
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=misc
+    sudo udevadm settle
+else
+    echo "udev rule already up to date — no sudo needed"
+fi
+
+# ── 2. Distrobox container + packages ────────────────────────────────────────
+distrobox create --name deckery --image archlinux:latest || true
+if ! distrobox enter deckery -- pacman -Q $BUILD_PACKAGES &>/dev/null; then
+    distrobox enter deckery -- sudo pacman -S --needed --noconfirm $BUILD_PACKAGES
+fi
+
+# ── 3. Systemd user services (no sudo) ───────────────────────────────────────
 SERVICE_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SERVICE_DIR"
 for svc in makima.service; do
@@ -53,5 +72,17 @@ if [ -f "$OLD_BIN" ]; then
     rm -f "$OLD_BIN"
 fi
 
-# ── 3. Build + deploy ────────────────────────────────────────────────────────
+# ── 4. qdbus compatibility shim ──────────────────────────────────────────────
+#
+# CachyOS and other Qt6-only distros ship qdbus6 but not qdbus. The deckery
+# configs use `run = ["qdbus ..."]` for KDE actions (nextDesktop, invokeShortcut
+# etc.). Create a user-level symlink so the existing configs work unchanged.
+_QDBUS_BIN="$HOME/.local/bin/qdbus"
+if ! command -v qdbus &>/dev/null && command -v qdbus6 &>/dev/null; then
+    echo "qdbus not found but qdbus6 is available — creating compatibility symlink"
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$(command -v qdbus6)" "$_QDBUS_BIN"
+fi
+
+# ── 5. Build + deploy ────────────────────────────────────────────────────────
 bash "$REPO/redeploy.sh"

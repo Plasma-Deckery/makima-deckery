@@ -1,32 +1,39 @@
 mod active_client;
 mod analog;
 mod config;
+mod config_registry;
 mod device_session;
-mod event_reader;
+mod device_tasks;
+mod event_loop;
 mod gesture_pad;
+mod compositor;
 mod kde_input_defaults;
-mod kwin_watcher;
-mod steam_detector;
-mod lizard_mode;
-mod mt_trackpad;
-mod pad_hidraw;
-mod resolver;
 mod resume_watcher;
+mod steam_detector;
+mod subprocess;
+mod machine;
+mod mt_trackpad;
+mod output;
+mod preferences;
+mod resolver;
 mod scroll_pad;
+mod settings;
+mod session;
 mod state_export;
+mod state_writer;
 mod trackball;
 mod trackpad;
 mod trackpad_router;
 mod udev_monitor;
 mod virtual_devices;
 
-use crate::udev_monitor::*;
-use config::Config;
-use std::env;
+use crate::config_registry::ConfigRegistry;
+use crate::udev_monitor::start_monitoring_udev;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio;
-use tokio::sync::Mutex;
+use tokio::net::UnixListener;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 /// Process start time, set once at the top of `main()`. Used to log
@@ -40,23 +47,29 @@ pub fn startup_ms() -> u128 {
     START.get().map(|s| s.elapsed().as_millis()).unwrap_or(0)
 }
 
-pub fn load_config_files(config_dir: &str) -> Vec<Config> {
-    let dir = match std::fs::read_dir(config_dir) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    let mut config_files: Vec<Config> = Vec::new();
-    for file in dir {
-        let filename: String = file.as_ref().unwrap().file_name().into_string().unwrap();
-        if filename.ends_with(".toml") && !filename.starts_with(".") {
-            let name: String = filename.split(".toml").collect::<Vec<&str>>()[0].to_string();
-            let config_file: Config =
-                Config::new_from_file(file.unwrap().path().to_str().unwrap(), name);
-            config_files.push(config_file);
-        }
-    }
-    config_files
+/// Microseconds elapsed since process start.
+///
+/// Same clock as `startup_ms` and as `trace_record`'s `t_us`, so a recorded
+/// input trace and a recorded action journal can be laid over each other.
+pub fn startup_us() -> u128 {
+    START.get().map(|s| s.elapsed().as_micros()).unwrap_or(0)
 }
+
+fn wait_for_config_dir(path: &std::path::Path) {
+    if path.is_dir() {
+        return;
+    }
+    eprintln!("deckery: config dir {:?} not found — waiting (install may still be running)", path);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if path.is_dir() {
+            eprintln!("deckery: config dir {:?} appeared, continuing startup", path);
+            return;
+        }
+        eprintln!("deckery: still waiting for config dir {:?}", path);
+    }
+}
+
 
 #[tokio::main]
 async fn main() {
@@ -70,54 +83,75 @@ async fn main() {
         default_hook(info);
         std::process::exit(1);
     }));
-    let config_dir = match env::var("MAKIMA_CONFIG") {
-        Ok(path) => {
-            println!("\nMAKIMA_CONFIG set to {:?}.\n", path);
-            if !std::path::Path::new(&path).is_dir() {
-                println!("Directory not found, exiting Makima.");
-                std::process::exit(0);
-            }
-            path
-        }
-        Err(_) => {
-            let user_home = match env::var("HOME") {
-                Ok(user_home) if user_home == "/root".to_string() => match env::var("SUDO_USER") {
-                    Ok(sudo_user) => format!("/home/{}", sudo_user),
-                    _ => user_home,
-                },
-                Ok(user_home) => user_home,
-                _ => "/root".to_string(),
-            };
-            let user_config_path = format!("{}/.config/makima", user_home);
-            // System-wide fallback: used when installed via RPM without per-user config.
-            // The deckery RPM meta-package installs default configs here.
-            let system_config_path = "/usr/share/makima-deckery/configs";
-            if std::path::Path::new(&user_config_path).is_dir() {
-                println!(
-                    "\nMAKIMA_CONFIG environment variable is not set, using {:?}.\n",
-                    user_config_path
-                );
-                user_config_path
-            } else if std::path::Path::new(system_config_path).is_dir() {
-                println!(
-                    "\nMAKIMA_CONFIG environment variable is not set. \
-                     No user config found at {:?}, falling back to system default at {:?}.\n",
-                    user_config_path, system_config_path
-                );
-                system_config_path.to_string()
-            } else {
-                println!(
-                    "\nMAKIMA_CONFIG environment variable is not set. \
-                     No config found at {:?} or {:?}, exiting.\n",
-                    user_config_path, system_config_path
-                );
-                std::process::exit(0);
-            }
-        }
-    };
-    let config_files = load_config_files(&config_dir);
-    println!("makima: config loaded, +{}ms since startup", startup_ms());
+    let roots = config_registry::ConfigRoots::resolve();
+    eprintln!("deckery: system configs: {:?}", roots.system);
+    eprintln!("deckery: user configs:   {:?}", roots.user);
+    // Only the system root has to be there. The user root holds overrides and
+    // preferences, and stays absent until the user actually makes one.
+    wait_for_config_dir(&roots.system);
+    let registry = ConfigRegistry::load(roots);
+    // Hints resolve against the merged config, so a dead or ambiguous one can
+    // only be detected here — not while parsing the file it was written in.
+    // Reported, never fatal: a hint is display-only.
+    for warning in registry.hint_warnings() {
+        eprintln!("deckery: {warning}");
+    }
+    eprintln!("deckery: config loaded, +{}ms since startup", startup_ms());
+    let state_tx = state_writer::spawn_state_writer();
+    // Publish initial config list so the tray sees all configs on startup,
+    // even before any device is connected.
+    let _ = state_tx.try_send(state_writer::StateCommand::SetLoadedConfigs(registry.snapshot()));
+    // Where those configs came from — the tray offers both folders for opening.
+    let _ = state_tx.try_send(
+        state_writer::StateCommand::SetConfigRoots(registry.roots().clone()));
+    // A broken base config is a global failure — escalate to a top-level error
+    // so the tray shows red, not just a per-config marker in the submenu.
+    udev_monitor::report_base_config_error(&registry, &state_tx);
     let tasks: Vec<JoinHandle<()>> = Vec::new();
-    let gaming_mode: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    start_monitoring_udev(config_files, config_dir, tasks, gaming_mode).await;
+    let gaming_mode: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
+
+    // IPC socket — bound once here, broadcast to all active EventReaders.
+    let (ipc_tx, _) = broadcast::channel::<String>(16);
+    {
+        let ipc_tx = ipc_tx.clone();
+        tokio::spawn(async move {
+            // Bind in $XDG_RUNTIME_DIR (= /run/user/<uid>), not /tmp.
+            //
+            // /tmp is mode 1777, so any local process can create the socket
+            // name before we bind it. This socket accepts "pause", i.e. it can
+            // switch off input remapping — not something to leave squattable.
+            // The runtime dir is mode 0700 and per-user, which additionally
+            // lets deckery-auth-daemon address each user's instance separately
+            // (it scans /run/user/*/makima-control.sock); a single /tmp path
+            // cannot express that. It is also why the daemon can reach us at
+            // all: it runs with PrivateTmp=yes and sees an empty /tmp.
+            //
+            // No /tmp fallback on purpose — it would silently downgrade to the
+            // squattable path in exactly the situation where something is
+            // already unusual.
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+                .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+            let socket_path = format!("{runtime_dir}/makima-control.sock");
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = match UnixListener::bind(&socket_path) {
+                Ok(l) => l,
+                Err(e) => { eprintln!("deckery: IPC socket bind failed: {}", e); return; }
+            };
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { continue };
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    reader.read_line(&mut line),
+                ).await;
+                if read.is_err() || read.unwrap().is_err() { continue; }
+                let cmd = line.trim().to_string();
+                if !cmd.is_empty() { let _ = ipc_tx.send(cmd); }
+            }
+        });
+    }
+
+    start_monitoring_udev(registry, tasks, gaming_mode, state_tx, ipc_tx).await;
 }

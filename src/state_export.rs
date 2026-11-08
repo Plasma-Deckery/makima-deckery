@@ -1,15 +1,17 @@
 // ── Deckery State Export ──────────────────────────────────────────────────────
 //
-// Writes /tmp/makima-state.json atomically on every config or modifier change.
-// The file is consumed by the Deckery HUD overlay to display live button
-// mappings without re-implementing any of makima's lookup logic.
+// Provides `build_state()` — a pure function that assembles the full
+// state snapshot as a JSON value, consumed by the Deckery HUD overlay
+// to display live button mappings without re-implementing makima's lookup
+// logic.
 //
-// Called from EventReader::write_state() in event_reader.rs, which handles
-// all Arc/Mutex locking and passes plain values here.
+// Actual I/O (writing the state file) is handled exclusively by
+// `state_writer::flush()` via the `StateWriterHandle` channel.  Nothing in
+// this module touches the filesystem.
 
-use crate::config::{Event, GamingModeConfig};
+use crate::config::{Event, GamingModeConfig, Hint};
 use crate::resolver::{resolve_binding, ResolvedBinding};
-use crate::Config;
+use crate::config::Config;
 use evdev::Key;
 use serde::Serialize;
 use serde_json;
@@ -48,6 +50,93 @@ pub fn now_ts() -> f64 {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// The custom modifiers held right now.
+///
+/// A modifier counts as held either directly, or through its own modifier-less
+/// remap: `R1 = ["KEY_LEFTCTRL"]` means holding R1 puts Ctrl into `modifiers`,
+/// and the combo `R1-A` still has to resolve.
+pub fn active_input_modifiers(config: &Config, modifiers: &[Event]) -> Vec<Event> {
+    config
+        .mapped_modifiers
+        .custom
+        .iter()
+        .filter(|input_mod| {
+            if modifiers.contains(input_mod) {
+                return true;
+            }
+            config
+                .bindings
+                .remap
+                .get(*input_mod)
+                .and_then(|m| m.get(&vec![]))
+                .map(|output_keys: &Vec<Key>| {
+                    output_keys
+                        .iter()
+                        .any(|k| modifiers.contains(&Event::Key(*k)))
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Every button that acts as a hint modifier somewhere in this config.
+pub fn hint_modifier_buttons(config: &Config) -> std::collections::HashSet<Event> {
+    config
+        .bindings
+        .hints_resolved
+        .keys()
+        .flat_map(|(_, combo)| combo.iter().copied())
+        .collect()
+}
+
+/// The set a hint's combo is matched against.
+///
+/// Hints are display-only, so their modifiers were never registered in
+/// mapped_modifiers and never enter `modifiers`. They are recognised from
+/// held_keys instead, which tracks every pressed button regardless of role.
+/// Real modifiers stay in the comparison set: holding L1 *and* R5 must hide
+/// R5-only hints, because L1 opens an actual layer.
+///
+/// The trigger of the press needs no special handling: it only survives the
+/// filter if it is itself a hint modifier somewhere, which is the same thing
+/// the display side decides.
+pub fn hint_modifiers(
+    config: &Config,
+    active_input_mods: &[Event],
+    held_keys: &[Event],
+) -> Vec<Event> {
+    let buttons = hint_modifier_buttons(config);
+    let mut hint_mods: Vec<Event> = active_input_mods.to_vec();
+    hint_mods.extend(held_keys.iter().filter(|e| buttons.contains(e)).copied());
+    hint_mods.sort();
+    hint_mods.dedup();
+    hint_mods
+}
+
+/// A combo counts only when the held set is exactly it — same rule as the
+/// resolver, so nothing is advertised or announced that would not fire.
+pub fn combo_satisfied(combo: &[Event], held: &[Event]) -> bool {
+    !combo.is_empty() && combo.len() == held.len() && combo.iter().all(|m| held.contains(m))
+}
+
+/// The hint `trigger` carries under the currently held buttons, if any.
+///
+/// Shared with the event reader so a pressed hint announces itself with the
+/// same label the HUD is already showing for it, decided by the same rule.
+pub fn matching_hint<'a>(
+    config: &'a Config,
+    trigger: &Event,
+    hint_mods: &[Event],
+) -> Option<&'a Hint> {
+    config
+        .bindings
+        .hints_resolved
+        .iter()
+        .find(|((t, combo), _)| t == trigger && combo_satisfied(combo, hint_mods))
+        .map(|(_, hint)| hint)
+}
+
 /// Canonical modifier order: Meta → Ctrl → Alt → Shift → everything else.
 /// Matches the standard shortcut notation used by most desktop environments.
 fn modifier_sort_key(key: &str) -> (u8, String) {
@@ -74,7 +163,6 @@ fn modifier_sort_key(key: &str) -> (u8, String) {
 pub fn build_state(
     config: &Config,
     modifiers: &[Event],
-    layout: u16,
     paused: bool,
     gaming_mode: bool,
     held_keys: &[Event],
@@ -181,49 +269,59 @@ pub fn build_state(
         }
     }
 
-    // Build modifier_active: combos reachable given the currently held modifiers.
-    let active_input_mods: Vec<Event> = config
-        .mapped_modifiers
-        .custom
-        .iter()
-        .filter(|input_mod| {
-            if modifiers.contains(input_mod) {
-                return true;
-            }
-            config
-                .bindings
-                .remap
-                .get(*input_mod)
-                .and_then(|m| m.get(&vec![]))
-                .map(|output_keys: &Vec<Key>| {
-                    output_keys
-                        .iter()
-                        .any(|k| modifiers.contains(&Event::Key(*k)))
-                })
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
+    // The merge flattens base and override hints into one map, so the hint
+    // itself is the only record of where its line was written — the active
+    // config's name would report a base hint as app-specific in every app.
+    let origin_hint = |hint: &Hint| -> &str {
+        if hint.from_override { &config.name } else { base_name }
+    };
 
-    // Track the combo length of each inserted entry so a more specific combo
-    // (longer = more modifiers) always wins over a less specific one.
+    // Modifier-less hints relabel a plain button, so they belong here and not in
+    // modifier_active — there is no modifier to wait for. The existing action is
+    // left in place: it stays the HUD's fallback text and keeps active_outputs
+    // honest. resolve_hints already refused any button that carries a written
+    // label, so nothing hand-written is overwritten.
+    for ((trigger, combo), hint) in &config.bindings.hints_resolved {
+        if !combo.is_empty() {
+            continue;
+        }
+        let key = event_to_str(trigger);
+        match bindings.get_mut(&key) {
+            Some(entry) => {
+                entry["label"]  = serde_json::json!(hint.label);
+                entry["origin"] = serde_json::json!(origin_hint(hint));
+                entry["kind"]   = serde_json::json!("hint");
+            }
+            None => {
+                bindings.insert(key, serde_json::json!({
+                    "action": [],
+                    "origin": origin_hint(hint),
+                    "label":  hint.label,
+                    "kind":   "hint",
+                    "silent": false,
+                }));
+            }
+        }
+    }
+
+    // Build modifier_active: combos reachable given the currently held modifiers.
+    let active_input_mods = active_input_modifiers(config, modifiers);
+    let hint_mods = hint_modifiers(config, &active_input_mods, held_keys);
+    let shown_under = |combo: &Vec<Event>, held: &[Event]| -> bool {
+        combo_satisfied(combo, held)
+    };
     let mut modifier_active: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    let mut modifier_active_combo_len: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     if !active_input_mods.is_empty() {
         // Remap combos
         for (trigger, modifier_map) in &config.bindings.remap {
             for (combo, actions) in modifier_map {
-                if !combo.is_empty() && combo.len() == active_input_mods.len() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                if shown_under(combo, &active_input_mods) {
                     let key = event_to_str(trigger);
-                    if combo.len() < *modifier_active_combo_len.get(&key).unwrap_or(&0) {
-                        continue;
-                    }
                     let action_list: Vec<serde_json::Value> = actions
                         .iter()
                         .map(|k| serde_json::Value::String(format!("{:?}", k)))
                         .collect();
                     let label = config.bindings.labels.get(&(*trigger, combo.clone()));
-                    modifier_active_combo_len.insert(key.clone(), combo.len());
                     modifier_active.insert(
                         key,
                         serde_json::json!({
@@ -239,17 +337,13 @@ pub fn build_state(
         // Command combos (e.g. BTN_TL-BTN_DPAD_LEFT = ["qdbus ..."])
         for (trigger, modifier_map) in &config.bindings.commands {
             for (combo, commands) in modifier_map {
-                if !combo.is_empty() && combo.len() == active_input_mods.len() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                if shown_under(combo, &active_input_mods) {
                     let key = event_to_str(trigger);
-                    if combo.len() < *modifier_active_combo_len.get(&key).unwrap_or(&0) {
-                        continue;
-                    }
                     let action_list: Vec<serde_json::Value> = commands
                         .iter()
                         .map(|s| serde_json::Value::String(s.clone()))
                         .collect();
                     let label = config.bindings.labels.get(&(*trigger, combo.clone()));
-                    modifier_active_combo_len.insert(key.clone(), combo.len());
                     modifier_active.insert(
                         key,
                         serde_json::json!({
@@ -265,13 +359,9 @@ pub fn build_state(
         // Movement combos (e.g. LSTICK_UP = ["KEY_W"] in bind-mode)
         for (trigger, modifier_map) in &config.bindings.movements {
             for (combo, movement) in modifier_map {
-                if !combo.is_empty() && combo.len() == active_input_mods.len() && combo.iter().all(|m| active_input_mods.contains(m)) {
+                if shown_under(combo, &active_input_mods) {
                     let key = event_to_str(trigger);
-                    if combo.len() < *modifier_active_combo_len.get(&key).unwrap_or(&0) {
-                        continue;
-                    }
                     let label = config.bindings.labels.get(&(*trigger, combo.clone()));
-                    modifier_active_combo_len.insert(key.clone(), combo.len());
                     modifier_active.insert(
                         key,
                         serde_json::json!({
@@ -283,6 +373,31 @@ pub fn build_state(
                     );
                 }
             }
+        }
+    }
+
+    // Hints: a fourth pass, matched against hint_mods rather than
+    // active_input_mods. Precedence against real bindings was already applied in
+    // resolve_hints, so the only guard needed here is against another hint of
+    // equal length landing on the same button.
+    if !hint_mods.is_empty() {
+        for ((trigger, combo), hint) in &config.bindings.hints_resolved {
+            if !shown_under(combo, &hint_mods) {
+                continue;
+            }
+            let key = event_to_str(trigger);
+            if modifier_active.contains_key(&key) {
+                continue;
+            }
+            modifier_active.insert(
+                key,
+                serde_json::json!({
+                    "action": [],
+                    "origin": origin_hint(hint),
+                    "kind": "hint",
+                    "label": hint.label,
+                }),
+            );
         }
     }
 
@@ -344,19 +459,71 @@ pub fn build_state(
         .chain(config.bindings.movements.values().flat_map(|m| m.keys()))
         .filter(|c| !c.is_empty())
         .collect();
-    let mut available_modifiers: Vec<String> = config.mapped_modifiers.custom
+
+    // For each available modifier, check whether any qualifying combo originates
+    // from an app-specific override (config.override_bindings). If yes →
+    // has_app_combos: true in the emitted object, so the HUD can signal it.
+    // A combo qualifies for modifier m when it contains m and all currently
+    // held modifiers — shared predicate used by both the availability filter
+    // and the has_app_combos check so the logic can't drift out of sync.
+    let qualifies = |m: &Event, combo: &Vec<Event>| -> bool {
+        combo.contains(m) && active_input_mods.iter().all(|held| combo.contains(held))
+    };
+    let has_app_combos = |m: &Event| -> bool {
+        match &config.override_bindings {
+            None => false,
+            Some(ov) => {
+                ov.remap.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
+                    || ov.commands.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
+                    || ov.movements.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
+            }
+        }
+    };
+
+    let mut available_modifiers: serde_json::Map<String, serde_json::Value> = config.mapped_modifiers.custom
         .iter()
         .filter(|m| !active_input_mods.contains(m))
-        .filter(|m| {
-            all_combos.iter().any(|combo| {
-                combo.contains(m)
-                    && active_input_mods.iter().all(|held| combo.contains(held))
-            })
-        })
-        .map(event_to_str)
+        .filter(|m| all_combos.iter().any(|combo| qualifies(m, combo)))
+        .map(|m| (event_to_str(m), serde_json::json!({
+            "has_app_combos": has_app_combos(m),
+        })))
         .collect();
-    available_modifiers.sort();
-    available_modifiers.dedup();
+
+    // Hint modifiers join the same list, marked virtual. The field's meaning
+    // widens from "pressing this unlocks a combo" to "…a combo *or* hints" —
+    // that is deliberate: the point is to signal that something is there to
+    // discover before the button is pressed. They are NOT added to
+    // held_modifiers, which stays reserved for makima's own input modifiers.
+    let hint_qualifies = |m: &Event, combo: &Vec<Event>| -> bool {
+        combo.contains(m) && hint_mods.iter().all(|held| combo.contains(held))
+    };
+    for m in &hint_modifier_buttons(config) {
+        if hint_mods.contains(m) {
+            continue;
+        }
+        let key = event_to_str(m);
+        if available_modifiers.contains_key(&key) {
+            continue;
+        }
+        // `has_app_combos` asks the same question here as for real modifiers —
+        // "is at least one of the things behind this button app-specific?" — so
+        // it is answered the same way, from where the hints were written.
+        let mut unlocks_any = false;
+        let mut unlocks_app = false;
+        for ((_, combo), hint) in &config.bindings.hints_resolved {
+            if !hint_qualifies(m, combo) {
+                continue;
+            }
+            unlocks_any = true;
+            unlocks_app |= hint.from_override;
+        }
+        if unlocks_any {
+            available_modifiers.insert(key, serde_json::json!({
+                "has_app_combos": unlocks_app,
+                "virtual": true,
+            }));
+        }
+    }
 
     // Determine active app name from config_stack (e.g., "org.mozilla.firefox" or "default")
     let active_app = if config_stack.len() > 1 {
@@ -376,7 +543,6 @@ pub fn build_state(
         "context": {
             "active_app": active_app,
             "config_stack": config_stack,
-            "layout": layout,
             "paused": paused,
             "gaming_mode": gaming_mode,
             "held_modifiers": held_modifiers,
@@ -389,41 +555,6 @@ pub fn build_state(
         "modifier_active": modifier_active,
         "gaming_mode_trigger": gaming_mode_trigger,
     })
-}
-
-// ── Main export function ──────────────────────────────────────────────────────
-
-pub async fn write_state(
-    config: &Config,
-    modifiers: &[Event],
-    layout: u16,
-    paused: bool,
-    gaming_mode: bool,
-    held_keys: &[Event],
-    last_action: &Option<LastAction>,
-    config_stack: &[String],
-    gaming_mode_config: &GamingModeConfig,
-    trackpads: serde_json::Value,
-    sticks: serde_json::Value,
-    imu: serde_json::Value,
-    analog_state_export: bool,
-) {
-    let mut state = build_state(config, modifiers, layout, paused, gaming_mode, held_keys, last_action, config_stack, gaming_mode_config);
-    state["trackpads"] = trackpads;
-    state["sticks"] = sticks;
-    state["imu"] = imu;
-    state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
-
-    let tmp_path = "/tmp/makima-state.json.tmp";
-    let final_path = "/tmp/makima-state.json";
-    match serde_json::to_string_pretty(&state) {
-        Ok(json) => {
-            if std::fs::write(tmp_path, json).is_ok() {
-                let _ = std::fs::rename(tmp_path, final_path);
-            }
-        }
-        Err(e) => eprintln!("makima: state export failed: {}", e),
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

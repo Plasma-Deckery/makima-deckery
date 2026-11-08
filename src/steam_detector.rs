@@ -27,7 +27,7 @@
 //! global state).  `should_be_gaming` is the single public entry point used
 //! by `steam_detection_task`.
 
-use crate::udev_monitor::Client;
+use crate::session::Client;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -106,8 +106,21 @@ pub async fn steam_detection_task(
     auto_detect: bool,
 ) {
     let mut last_sent: Option<bool> = None;
+
+    // Register before the first wait and re-arm before the work, not after —
+    // window_changed is fired with notify_waiters(), which keeps no permit, so
+    // anything pushed while this task is unregistered is lost. The body below
+    // calls is_game_running(), which walks /proc, so the unguarded window was
+    // wider here than in EventReader::window_changed_loop: a quick app switch
+    // could leave Gaming Mode stuck on the previous window's verdict.
+    let mut notified = Box::pin(window_changed.notified());
+    notified.as_mut().enable();
+
     loop {
-        window_changed.notified().await;
+        notified.as_mut().await;
+        notified = Box::pin(window_changed.notified());
+        notified.as_mut().enable();
+
         let new_state = if auto_detect {
             let (class, caption, pid) = match &*active_client.lock().await {
                 Client::Class(c, cap, p) => (c.clone(), cap.clone(), *p),
@@ -179,7 +192,7 @@ mod tests {
     /// even when the focused window looks exactly like Steam Big Picture Mode.
     #[tokio::test]
     async fn auto_detect_false_never_sends_true() {
-        use crate::udev_monitor::Client;
+        use crate::session::Client;
         let notify = Arc::new(Notify::new());
         // Focused window is Steam BPM — would normally trigger gaming mode.
         let client = Arc::new(Mutex::new(Client::Class(
@@ -207,7 +220,7 @@ mod tests {
     /// focused window is Steam Big Picture Mode.
     #[tokio::test]
     async fn auto_detect_true_sends_true_for_bpm() {
-        use crate::udev_monitor::Client;
+        use crate::session::Client;
         let notify = Arc::new(Notify::new());
         let client = Arc::new(Mutex::new(Client::Class(
             "steam".to_string(),
