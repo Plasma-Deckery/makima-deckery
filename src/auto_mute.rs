@@ -27,14 +27,13 @@
 //! not.
 
 use crate::config_registry::ConfigRegistry;
-use crate::session::Client;
 use crate::steam_detector::game_reaper;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::watch;
 
 /// One audio stream, as far as muting cares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,17 +403,11 @@ fn enabled_in(registry: &ConfigRegistry) -> bool {
 /// never enables it never spawns anything.
 pub async fn auto_mute_task(
     registry: Arc<ConfigRegistry>,
-    window_changed: Arc<Notify>,
-    active_client: Arc<Mutex<Client>>,
+    mut game_focus: watch::Receiver<crate::game_focus::GameFocus>,
 ) {
     let mut muter = Muter::new(enabled_in(&registry), load_ours());
     let mut events: Option<tokio::io::Lines<BufReader<tokio::process::ChildStdout>>> = None;
     let mut _child: Option<tokio::process::Child> = None;
-
-    // Registered before the first wait and re-armed before the work, for the
-    // reason given in steam_detection_task: notify_waiters() keeps no permit.
-    let mut notified = Box::pin(window_changed.notified());
-    notified.as_mut().enable();
 
     loop {
         // Start listening for streams as soon as the feature is on.
@@ -437,20 +430,19 @@ pub async fn auto_mute_task(
         // this collects inputs rather than choosing one.
         let mut inputs: Vec<Input> = Vec::new();
         tokio::select! {
-            _ = notified.as_mut() => {
-                notified = Box::pin(window_changed.notified());
-                notified.as_mut().enable();
-
+            changed = game_focus.changed() => {
+                if changed.is_err() {
+                    return; // the focus task is gone, and with it the process
+                }
                 // A focus change is also where a reloaded setting is noticed.
                 let now = enabled_in(&registry);
                 if now != muter.enabled {
                     inputs.push(Input::Enabled(now));
                 }
-                let pid = match &*active_client.lock().await {
-                    Client::Class(_, _, pid) => *pid,
-                    Client::Default => None,
-                };
-                inputs.push(Input::Focus { game: pid.and_then(game_reaper) });
+                // The settled focus: a game only counts once it has kept focus
+                // for focus_threshold_ms, so sliding past it does not unmute it.
+                let game = game_focus.borrow_and_update().game;
+                inputs.push(Input::Focus { game });
             }
             line = async { events.as_mut()?.next_line().await.ok().flatten() }, if events.is_some() => {
                 let Some(line) = line else {

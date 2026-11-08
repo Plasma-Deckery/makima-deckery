@@ -65,13 +65,28 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec
     // Everything a device generation needs, assembled once. The task list is
     // the only thing that does not belong in it — that is replaced on every
     // reinit, which is exactly what the other fields are not.
-    // Once per process, not per device generation: it remembers which streams it
-    // muted, and a reinit — every config reload is one — must not forget that.
-    tokio::spawn(crate::auto_mute::auto_mute_task(
-        registry.clone(),
+    // Which game counts as focused, decided once and published for everything
+    // that reacts to it. A game only counts after keeping focus for
+    // focus_threshold_ms — read on every change, so a reload applies.
+    let (game_focus_tx, game_focus) =
+        tokio::sync::watch::channel(crate::game_focus::GameFocus::default());
+    let threshold_registry = registry.clone();
+    tokio::spawn(crate::game_focus::game_focus_task(
         window_changed.clone(),
         active_client.clone(),
+        move || std::time::Duration::from_millis(
+            threshold_registry
+                .base_configs()
+                .first()
+                .map(|c| c.gaming_mode_config.focus_threshold_ms)
+                .unwrap_or(0),
+        ),
+        game_focus_tx,
     ));
+
+    // Once per process, not per device generation: it remembers which streams it
+    // muted, and a reinit — every config reload is one — must not forget that.
+    tokio::spawn(crate::auto_mute::auto_mute_task(registry.clone(), game_focus.clone()));
 
     let session = DeviceSession {
         registry:            registry.clone(),
@@ -83,6 +98,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec
         state_tx:            state_tx.clone(),
         ipc_tx,
         virt_dev:            virt_dev.clone(),
+        game_focus,
     };
 
     let mut prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
