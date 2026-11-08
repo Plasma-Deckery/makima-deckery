@@ -246,7 +246,7 @@ fn refresh_readme(roots: &ConfigRoots) {
 /// The invoking user's home directory. Under `sudo` the process sees `/root`
 /// while the configs that matter belong to the real user, so `SUDO_USER` wins
 /// in that one case.
-fn user_home() -> String {
+pub(crate) fn user_home() -> String {
     match env::var("HOME") {
         Ok(home) if home == "/root" => match env::var("SUDO_USER") {
             Ok(sudo_user) => format!("/home/{sudo_user}"),

@@ -53,20 +53,27 @@ pub fn is_steam_bpm(class_name: &str, caption: &str) -> bool {
 /// per ancestor level.  Handles disappeared processes gracefully (returns
 /// `false`).  Stops at PID 1 (init).
 pub fn is_game_running(focused_pid: u32) -> bool {
-    let mut current = focused_pid;
+    game_reaper(focused_pid).is_some()
+}
+
+/// The `reaper` a process runs under, if it is part of a Steam game.
+///
+/// Same walk as `is_game_running`, but it answers *which* game rather than
+/// whether there is one: every process a game starts — Proton, wine, the game
+/// binary, the thread that opens the audio stream — sits below one `reaper`,
+/// so its PID is what identifies the game as a whole. Two processes belong to
+/// the same game exactly when this returns the same value for both.
+pub fn game_reaper(pid: u32) -> Option<u32> {
+    let mut current = pid;
     loop {
-        let (name, ppid) = match read_proc_status(current) {
-            Some(v) => v,
-            None => return false, // process disappeared
-        };
+        let (name, ppid) = read_proc_status(current)?; // process disappeared
         if ppid <= 1 {
-            return false; // reached init without finding steam/reaper
+            return None; // reached init without finding steam/reaper
         }
         if name == "reaper" {
             // Confirm the reaper's parent is steam.
-            return read_proc_status(ppid)
-                .map(|(parent_name, _)| parent_name == "steam")
-                .unwrap_or(false);
+            let (parent_name, _) = read_proc_status(ppid)?;
+            return (parent_name == "steam").then_some(current);
         }
         current = ppid;
     }
@@ -74,7 +81,7 @@ pub fn is_game_running(focused_pid: u32) -> bool {
 
 /// Read `Name:` and `PPid:` from `/proc/{pid}/status`.
 /// Returns `None` if the file cannot be read (process gone).
-fn read_proc_status(pid: u32) -> Option<(String, u32)> {
+pub(crate) fn read_proc_status(pid: u32) -> Option<(String, u32)> {
     let content = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
     let name = parse_field(&content, "Name")?;
     let ppid: u32 = parse_field(&content, "PPid")?.parse().ok()?;

@@ -1,5 +1,6 @@
 mod active_client;
 mod analog;
+mod auto_mute;
 mod config;
 mod config_registry;
 mod device_session;
