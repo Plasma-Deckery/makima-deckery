@@ -205,6 +205,7 @@ fn parse_raw_config_populates_while_gaming_for_remap() {
             while_gaming: true,
             label: None,
             silent: false,
+            haptic: None,
         },
     );
     // BTN_EAST → KEY_B without while_gaming
@@ -216,6 +217,7 @@ fn parse_raw_config_populates_while_gaming_for_remap() {
             while_gaming: false,
             label: None,
             silent: false,
+            haptic: None,
         },
     );
     let raw = RawConfig {
@@ -255,6 +257,7 @@ fn parse_raw_config_populates_while_gaming_for_command() {
             while_gaming: true,
             label: None,
             silent: false,
+            haptic: None,
         },
     );
     let raw = RawConfig {
@@ -731,4 +734,125 @@ fn written_label_wins_over_a_modifier_less_hint() {
     config.resolve_hints();
 
     assert!(config.bindings.hints_resolved.is_empty());
+}
+
+// ── haptic = { … } on a binding ──────────────────────────────────────────────
+
+/// Pull the haptic out of a parsed `[remap]` value, or fail the test.
+fn remap_haptic(toml_value: &str) -> Result<Option<BindingHaptic>, String> {
+    let w: RemapWrapper = toml::from_str(&format!("val = {toml_value}")).map_err(|e| e.to_string())?;
+    match w.val {
+        RemapValue::WithAttrs { haptic, .. } => Ok(haptic),
+        RemapValue::Simple(_) => Ok(None),
+    }
+}
+
+/// The form the shipped config uses: a side and nothing else, which plays the
+/// default pulse — the one tuned on hardware against Lizard Mode's click.
+#[test]
+fn haptic_with_only_a_side_plays_the_default_pulse() {
+    let h = remap_haptic(r#"{ keys = ["BTN_LEFT"], haptic = { pad = "right" } }"#)
+        .unwrap()
+        .expect("haptic should be present");
+    assert_eq!(h.pad, deckery_controller::HapticPad::Right);
+    assert_eq!(h.chain, HapticChain::Single(HapticPulse::default()));
+}
+
+/// Pulse fields given inline override only themselves; the rest keep their
+/// defaults.
+#[test]
+fn haptic_inline_pulse_fields_override_individually() {
+    let h = remap_haptic(r#"{ keys = ["BTN_LEFT"], haptic = { duration_us = 3000, count = 1 } }"#)
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.pad, deckery_controller::HapticPad::Both, "pad defaults to both");
+    assert_eq!(h.chain, HapticChain::Single(HapticPulse {
+        duration_us: 3000,
+        count: 1,
+        ..HapticPulse::default()
+    }));
+}
+
+/// A full chain is accepted in the same shape every other haptic in the config
+/// takes.
+#[test]
+fn haptic_accepts_a_chain() {
+    let h = remap_haptic(
+        r#"{ keys = ["BTN_LEFT"], haptic = { pad = "left", chain = [{ duration_us = 8000, pause_ms = 150 }, { duration_us = 8000 }] } }"#,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(matches!(h.chain, HapticChain::Chain(ref steps) if steps.len() == 2));
+}
+
+/// Pulse fields *and* a chain are two answers to one question; refusing is
+/// better than picking one silently.
+#[test]
+fn haptic_rejects_pulse_and_chain_together() {
+    assert!(remap_haptic(
+        r#"{ keys = ["BTN_LEFT"], haptic = { duration_us = 3000, chain = [{ duration_us = 8000 }] } }"#
+    ).is_err());
+}
+
+/// A misspelt field must not silently fall back to the default pulse.
+#[test]
+fn haptic_rejects_unknown_fields() {
+    assert!(remap_haptic(r#"{ keys = ["BTN_LEFT"], haptic = { duraton_us = 3000 } }"#).is_err());
+}
+
+/// An unknown side is an error, not a quiet `both`.
+#[test]
+fn haptic_rejects_an_unknown_side() {
+    assert!(remap_haptic(r#"{ keys = ["BTN_LEFT"], haptic = { pad = "middle" } }"#).is_err());
+}
+
+fn tick(pad: deckery_controller::HapticPad) -> BindingHaptic {
+    BindingHaptic { pad, chain: HapticChain::Single(HapticPulse::default()) }
+}
+
+/// A module or app override that replaces an action must take the base
+/// binding's buzz with it — otherwise the new action would tick like the old.
+#[test]
+fn merge_base_evicts_the_haptic_of_a_replaced_action() {
+    let r2 = key(Key::BTN_TR2);
+    let mut base_b = make_remap_bindings(vec![(r2, vec![], vec![Key::BTN_LEFT])]);
+    base_b.haptics.insert((r2, vec![]), tick(deckery_controller::HapticPad::Right));
+    let base = config_with("base", base_b);
+
+    // The override rebinds R2 to something else and says nothing about haptics.
+    let mut over = config_with("app", make_remap_bindings(vec![(r2, vec![], vec![Key::KEY_ENTER])]));
+    over.merge_base(&base);
+
+    assert!(!over.bindings.haptics.contains_key(&(r2, vec![])), "kept the replaced action's haptic");
+}
+
+/// A binding the override does not touch keeps its haptic through the merge —
+/// this is how a haptic in the base config reaches every app.
+#[test]
+fn merge_base_keeps_the_haptic_of_an_untouched_binding() {
+    let r2 = key(Key::BTN_TR2);
+    let mut base_b = make_remap_bindings(vec![(r2, vec![], vec![Key::BTN_LEFT])]);
+    base_b.haptics.insert((r2, vec![]), tick(deckery_controller::HapticPad::Right));
+    let base = config_with("base", base_b);
+
+    let mut over = config_with("app", make_remap_bindings(vec![]));
+    over.merge_base(&base);
+
+    assert_eq!(over.bindings.haptics.get(&(r2, vec![])), Some(&tick(deckery_controller::HapticPad::Right)));
+}
+
+/// And an override's own haptic wins over the base's.
+#[test]
+fn merge_base_override_haptic_wins() {
+    let r2 = key(Key::BTN_TR2);
+    let mut base_b = make_remap_bindings(vec![(r2, vec![], vec![Key::BTN_LEFT])]);
+    base_b.haptics.insert((r2, vec![]), tick(deckery_controller::HapticPad::Right));
+    let base = config_with("base", base_b);
+
+    let mut over_b = make_remap_bindings(vec![(r2, vec![], vec![Key::BTN_LEFT])]);
+    over_b.haptics.insert((r2, vec![]), tick(deckery_controller::HapticPad::Both));
+    let mut over = config_with("app", over_b);
+    over.merge_base(&base);
+
+    assert_eq!(over.bindings.haptics.get(&(r2, vec![])), Some(&tick(deckery_controller::HapticPad::Both)));
 }

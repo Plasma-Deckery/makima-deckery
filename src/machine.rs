@@ -88,6 +88,26 @@ pub fn fires_while_paused(paused: bool, no_pause: bool) -> bool {
     !paused || no_pause
 }
 
+/// The feedback a binding plays when it fires, if it has any.
+///
+/// Only on the press — a held key repeats and is released, and neither is a
+/// click. And only when the binding actually takes effect: a press swallowed by
+/// pause sends nothing, so it must not buzz as if it had clicked. That is the
+/// same condition the binding itself obeys, which is why it reuses
+/// `fires_while_paused` rather than restating it.
+pub fn binding_haptic(
+    haptic: Option<&crate::config::BindingHaptic>,
+    value: i32,
+    paused: bool,
+    no_pause: bool,
+) -> Option<OutputAction> {
+    let haptic = haptic?;
+    (value == 1 && fires_while_paused(paused, no_pause)).then(|| OutputAction::Haptic {
+        pad: haptic.pad,
+        chain: haptic.chain.clone(),
+    })
+}
+
 /// Everything one `emit_event` is decided from.
 ///
 /// A struct rather than nine positional arguments, and for the reason
