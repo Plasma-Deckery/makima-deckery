@@ -122,7 +122,7 @@ impl EventReader {
         }
 
         match resolve_binding(&config.bindings, event, &modifiers, self.settings.chain_only) {
-            ResolvedBinding::Keys { keys, label, no_pause, while_gaming: _, silent, is_combo, is_fallback } => {
+            ResolvedBinding::Keys { keys, label, no_pause, while_gaming: _, silent, is_combo, is_fallback, haptic } => {
                 // release_keys: release held modifier output keys before emitting.
                 //   true  → base binding with no modifiers held (normal press)
                 //   false → combo or fallback; modifier keys must stay held
@@ -136,10 +136,14 @@ impl EventReader {
                 } else {
                     None
                 };
-                if let Some(action) = crate::machine::keys_announcement(
+                let actions: Vec<_> = crate::machine::keys_announcement(
                     &keys, value, is_combo, label, hint, silent,
-                ) {
-                    self.outputs.dispatch(&[action]).await;
+                )
+                .into_iter()
+                .chain(crate::machine::binding_haptic(haptic.as_ref(), value, paused, no_pause))
+                .collect();
+                if !actions.is_empty() {
+                    self.outputs.dispatch(&actions).await;
                 }
                 self.write_state().await;
                 self.emit_event(&keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
@@ -156,7 +160,7 @@ impl EventReader {
                 self.emit_event(&keys, value, &modifiers, &config, false, false, false).await;
                 return;
             }
-            ResolvedBinding::Command { commands, label, no_pause, while_gaming: _, silent, .. } => {
+            ResolvedBinding::Command { commands, label, no_pause, while_gaming: _, silent, haptic, .. } => {
                 if value == 1 {
                     let mut actions = vec![crate::machine::command_announcement(
                         &commands, label.clone(), silent,
@@ -168,6 +172,9 @@ impl EventReader {
                             argv: commands.clone(),
                             label,
                         });
+                        actions.extend(crate::machine::binding_haptic(
+                            haptic.as_ref(), value, paused, no_pause,
+                        ));
                         // Running a command counts as having used the modifier
                         // that was held, so releasing it does not also tap.
                         // Only when it actually runs, which is why this sits

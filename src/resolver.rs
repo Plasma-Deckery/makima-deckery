@@ -9,7 +9,7 @@
 // several bugs (modifier_active showing wrong bindings, active_outputs
 // mismatching actual emission).
 
-use crate::config::{Bindings, Event, Relative};
+use crate::config::{BindingHaptic, Bindings, Event, Relative};
 use evdev::Key;
 
 // ── Result type ───────────────────────────────────────────────────────────────
@@ -30,6 +30,8 @@ pub enum ResolvedBinding {
         /// true when modifiers are held but no combo was defined — falls back
         /// to the base binding. The held modifier output keys must stay held.
         is_fallback: bool,
+        /// What to play on the controller when it fires, if anything.
+        haptic: Option<BindingHaptic>,
     },
     /// A shell command binding.
     Command {
@@ -41,6 +43,8 @@ pub enum ResolvedBinding {
         while_gaming: bool,
         silent: bool,
         is_combo: bool,
+        /// What to play on the controller when it fires, if anything.
+        haptic: Option<BindingHaptic>,
     },
     /// An axis movement binding (stick-to-mouse etc.).
     Movement {
@@ -72,6 +76,10 @@ struct Flags {
     while_gaming: bool,
     silent: bool,
     label: Option<String>,
+    /// Exact combination only, like `label` and unlike the three above: it
+    /// belongs to this one action. A combo on the same button is a different
+    /// action and must not borrow the base binding's feedback.
+    haptic: Option<BindingHaptic>,
 }
 
 fn flags(bindings: &Bindings, event: Event, mods: &[Event]) -> Flags {
@@ -83,7 +91,8 @@ fn flags(bindings: &Bindings, event: Event, mods: &[Event]) -> Flags {
             || bindings.while_gaming.contains(&(event, vec![])),
         silent: bindings.silent.contains(&(event, exact.clone()))
             || bindings.silent.contains(&(event, vec![])),
-        label: bindings.labels.get(&(event, exact)).cloned(),
+        label: bindings.labels.get(&(event, exact.clone())).cloned(),
+        haptic: bindings.haptics.get(&(event, exact)).cloned(),
     }
 }
 
@@ -103,6 +112,7 @@ fn resolve_command(bindings: &Bindings, event: Event, mods: &[Event]) -> Option<
         while_gaming: f.while_gaming,
         silent: f.silent,
         is_combo: !mods.is_empty(),
+        haptic: f.haptic,
     })
 }
 
@@ -137,6 +147,7 @@ pub fn resolve_binding(
                 silent: f.silent,
                 is_combo: !mods.is_empty(),
                 is_fallback: false,
+                haptic: f.haptic,
             };
         }
 
@@ -177,6 +188,7 @@ pub fn resolve_binding(
                 silent: f.silent,
                 is_combo: false,
                 is_fallback: !mods.is_empty(),
+                haptic: f.haptic,
             };
         }
     }
@@ -251,6 +263,7 @@ mod tests {
             silent: false,
             is_combo: false,
             is_fallback: false,
+            haptic: None,
         });
     }
 
@@ -273,6 +286,7 @@ mod tests {
             silent: false,
             is_combo: true,
             is_fallback: false,
+            haptic: None,
         });
     }
 
@@ -298,6 +312,7 @@ mod tests {
             silent: false,
             is_combo: false,
             is_fallback: true,
+            haptic: None,
         });
     }
 
@@ -323,6 +338,7 @@ mod tests {
             silent: false,
             is_combo: true,
             is_fallback: false,
+            haptic: None,
         });
     }
 
@@ -512,6 +528,7 @@ mod tests {
             silent: false,
             is_combo: true,
             is_fallback: false,
+            haptic: None,
         });
     }
 
@@ -617,6 +634,7 @@ mod tests {
             while_gaming: false,
             silent: false,
             is_combo: false,
+            haptic: None,
         });
     }
 
@@ -642,6 +660,7 @@ mod tests {
             while_gaming: false,
             silent: false,
             is_combo: true,
+            haptic: None,
         });
     }
 
@@ -664,6 +683,7 @@ mod tests {
             while_gaming: false,
             silent: true,
             is_combo: false,
+            haptic: None,
         });
     }
 
@@ -683,6 +703,69 @@ mod tests {
             while_gaming: false,
             silent: false,
             is_combo: false,
+            haptic: None,
         });
+    }
+
+    // ── haptic ───────────────────────────────────────────────────────────────
+
+    fn tick() -> crate::config::BindingHaptic {
+        crate::config::BindingHaptic {
+            pad: deckery_controller::HapticPad::Right,
+            chain: deckery_controller::HapticChain::Single(Default::default()),
+        }
+    }
+
+    fn haptic_of(r: ResolvedBinding) -> Option<crate::config::BindingHaptic> {
+        match r {
+            ResolvedBinding::Keys { haptic, .. } | ResolvedBinding::Command { haptic, .. } => haptic,
+            other => panic!("expected Keys or Command, got {other:?}"),
+        }
+    }
+
+    /// The case this was built for: R2 as left click, with a tick.
+    #[test]
+    fn a_binding_carries_its_haptic() {
+        let r2 = key_event(Key::BTN_TR2);
+        let mut b = make_bindings(vec![(r2, vec![], vec![Key::BTN_LEFT])], vec![], vec![], vec![]);
+        b.haptics.insert((r2, vec![]), tick());
+        assert_eq!(haptic_of(resolve_binding(&b, r2, &[], false)), Some(tick()));
+    }
+
+    /// With a modifier held and no combo defined, the base binding fires — and
+    /// so its tick plays. It is the base binding's action, after all.
+    #[test]
+    fn the_fallback_plays_the_base_binding_haptic() {
+        let r2 = key_event(Key::BTN_TR2);
+        let l1 = key_event(Key::BTN_TL);
+        let mut b = make_bindings(vec![(r2, vec![], vec![Key::BTN_LEFT])], vec![], vec![], vec![]);
+        b.haptics.insert((r2, vec![]), tick());
+        assert_eq!(haptic_of(resolve_binding(&b, r2, &[l1], false)), Some(tick()));
+    }
+
+    /// A combo on the same button is a different action. It must not borrow the
+    /// base binding's click — L1+R2 doing something else should not feel like a
+    /// mouse click.
+    #[test]
+    fn a_combo_does_not_inherit_the_base_haptic() {
+        let r2 = key_event(Key::BTN_TR2);
+        let l1 = key_event(Key::BTN_TL);
+        let mut b = make_bindings(
+            vec![(r2, vec![], vec![Key::BTN_LEFT]), (r2, vec![l1], vec![Key::KEY_A])],
+            vec![],
+            vec![],
+            vec![],
+        );
+        b.haptics.insert((r2, vec![]), tick());
+        assert_eq!(haptic_of(resolve_binding(&b, r2, &[l1], false)), None);
+    }
+
+    /// Commands carry it too.
+    #[test]
+    fn a_command_carries_its_haptic() {
+        let x = key_event(Key::BTN_WEST);
+        let mut b = make_bindings(vec![], vec![(x, vec![], vec!["true".into()])], vec![], vec![]);
+        b.haptics.insert((x, vec![]), tick());
+        assert_eq!(haptic_of(resolve_binding(&b, x, &[], false)), Some(tick()));
     }
 }
