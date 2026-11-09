@@ -42,6 +42,10 @@ pub struct DeviceSession {
     /// All `EventReader` instances share this single set of virtual devices;
     /// the same `Arc` is reused across reinits so uinput nodes never disappear.
     pub virt_dev:            Arc<Mutex<VirtualDevices>>,
+    /// Which game counts as focused, after `focus_threshold_ms`. Published by
+    /// one task started alongside this session, so Gaming Mode detection and
+    /// muting read the same answer.
+    pub game_focus:          tokio::sync::watch::Receiver<crate::game_focus::GameFocus>,
 }
 
 /// Spawn a reconnecting evdev reader for a non-Steam-Deck device.
@@ -137,7 +141,7 @@ pub async fn launch_tasks(
 ) -> Arc<Mutex<Vec<Event>>> {
     let DeviceSession {
         registry, environment, device_error_notify, active_client,
-        window_changed, gaming_mode, state_tx, ipc_tx, virt_dev,
+        window_changed, gaming_mode, state_tx, ipc_tx, virt_dev, game_focus,
     } = session;
     // Unified Gaming Mode channel: steam detection and IPC both send here.
     // The EventReader's gaming_mode_set_loop is the sole consumer.
@@ -151,8 +155,7 @@ pub async fn launch_tasks(
         .map(|c| c.gaming_mode_config.auto_detect_steam_games)
         .unwrap_or(true);
     tokio::spawn(crate::steam_detector::steam_detection_task(
-        window_changed.clone(),
-        active_client.clone(),
+        game_focus.clone(),
         gaming_mode_tx.clone(),
         auto_detect,
     ));

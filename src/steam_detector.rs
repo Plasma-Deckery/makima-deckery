@@ -27,9 +27,7 @@
 //! global state).  `should_be_gaming` is the single public entry point used
 //! by `steam_detection_task`.
 
-use crate::session::Client;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch};
 
 /// Returns `true` if the focused window is Steam Big Picture Mode.
 ///
@@ -40,26 +38,11 @@ pub fn is_steam_bpm(class_name: &str, caption: &str) -> bool {
         && (caption.contains("Big Picture") || caption.contains("Big-Picture"))
 }
 
-/// Walk upward from `focused_pid` through the process tree via
-/// `/proc/{pid}/status` and return `true` if `reaper → steam` appears in the
-/// ancestor chain, meaning a Steam game is running.
-///
-/// Process tree structure:
-/// ```
-/// steam  →  reaper  →  [game process / proton / wine / bwrap / …]
-/// ```
-///
-/// Reads only `Name:` and `PPid:` from each `/proc/{pid}/status` — one file
-/// per ancestor level.  Handles disappeared processes gracefully (returns
-/// `false`).  Stops at PID 1 (init).
-pub fn is_game_running(focused_pid: u32) -> bool {
-    game_reaper(focused_pid).is_some()
-}
-
 /// The `reaper` a process runs under, if it is part of a Steam game.
 ///
-/// Same walk as `is_game_running`, but it answers *which* game rather than
-/// whether there is one: every process a game starts — Proton, wine, the game
+/// Walks upward through `/proc/{pid}/status` until it finds `reaper → steam`.
+/// It answers *which* game rather than whether there is one: every process a
+/// game starts — Proton, wine, the game
 /// binary, the thread that opens the audio stream — sits below one `reaper`,
 /// so its PID is what identifies the game as a whole. Two processes belong to
 /// the same game exactly when this returns the same value for both.
@@ -96,49 +79,31 @@ fn parse_field(content: &str, field: &str) -> Option<String> {
     })
 }
 
-/// Async loop that watches for window-focus changes and sends the desired
-/// Gaming Mode state (`true` = gaming) over `tx`.
+/// Async loop that turns the settled game focus into the desired Gaming Mode
+/// state (`true` = gaming) on `tx`.
 ///
-/// Spawned once per session from `launch_tasks` in `udev_monitor`.
-/// Compositor-agnostic: on non-KDE systems `window_changed` is never fired
-/// and the task simply blocks on `notified()` forever — zero overhead.
-/// Only sends when the state actually changes to avoid flooding the channel.
+/// Spawned once per device generation from `launch_tasks`. It no longer reads
+/// raw focus itself: `game_focus` publishes which game counts as focused, after
+/// `focus_threshold_ms`, and this only maps that onto Gaming Mode. Only sends
+/// when the state actually changes to avoid flooding the channel.
+///
+/// The value already in the channel when this starts is deliberately *not*
+/// acted on. A reinit — every config reload is one — restarts this task, and
+/// re-sending the current focus would undo a Gaming Mode the user had just
+/// switched off by hand. It waits for the next real change, as it always did.
 ///
 /// When `auto_detect` is false the task still runs but never sends `true` —
 /// Gaming Mode can only be set via the manual double-click trigger or IPC.
 pub async fn steam_detection_task(
-    window_changed: Arc<Notify>,
-    active_client: Arc<Mutex<Client>>,
+    mut game_focus: watch::Receiver<crate::game_focus::GameFocus>,
     tx: mpsc::Sender<bool>,
     auto_detect: bool,
 ) {
     let mut last_sent: Option<bool> = None;
+    game_focus.borrow_and_update();
 
-    // Register before the first wait and re-arm before the work, not after —
-    // window_changed is fired with notify_waiters(), which keeps no permit, so
-    // anything pushed while this task is unregistered is lost. The body below
-    // calls is_game_running(), which walks /proc, so the unguarded window was
-    // wider here than in EventReader::window_changed_loop: a quick app switch
-    // could leave Gaming Mode stuck on the previous window's verdict.
-    let mut notified = Box::pin(window_changed.notified());
-    notified.as_mut().enable();
-
-    loop {
-        notified.as_mut().await;
-        notified = Box::pin(window_changed.notified());
-        notified.as_mut().enable();
-
-        let new_state = if auto_detect {
-            let (class, caption, pid) = match &*active_client.lock().await {
-                Client::Class(c, cap, p) => (c.clone(), cap.clone(), *p),
-                Client::Default => (String::new(), String::new(), None),
-            };
-            let bpm  = is_steam_bpm(&class, &caption);
-            let game = pid.map(is_game_running).unwrap_or(false);
-            bpm || game
-        } else {
-            false
-        };
+    while game_focus.changed().await.is_ok() {
+        let new_state = auto_detect && game_focus.borrow_and_update().is_gaming();
         if Some(new_state) != last_sent {
             if tx.send(new_state).await.is_err() {
                 break; // all receivers gone, stop
@@ -178,7 +143,7 @@ mod tests {
 
     #[test]
     fn no_pid_means_not_gaming() {
-        assert!(!is_steam_bpm("", "") && !is_game_running(1));
+        assert!(!is_steam_bpm("", "") && game_reaper(1).is_none());
         assert!(!is_steam_bpm("org.mozilla.firefox", "Firefox"));
     }
 
@@ -195,63 +160,52 @@ mod tests {
         assert_eq!(parse_field(status, "Missing"), None);
     }
 
+    use crate::game_focus::GameFocus;
+
+    const BIG_PICTURE: GameFocus = GameFocus { game: None, big_picture: true };
+
+    /// Start the task, then publish `focus` as a real change after it.
+    async fn run(auto_detect: bool, focus: GameFocus) -> Option<bool> {
+        let (focus_tx, focus_rx) = watch::channel(GameFocus::default());
+        let (tx, mut rx) = mpsc::channel::<bool>(8);
+        tokio::spawn(steam_detection_task(focus_rx, tx, auto_detect));
+        tokio::task::yield_now().await;
+        focus_tx.send(focus).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        rx.try_recv().ok()
+    }
+
     /// When `auto_detect_steam_games = false` the task must never send `true`,
-    /// even when the focused window looks exactly like Steam Big Picture Mode.
+    /// even when the focused window is exactly Steam Big Picture Mode.
     #[tokio::test]
     async fn auto_detect_false_never_sends_true() {
-        use crate::session::Client;
-        let notify = Arc::new(Notify::new());
-        // Focused window is Steam BPM — would normally trigger gaming mode.
-        let client = Arc::new(Mutex::new(Client::Class(
-            "steam".to_string(),
-            "Steam Big Picture".to_string(),
-            None,
-        )));
-        let (tx, mut rx) = mpsc::channel::<bool>(8);
-        // notify_one() stores a permit so the task fires immediately on first
-        // notified().await even if we race ahead of the spawn.
-        notify.notify_one();
-        tokio::spawn(steam_detection_task(
-            notify.clone(),
-            client,
-            tx,
-            false, // auto_detect_steam_games = false
-        ));
-        // Allow the task one iteration.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let state = rx.try_recv().expect("task should have sent a value");
-        assert!(!state, "auto_detect_steam_games=false must never send true");
+        assert_eq!(run(false, BIG_PICTURE).await, Some(false));
     }
 
     /// When `auto_detect_steam_games = true` the task must send `true` when the
-    /// focused window is Steam Big Picture Mode.
+    /// settled focus is Steam Big Picture Mode.
     #[tokio::test]
     async fn auto_detect_true_sends_true_for_bpm() {
-        use crate::session::Client;
-        let notify = Arc::new(Notify::new());
-        let client = Arc::new(Mutex::new(Client::Class(
-            "steam".to_string(),
-            "Steam Big Picture".to_string(),
-            None,
-        )));
+        assert_eq!(run(true, BIG_PICTURE).await, Some(true));
+    }
+
+    /// What is already in the channel when the task starts is not acted on. A
+    /// reinit restarts this task, and re-sending the current focus would switch
+    /// back on a Gaming Mode the user had just turned off by hand.
+    #[tokio::test]
+    async fn the_focus_present_at_start_is_not_acted_on() {
+        let (_focus_tx, focus_rx) = watch::channel(BIG_PICTURE);
         let (tx, mut rx) = mpsc::channel::<bool>(8);
-        notify.notify_one();
-        tokio::spawn(steam_detection_task(
-            notify.clone(),
-            client,
-            tx,
-            true, // auto_detect_steam_games = true
-        ));
+        tokio::spawn(steam_detection_task(focus_rx, tx, true));
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let state = rx.try_recv().expect("task should have sent a value");
-        assert!(state, "auto_detect_steam_games=true should send true for BPM window");
+        assert!(rx.try_recv().is_err(), "acted on the focus it found at start");
     }
 
     // Live process-tree test: only verifies no panic; whether a game is
     // running is non-deterministic in CI.
     #[test]
-    fn is_game_running_pid1_returns_false() {
-        assert!(!is_game_running(1));
+    fn pid1_is_not_part_of_a_game() {
+        assert_eq!(game_reaper(1), None);
     }
 
     /// Measures how long a full /proc walk takes on the live system.
@@ -264,12 +218,12 @@ mod tests {
         let own_pid = std::process::id();
 
         // Warm up (first read may be slower due to page cache cold start).
-        let _ = is_game_running(own_pid);
+        let _ = game_reaper(own_pid);
 
         const RUNS: u32 = 100;
         let start = std::time::Instant::now();
         for _ in 0..RUNS {
-            let _ = is_game_running(own_pid);
+            let _ = game_reaper(own_pid);
         }
         let total = start.elapsed();
         let avg_us = total.as_micros() / RUNS as u128;

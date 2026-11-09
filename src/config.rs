@@ -355,6 +355,9 @@ pub struct RawGamingModeConfig {
     /// Mute a running Steam game while its window is not focused, and unmute it
     /// when it is focused again. Default: false.
     pub auto_mute: Option<bool>,
+    /// How long a game window has to keep focus before it counts as focused, in
+    /// milliseconds. Default: 0.
+    pub focus_threshold_ms: Option<u64>,
 }
 
 /// Parsed Gaming Mode configuration, ready for use at runtime.
@@ -374,6 +377,13 @@ pub struct GamingModeConfig {
     /// mixer, which nobody expects a controller remapper to do unasked. The
     /// shipped base config turns it on.
     pub auto_mute: bool,
+    /// How long a game window has to keep focus before it counts as focused.
+    ///
+    /// Switching desktops passes over a game's window on the way, and without
+    /// this the moment it is focused turns Gaming Mode on — which switches off
+    /// the very bindings being used to keep moving. Only *gaining* focus waits;
+    /// losing it counts at once. 0 means no wait, which is the old behaviour.
+    pub focus_threshold_ms: u64,
 }
 
 impl Default for GamingModeConfig {
@@ -396,6 +406,7 @@ impl Default for GamingModeConfig {
             haptic_off: default_chain,
             auto_detect_steam_games: true,
             auto_mute: false,
+            focus_threshold_ms: 0,
         }
     }
 }
@@ -426,8 +437,11 @@ impl GamingModeConfig {
 
         let auto_detect_steam_games = raw.auto_detect_steam_games.unwrap_or(true);
         let auto_mute = raw.auto_mute.unwrap_or(false);
+        let focus_threshold_ms = raw.focus_threshold_ms.unwrap_or(0);
 
-        GamingModeConfig { trigger, haptic_on, haptic_off, auto_detect_steam_games, auto_mute }
+        GamingModeConfig {
+            trigger, haptic_on, haptic_off, auto_detect_steam_games, auto_mute, focus_threshold_ms,
+        }
     }
 }
 

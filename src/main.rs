@@ -5,6 +5,7 @@ mod config;
 mod config_registry;
 mod device_session;
 mod device_tasks;
+mod game_focus;
 mod event_loop;
 mod gesture_pad;
 mod compositor;
