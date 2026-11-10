@@ -21,7 +21,7 @@ use serde_json;
 /// Fire-and-forget record of the last discrete user action.
 /// Written by the backend on press; never deleted by the backend.
 /// The HUD reads `ts` and fades the display after 1.5 s.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LastAction {
     pub r#type: String,           // "keys" | "command" | "exec"
     pub value: serde_json::Value, // [KEY_*] for keys, string for command/exec

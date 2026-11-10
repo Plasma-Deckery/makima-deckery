@@ -11,6 +11,61 @@
 
 use super::*;
 
+/// Below this, a change in a normalized stick or pad value is not worth a
+/// write. A resting stick wanders by a few thousandths inside its deadzone,
+/// and with the analog export on that alone was ~45 full state.json writes a
+/// second. Five thousandths is a fraction of a pixel in the HUD's stick ring,
+/// and the comparison is against the last *written* value, so slow drift still
+/// lands once it adds up. The values sit on `r3`'s 0.001 grid; the half step
+/// keeps f32 error from deciding whether a step of exactly five counts.
+const ANALOG_WRITE_EPSILON: f32 = 0.0045;
+
+/// Whether any value moved by at least `ANALOG_WRITE_EPSILON` since `prev`.
+/// A NaN in `prev` (nothing written yet) always counts as moved.
+pub(super) fn analog_moved(prev: &[f32; 8], new: &[f32; 8]) -> bool {
+    prev.iter().zip(new).any(|(a, b)| !((a - b).abs() < ANALOG_WRITE_EPSILON))
+}
+
+/// What `build_state` was last called with, and what it returned.
+///
+/// `build_state` walks every binding of the merged config, and an analog tick
+/// changes none of its inputs — only the trackpads/sticks/imu laid over it
+/// afterwards. With the export on that rebuild ran up to 90 times a second
+/// for an identical result. The config compares by pointer: a new config is
+/// always a new `Arc`, never one mutated in place.
+pub(super) struct StateCache {
+    pub(super) config:       Arc<Config>,
+    pub(super) modifiers:    Vec<Event>,
+    pub(super) paused:       bool,
+    pub(super) gaming_mode:  bool,
+    pub(super) held_keys:    Vec<Event>,
+    pub(super) last_action:  Option<LastAction>,
+    pub(super) config_stack: Vec<String>,
+    pub(super) state:        serde_json::Value,
+}
+
+impl StateCache {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn matches(
+        &self,
+        config: &Arc<Config>,
+        modifiers: &[Event],
+        paused: bool,
+        gaming_mode: bool,
+        held_keys: &[Event],
+        last_action: &Option<LastAction>,
+        config_stack: &[String],
+    ) -> bool {
+        Arc::ptr_eq(&self.config, config)
+            && self.modifiers == modifiers
+            && self.paused == paused
+            && self.gaming_mode == gaming_mode
+            && self.held_keys == held_keys
+            && self.last_action == *last_action
+            && self.config_stack == config_stack
+    }
+}
+
 impl EventReader {
     pub(super) async fn write_state(&self) {
         self.write_state_inner(false).await;
@@ -96,16 +151,16 @@ impl EventReader {
         let lstick_y = crate::analog::normalize_y(lstick_raw.1); // negated: hardware up = negative ABS_Y
         let rstick_x = crate::analog::normalize(rstick_raw.0);
         let rstick_y = crate::analog::normalize_y(rstick_raw.1); // negated: hardware up = negative ABS_Y
-        // For analog-triggered writes (SYN_REPORT): skip if all rounded values unchanged.
-        // For button-triggered writes: always write, but invalidate the snapshot so the
-        // next analog write goes through even if analog values haven't moved.
+        // For analog-triggered writes (SYN_REPORT): skip unless something moved
+        // visibly since the last write — see `analog_moved`.
+        // For button-triggered writes: always write, and take the snapshot along.
         let new_snap: [f32; 8] = [
             lstick_x, lstick_y, rstick_x, rstick_y,
             lpad_x, lpad_y, rpad_x, rpad_y,
         ];
         {
             let mut snap = self.analog_snapshot.lock().await;
-            if analog_triggered && *snap == new_snap {
+            if analog_triggered && !analog_moved(&snap, &new_snap) {
                 return;
             }
             *snap = new_snap;
@@ -169,10 +224,24 @@ impl EventReader {
             "x": crate::analog::normalize(imu_raw.0),
             "y": crate::analog::normalize(imu_raw.1),
         });
-        let mut event_state = crate::state_export::build_state(
-            &config, &modifiers, paused, gaming_mode,
-            &held_keys, &last_action, &config_stack, &self.gaming_mode_config,
-        );
+        let mut event_state = {
+            let mut cache = self.state_cache.lock().await;
+            match cache.as_ref() {
+                Some(c) if c.matches(&config, &modifiers, paused, gaming_mode,
+                                     &held_keys, &last_action, &config_stack) => c.state.clone(),
+                _ => {
+                    let state = crate::state_export::build_state(
+                        &config, &modifiers, paused, gaming_mode,
+                        &held_keys, &last_action, &config_stack, &self.gaming_mode_config,
+                    );
+                    *cache = Some(StateCache {
+                        config: config.clone(), modifiers, paused, gaming_mode,
+                        held_keys, last_action, config_stack, state: state.clone(),
+                    });
+                    state
+                }
+            }
+        };
         event_state["trackpads"] = trackpads;
         event_state["sticks"]    = sticks;
         event_state["imu"]       = imu;
@@ -211,3 +280,7 @@ impl EventReader {
             .map(|hint| hint.label.clone())
     }
 }
+
+#[cfg(test)]
+#[path = "state_tests.rs"]
+mod tests;
