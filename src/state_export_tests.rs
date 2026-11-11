@@ -1128,6 +1128,23 @@ fn hint_modifier_leaves_available_modifiers_once_held() {
     assert!(state["context"]["available_modifiers"].get("BTN_GRIPR2").is_none());
 }
 
+/// A held hint modifier counts as held for the real modifiers too. No combo
+/// contains R5 alongside L1, so while R5 is down L1 unlocks nothing new and
+/// must not be advertised — before, it was matched against an empty held
+/// set and every real modifier with any combo showed up.
+#[test]
+fn held_hint_modifier_hides_real_modifiers_without_a_combo_on_it() {
+    let config = config_with_ctrl_hints();
+    let state = build_state(
+        &config, &[], false, false,
+        &[key(Key::BTN_GRIPR2)],
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert!(state["context"]["available_modifiers"].get("BTN_TL").is_none(),
+        "L1 advertised while only R5 is held: {}", state["context"]["available_modifiers"]);
+}
+
 // ── Modifier-less hints ───────────────────────────────────────────────────
 
 /// `from_override` mirrors the merge: the hint is in the merged map either way,
