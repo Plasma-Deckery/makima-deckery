@@ -80,6 +80,14 @@ pub fn active_input_modifiers(config: &Config, modifiers: &[Event]) -> Vec<Event
         .collect()
 }
 
+/// Adds the binding's `note` to its state entry — only when there is one, so
+/// the many bindings without a note don't each carry a `null`.
+fn with_note(entry: &mut serde_json::Value, config: &Config, trigger: &Event, combo: &[Event]) {
+    if let Some(note) = config.bindings.notes.get(&(*trigger, combo.to_vec())) {
+        entry["note"] = serde_json::json!(note);
+    }
+}
+
 /// Every button that acts as a hint modifier somewhere in this config.
 pub fn hint_modifier_buttons(config: &Config) -> std::collections::HashSet<Event> {
     config
@@ -230,16 +238,15 @@ pub fn build_state(
                 .collect();
             let label = config.bindings.labels.get(&(*trigger, combo.clone()));
             let silent = config.bindings.silent.contains(&(*trigger, combo.clone()));
-            bindings.insert(
-                key,
-                serde_json::json!({
-                    "action": action_list,
-                    "origin": origin_remap(trigger, combo),
-                    "label": label,
-                    "kind": "remap",
-                    "silent": silent,
-                }),
-            );
+            let mut entry = serde_json::json!({
+                "action": action_list,
+                "origin": origin_remap(trigger, combo),
+                "label": label,
+                "kind": "remap",
+                "silent": silent,
+            });
+            with_note(&mut entry, config, trigger, combo);
+            bindings.insert(key, entry);
         }
     }
     for (trigger, modifier_map) in &config.bindings.commands {
@@ -256,16 +263,15 @@ pub fn build_state(
                 .collect();
             let label = config.bindings.labels.get(&(*trigger, combo.clone()));
             let no_pause = config.bindings.no_pause.contains(&(*trigger, combo.clone()));
-            bindings.insert(
-                key,
-                serde_json::json!({
-                    "action": action_list,
-                    "origin": origin_cmd(trigger, combo),
-                    "label": label,
-                    "kind": "command",
-                    "no_pause": no_pause,
-                }),
-            );
+            let mut entry = serde_json::json!({
+                "action": action_list,
+                "origin": origin_cmd(trigger, combo),
+                "label": label,
+                "kind": "command",
+                "no_pause": no_pause,
+            });
+            with_note(&mut entry, config, trigger, combo);
+            bindings.insert(key, entry);
         }
     }
 
@@ -322,15 +328,14 @@ pub fn build_state(
                         .map(|k| serde_json::Value::String(format!("{:?}", k)))
                         .collect();
                     let label = config.bindings.labels.get(&(*trigger, combo.clone()));
-                    modifier_active.insert(
-                        key,
-                        serde_json::json!({
-                            "action": action_list,
-                            "origin": origin_remap(trigger, combo),
-                            "kind": "remap",
-                            "label": label,
-                        }),
-                    );
+                    let mut entry = serde_json::json!({
+                        "action": action_list,
+                        "origin": origin_remap(trigger, combo),
+                        "kind": "remap",
+                        "label": label,
+                    });
+                    with_note(&mut entry, config, trigger, combo);
+                    modifier_active.insert(key, entry);
                 }
             }
         }
@@ -344,15 +349,14 @@ pub fn build_state(
                         .map(|s| serde_json::Value::String(s.clone()))
                         .collect();
                     let label = config.bindings.labels.get(&(*trigger, combo.clone()));
-                    modifier_active.insert(
-                        key,
-                        serde_json::json!({
-                            "action": action_list,
-                            "origin": origin_cmd(trigger, combo),
-                            "kind": "command",
-                            "label": label,
-                        }),
-                    );
+                    let mut entry = serde_json::json!({
+                        "action": action_list,
+                        "origin": origin_cmd(trigger, combo),
+                        "kind": "command",
+                        "label": label,
+                    });
+                    with_note(&mut entry, config, trigger, combo);
+                    modifier_active.insert(key, entry);
                 }
             }
         }

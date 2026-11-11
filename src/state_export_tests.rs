@@ -1288,3 +1288,34 @@ fn matching_hint_is_per_trigger() {
     assert_eq!(matching_hint(&config, &key(Key::BTN_SOUTH), &mods).map(|h| h.label.as_str()),
                None);
 }
+
+// ── Binding notes ─────────────────────────────────────────────────────────
+
+/// A `note` reaches the HUD next to the label, both for the plain binding
+/// and, once its modifier is held, in modifier_active. Bindings without one
+/// carry no `note` key at all.
+#[test]
+fn binding_note_is_exported_in_bindings_and_modifier_active() {
+    let l1 = key(Key::BTN_TL);
+    let r5 = key(Key::BTN_GRIPR2);
+    let a = key(Key::BTN_SOUTH);
+    let mut config = make_config(
+        vec![
+            (r5, vec![l1], vec![Key::KEY_LEFTCTRL, Key::KEY_PAGEDOWN]),
+            (a, vec![], vec![Key::KEY_ENTER]),
+        ],
+        vec![(key(Key::BTN_NORTH), vec![l1], vec!["true".to_string()])],
+        vec![l1],
+    );
+    config.bindings.notes.insert((r5, vec![l1]), "halten".to_string());
+    config.bindings.notes.insert((key(Key::BTN_NORTH), vec![l1]), "halten".to_string());
+
+    let idle = build_state(&config, &[], false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
+    assert_eq!(idle["bindings"]["BTN_TL-BTN_GRIPR2"]["note"], "halten");
+    assert_eq!(idle["bindings"]["BTN_TL-BTN_NORTH"]["note"], "halten");
+    assert!(idle["bindings"]["BTN_SOUTH"].get("note").is_none());
+
+    let held = build_state(&config, &[l1], false, false, &[l1], &None, &["test".to_string()], &GamingModeConfig::default());
+    assert_eq!(held["modifier_active"]["BTN_GRIPR2"]["note"], "halten");
+    assert_eq!(held["modifier_active"]["BTN_NORTH"]["note"], "halten");
+}

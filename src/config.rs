@@ -123,7 +123,7 @@ fn parse_trackpad_side(raw: Option<&toml::Value>) -> TrackpadSideConfig {
 #[serde(untagged)]
 pub(crate) enum RemapValue {
     Simple(Vec<Key>),
-    WithAttrs { keys: Vec<Key>, #[serde(default)] no_pause: bool, #[serde(default)] while_gaming: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool, #[serde(default)] haptic: Option<BindingHaptic> },
+    WithAttrs { keys: Vec<Key>, #[serde(default)] no_pause: bool, #[serde(default)] while_gaming: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool, #[serde(default)] haptic: Option<BindingHaptic>, #[serde(default)] note: Option<String> },
 }
 
 /// Value for a `[commands]` entry — simple array or inline table with attributes.
@@ -131,7 +131,7 @@ pub(crate) enum RemapValue {
 #[serde(untagged)]
 pub(crate) enum CommandValue {
     Simple(Vec<String>),
-    WithAttrs { run: Vec<String>, #[serde(default)] no_pause: bool, #[serde(default)] while_gaming: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool, #[serde(default)] haptic: Option<BindingHaptic> },
+    WithAttrs { run: Vec<String>, #[serde(default)] no_pause: bool, #[serde(default)] while_gaming: bool, #[serde(default)] label: Option<String>, #[serde(default)] silent: bool, #[serde(default)] haptic: Option<BindingHaptic>, #[serde(default)] note: Option<String> },
 }
 
 /// `haptic = { … }` on a binding: the feedback it plays when it fires.
@@ -364,6 +364,10 @@ pub struct Bindings {
     /// belongs to that one action and is not inherited by a combo on the same
     /// button.
     pub haptics: HashMap<(Event, Vec<Event>), BindingHaptic>,
+    /// Set via `note = "…"` in an inline-table binding: a short second line
+    /// the HUD shows under the label — how the action is used ("halten" for
+    /// push-to-talk), not what it does. Keyed and merged like `labels`.
+    pub notes: HashMap<(Event, Vec<Event>), String>,
     /// Raw `[hints]` entries in source form: TOML key → label.
     ///
     /// Kept unresolved on purpose. A hint written in output space
@@ -739,6 +743,7 @@ impl Config {
                 merged.labels.remove(&(*trigger, combo.clone()));
                 merged.silent.remove(&(*trigger, combo.clone()));
                 merged.haptics.remove(&(*trigger, combo.clone()));
+                merged.notes.remove(&(*trigger, combo.clone()));
                 merged.remap.entry(*trigger).or_default().insert(combo.clone(), actions.clone());
             }
         }
@@ -749,6 +754,7 @@ impl Config {
                 merged.labels.remove(&(*trigger, combo.clone()));
                 merged.silent.remove(&(*trigger, combo.clone()));
                 merged.haptics.remove(&(*trigger, combo.clone()));
+                merged.notes.remove(&(*trigger, combo.clone()));
                 merged.commands.entry(*trigger).or_default().insert(combo.clone(), cmds.clone());
             }
         }
@@ -759,6 +765,7 @@ impl Config {
                 merged.labels.remove(&(*trigger, combo.clone()));
                 merged.silent.remove(&(*trigger, combo.clone()));
                 merged.haptics.remove(&(*trigger, combo.clone()));
+                merged.notes.remove(&(*trigger, combo.clone()));
                 merged.movements.entry(*trigger).or_default().insert(combo.clone(), *movement);
             }
         }
@@ -778,6 +785,9 @@ impl Config {
         }
         for (key, haptic) in &self.bindings.haptics {
             merged.haptics.insert(key.clone(), haptic.clone());
+        }
+        for (key, note) in &self.bindings.notes {
+            merged.notes.insert(key.clone(), note.clone());
         }
         // Hints merge like labels: same key → override wins. They stay in source
         // form; resolve_hints turns them into buttons once the merge is complete.
@@ -1097,9 +1107,9 @@ fn parse_raw_config(
     mapped_modifiers.custom.extend(rstick_activation_modifiers);
 
     for (input, value) in remap {
-        let (output, np, wg, lbl, sl, hp) = match value {
-            RemapValue::Simple(keys) => (keys, false, false, None, false, None),
-            RemapValue::WithAttrs { keys, no_pause, while_gaming, label, silent, haptic } => (keys, no_pause, while_gaming, label, silent, haptic),
+        let (output, np, wg, lbl, sl, hp, nt) = match value {
+            RemapValue::Simple(keys) => (keys, false, false, None, false, None, None),
+            RemapValue::WithAttrs { keys, no_pause, while_gaming, label, silent, haptic, note } => (keys, no_pause, while_gaming, label, silent, haptic, note),
         };
         let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else { continue; };
         if np { bindings.no_pause.insert((evt, modifiers.clone())); }
@@ -1107,13 +1117,14 @@ fn parse_raw_config(
         if let Some(l) = lbl { bindings.labels.insert((evt, modifiers.clone()), l); }
         if sl { bindings.silent.insert((evt, modifiers.clone())); }
         if let Some(h) = hp { bindings.haptics.insert((evt, modifiers.clone()), h); }
+        if let Some(n) = nt { bindings.notes.insert((evt, modifiers.clone()), n); }
         bindings.remap.entry(evt).or_default().insert(modifiers, output);
     }
 
     for (input, value) in commands {
-        let (output, np, wg, lbl, sl, hp) = match value {
-            CommandValue::Simple(cmds) => (cmds, false, false, None, false, None),
-            CommandValue::WithAttrs { run, no_pause, while_gaming, label, silent, haptic } => (run, no_pause, while_gaming, label, silent, haptic),
+        let (output, np, wg, lbl, sl, hp, nt) = match value {
+            CommandValue::Simple(cmds) => (cmds, false, false, None, false, None, None),
+            CommandValue::WithAttrs { run, no_pause, while_gaming, label, silent, haptic, note } => (run, no_pause, while_gaming, label, silent, haptic, note),
         };
         let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else { continue; };
         if np { bindings.no_pause.insert((evt, modifiers.clone())); }
@@ -1121,6 +1132,7 @@ fn parse_raw_config(
         if let Some(l) = lbl { bindings.labels.insert((evt, modifiers.clone()), l); }
         if sl { bindings.silent.insert((evt, modifiers.clone())); }
         if let Some(h) = hp { bindings.haptics.insert((evt, modifiers.clone()), h); }
+        if let Some(n) = nt { bindings.notes.insert((evt, modifiers.clone()), n); }
         bindings.commands.entry(evt).or_default().insert(modifiers, output);
     }
 
