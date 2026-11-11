@@ -466,8 +466,10 @@ pub fn build_state(
     // A combo qualifies for modifier m when it contains m and all currently
     // held modifiers — shared predicate used by both the availability filter
     // and the has_app_combos check so the logic can't drift out of sync.
+    // "Held" includes hint modifiers (hint_mods ⊇ active_input_mods): while R5
+    // is down, a combo without R5 is not one the user is building towards.
     let qualifies = |m: &Event, combo: &Vec<Event>| -> bool {
-        combo.contains(m) && active_input_mods.iter().all(|held| combo.contains(held))
+        combo.contains(m) && hint_mods.iter().all(|held| combo.contains(held))
     };
     let has_app_combos = |m: &Event| -> bool {
         match &config.override_bindings {
