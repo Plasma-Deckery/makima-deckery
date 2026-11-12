@@ -179,11 +179,10 @@ fn no_relevant_group_means_no_access() {
 }
 
 #[test]
-#[ignore = "substring match: a group like `uinput` or `chroot` counts as access — see issue #42 report"]
 fn a_group_that_merely_contains_input_does_not_grant_access() {
-    // `groups` prints whole names separated by spaces. Testing for a
-    // substring lets `uinput` pass as `input`, which picks the wrong hint
-    // when no device is found.
+    // `groups` prints whole names separated by spaces. A substring test once
+    // let `uinput` pass as `input`, which picked the wrong hint when no
+    // device was found.
     assert_eq!(evdev_access("philipp uinput\n"), EvdevAccess::Missing);
     assert_eq!(evdev_access("philipp chroot\n"), EvdevAccess::Missing);
 }

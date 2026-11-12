@@ -165,12 +165,13 @@ enum EvdevAccess {
     Missing,
 }
 
-/// Read the output of `groups` the way `launch_tasks` always has: a plain
-/// substring test, `input` checked before `root`.
+/// Read the output of `groups`: whole names separated by whitespace, `input`
+/// checked before `root`. A substring test would let `uinput` pass as `input`.
 fn evdev_access(groups: &str) -> EvdevAccess {
-    if groups.contains("input") {
+    let is_member = |name: &str| groups.split_whitespace().any(|g| g == name);
+    if is_member("input") {
         EvdevAccess::InputGroup
-    } else if groups.contains("root") {
+    } else if is_member("root") {
         EvdevAccess::Root
     } else {
         EvdevAccess::Missing
