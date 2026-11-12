@@ -393,6 +393,18 @@ impl EventReader {
         self.apply_frames(&plan.frames).await;
     }
 
+    /// What the IPC `resume` does to the input path: nothing is sent, and a
+    /// custom modifier still held counts as used — see
+    /// `machine::resume_modifier_was_activated`.
+    async fn resume_mark_held_modifiers(&self) {
+        let config = self.current_config.lock().await.clone();
+        let modifiers = self.modifiers.lock().await.clone();
+        let mut activated = self.modifier_was_activated.lock().await;
+        *activated = crate::machine::resume_modifier_was_activated(
+            &modifiers, &config.mapped_modifiers.custom, *activated,
+        );
+    }
+
     /// Release all currently held output keys and clear modifier/held-key state.
     ///
     /// The full reset, for when edges really were lost: `ControllerEvent::Reconnected`

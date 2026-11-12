@@ -1013,7 +1013,8 @@ fn no_haptic_plays_nothing() {
 // of `emitted_outputs`, `plan_route`, the intercept, `resolve_binding`,
 // `plan_emit`, and for an unbound event `paused_nonmapped` then
 // `plan_nonmapped`. Pause is `plan_pause` as `pause_release_outputs` applies it;
-// resume is what the IPC handler does — flip the flag, nothing else.
+// resume is what the IPC handler does — flip the flag and apply
+// `resume_modifier_was_activated`, sending nothing.
 
 const L1: Key = Key::BTN_TL;
 const STEAM: Key = Key::BTN_MODE;
@@ -1207,9 +1208,14 @@ impl Reader {
         self.send(&plan.frames);
     }
 
-    /// The IPC `resume`: the flag, and nothing else.
+    /// The IPC `resume`: the flag, and the used-mark for a held modifier.
+    /// Nothing is sent.
     fn resume(&mut self) {
         self.paused = false;
+        self.modifier_was_activated = resume_modifier_was_activated(
+            &self.modifiers, &self.config.mapped_modifiers.custom,
+            self.modifier_was_activated,
+        );
     }
 }
 
@@ -1419,4 +1425,35 @@ fn paused_nonmapped_tracks_modifiers_and_honours_no_pause() {
     assert_eq!(paused_nonmapped(&config, ev(Key::BTN_SOUTH), &[], true), Some(false));
     config.bindings.no_pause.insert((ev(Key::BTN_SOUTH), vec![]));
     assert_eq!(paused_nonmapped(&config, ev(Key::BTN_SOUTH), &[ev(L4)], true), None);
+}
+
+/// Steam pressed *during* the pause and released after it: the press was
+/// swallowed, so the release must not tap either. The flag has to be false at
+/// the pause for this to matter, which is rare — it starts true, and a pause
+/// with a custom modifier held sets it — so the test puts it there directly,
+/// as if an unused modifier press were pending.
+#[test]
+fn a_modifier_pressed_during_a_pause_does_not_tap_after_it() {
+    let mut r = Reader::new(layered_config());
+    r.modifier_was_activated = false;
+
+    r.pause();
+    r.press(STEAM);
+    assert!(!r.modifier_was_activated, "precondition: still armed while paused");
+    r.resume();
+    assert!(r.modifier_was_activated, "resume has to count the held Steam as used");
+    assert_eq!(r.take(), vec![], "pause or resume sent something");
+
+    r.release(STEAM);
+    assert_eq!(presses(&r.take()), Vec::<u16>::new(), "Steam tapped after the pause");
+    assert!(r.modifiers.is_empty());
+}
+
+/// Resume with no custom modifier held leaves the flag as it was.
+#[test]
+fn a_resume_without_a_held_modifier_leaves_the_flag_alone() {
+    let config = layered_config();
+    let custom = &config.mapped_modifiers.custom;
+    assert!(!resume_modifier_was_activated(&[], custom, false));
+    assert!(resume_modifier_was_activated(&[ev(STEAM)], custom, false));
 }

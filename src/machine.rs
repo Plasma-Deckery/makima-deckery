@@ -334,9 +334,10 @@ pub fn release_emitted(emitted_outputs: &std::collections::HashMap<Event, Vec<Ke
 /// that arrive during the pause keep both sets current, which is what already
 /// made a press *during* the pause work.
 ///
-/// Resume needs no plan of its own: it re-presses nothing and emits nothing, so
-/// a button held across the pause stays released on the output side until it is
-/// pressed again, and a held layer key simply carries on resolving its layer.
+/// Resume re-presses nothing and emits nothing (`resume_modifier_was_activated`
+/// is its only decision), so a button held across the pause stays released on
+/// the output side until it is pressed again, and a held layer key simply
+/// carries on resolving its layer.
 ///
 /// A custom modifier held across the pause counts as used. Whatever the user did
 /// with it while the HUD was open happened where makima sends nothing, so the
@@ -349,11 +350,37 @@ pub fn plan_pause(
     custom_modifiers: &[Event],
     modifier_was_activated: bool,
 ) -> PausePlan {
-    let holds_custom = modifiers.iter().any(|m| custom_modifiers.contains(m));
     PausePlan {
         frames: release_emitted(emitted_outputs),
-        modifier_was_activated: modifier_was_activated || holds_custom,
+        modifier_was_activated: held_modifier_counts_as_used(
+            modifiers, custom_modifiers, modifier_was_activated,
+        ),
     }
+}
+
+/// `modifier_was_activated` after the IPC `resume`.
+///
+/// The other half of the rule `plan_pause` applies: a custom modifier pressed
+/// *during* the pause and still held when it ends was not there at the pause,
+/// so only the resume can mark it used. Its press was swallowed — nothing went
+/// out for it — so a tap on its release after the pause would be the one event
+/// of the pause that still reaches the outside. Resume sends nothing; this is
+/// state only.
+pub fn resume_modifier_was_activated(
+    modifiers: &[Event],
+    custom_modifiers: &[Event],
+    modifier_was_activated: bool,
+) -> bool {
+    held_modifier_counts_as_used(modifiers, custom_modifiers, modifier_was_activated)
+}
+
+/// A custom modifier held at a pause boundary counts as used.
+fn held_modifier_counts_as_used(
+    modifiers: &[Event],
+    custom_modifiers: &[Event],
+    modifier_was_activated: bool,
+) -> bool {
+    modifier_was_activated || modifiers.iter().any(|m| custom_modifiers.contains(m))
 }
 
 /// Whether a pause swallows an event that has no binding of its own, and if so,
