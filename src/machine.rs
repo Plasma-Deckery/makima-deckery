@@ -861,5 +861,5 @@ pub fn stick_loop_active(paused: bool, cursor_when_paused: bool, gaming_mode: bo
 }
 
 #[cfg(test)]
-#[path = "machine_tests.rs"]
+#[path = "machine_tests/mod.rs"]
 mod tests;
