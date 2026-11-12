@@ -273,22 +273,26 @@ impl EventReader {
         modifiers: &Vec<Event>,
         config: &Config,
     ) {
-        if *self.paused.lock().await {
-            // Check whether this exact (trigger, current-modifiers) combo has no_pause = true.
-            // If so, fall through to normal processing so the binding executes even when paused.
+        let paused = *self.paused.lock().await;
+        if paused {
+            // The exact (trigger, current-modifiers) combo is checked against
+            // the live set, not the sorted copy the caller resolved with — as
+            // it always has been.
             let current_mods = self.modifiers.lock().await.clone();
-            let is_no_pause = config.bindings.no_pause.contains(&(event, current_mods.clone()))
-                || config.bindings.no_pause.contains(&(event, vec![]));
-            if !is_no_pause {
+            match crate::machine::paused_nonmapped(config, event, &current_mods, paused) {
                 // When paused, still track modifier buttons (BTN_TL, BTN_MODE, etc.)
                 // so the HUD can display combo overlays while open.
-                // For non-modifier buttons, just write state to reflect active_buttons.
-                if config.mapped_modifiers.all.contains(&event) {
+                Some(true) => {
                     self.toggle_modifiers(event, value, config).await;
-                } else {
-                    self.write_state().await;
+                    return;
                 }
-                return;
+                // For non-modifier buttons, just write state to reflect active_buttons.
+                Some(false) => {
+                    self.write_state().await;
+                    return;
+                }
+                // A no_pause binding: processed as if not paused.
+                None => {}
             }
         }
         // Passthrough keys are held state — last_action is only for combos and commands.

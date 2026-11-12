@@ -23,9 +23,15 @@ impl EventReader {
                         *self.paused.lock().await = cmd == "pause";
                         // On pause: release all held output keys immediately so
                         // nothing stays stuck while an external process (e.g.
-                        // deckery-auth-daemon) takes over the controller.
+                        // deckery-auth-daemon) takes over the controller. What
+                        // the user still holds is kept (issue #62). Resume sends
+                        // nothing: no output goes back down, the held state just
+                        // carries on, and a custom modifier still held is marked
+                        // used so its release does not tap.
                         if cmd == "pause" {
-                            self.release_all_held().await;
+                            self.pause_release_outputs().await;
+                        } else {
+                            self.resume_mark_held_modifiers().await;
                         }
                     } else {
                         // Route through the unified Gaming Mode channel.
