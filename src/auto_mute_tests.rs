@@ -1,4 +1,6 @@
 use super::*;
+use super::pipewire::{parse_event, parse_flatpak_info, parse_streams, resolve_game};
+use std::collections::HashMap;
 
 const GAME: u32 = 1000;
 const OTHER_GAME: u32 = 2000;
@@ -214,4 +216,35 @@ fn flatpak_info_yields_the_app_id() {
     assert_eq!(parse_flatpak_info(info).as_deref(), Some("org.DolphinEmu.dolphin-emu"));
     // `name=` in a later section is not the app id.
     assert_eq!(parse_flatpak_info("[Instance]\nname=x\n"), None);
+}
+
+/// Off, a focus change needs no listing: that is what keeps a config that
+/// never enables the feature from spawning `pactl` on every window switch.
+#[test]
+fn off_needs_no_streams_for_a_focus_change() {
+    let m = Muter::new(false, BTreeSet::new());
+    assert!(!m.needs_streams(&[Input::Focus { game: Some(GAME) }]));
+    assert!(!m.needs_streams(&[Input::Focus { game: None }]));
+}
+
+/// Turning it on mutes a game already in the background, which needs the
+/// streams; turning it off releases what was muted, which does too.
+#[test]
+fn switching_it_needs_streams() {
+    let off = Muter::new(false, BTreeSet::new());
+    assert!(off.needs_streams(&[Input::Enabled(true), Input::Focus { game: None }]));
+
+    let mut m = on();
+    backgrounded(&mut m);
+    assert!(m.needs_streams(&[Input::Enabled(false)]));
+}
+
+/// Off, but something makima muted is still open: it must still be listed so
+/// it can be released.
+#[test]
+fn off_with_a_stream_still_muted_needs_streams() {
+    let mut m = on();
+    backgrounded(&mut m);
+    m.step(Input::Enabled(false), &[]); // the stream was not in the listing
+    assert!(m.needs_streams(&[Input::Focus { game: None }]));
 }
