@@ -732,3 +732,15 @@ fn written_label_wins_over_a_modifier_less_hint() {
 
     assert!(config.bindings.hints_resolved.is_empty());
 }
+
+/// The modes that read the pad from hidraw are the ones whose evdev
+/// duplicates (click, hat position) must be swallowed by the event loop.
+#[test]
+fn trackball_and_mt_trackpad_own_their_pad() {
+    let side = |mode: &str| TrackpadSideConfig { mode: mode.to_string(), ..Default::default() };
+    assert!(side("mt-trackpad").has_handler());
+    assert!(side("trackball").has_handler());
+    assert!(!side("disabled").has_handler());
+    assert!(!side("scroll").has_handler(), "no handler yet, see issue #24");
+    assert!(!side("nonsense").has_handler());
+}

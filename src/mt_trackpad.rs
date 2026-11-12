@@ -32,7 +32,7 @@ fn default_movement_pixel_interval() -> u32 { 3000 }
 /// produced a continuous buzz; distance-gating means faster movement ticks
 /// more often and slow movement ticks rarely, matching Steam Input's own
 /// trackpad feedback feel.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 pub struct MovementHaptic {
     #[serde(default = "default_movement_pixel_interval")]
     pub pixel_interval: u32,

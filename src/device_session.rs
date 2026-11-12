@@ -21,6 +21,7 @@ use deckery_controller::HapticChain;
 use deckery_controller::{ClickPressureConfig, ClickPressureHandle, HapticPad, PadFrame};
 use crate::output::Outputs;
 use crate::trackpad::PadState;
+use crate::trackball::{self, TrackballConfig};
 use crate::trackpad_router::{self, GestureEvent, SinglePadFrame};
 use crate::virtual_devices::VirtualDevices;
 use std::sync::Arc;
@@ -42,6 +43,11 @@ pub struct TrackpadSession {
     right_press_chain:    HapticChain,
     right_release_chain:  Option<HapticChain>,
     right_movement_pulse: Option<MovementHaptic>,
+
+    /// `Some` when that side runs in trackball mode instead of mt-trackpad;
+    /// its channel then feeds `trackball::run_single`.
+    left_trackball:  Option<TrackballConfig>,
+    right_trackball: Option<TrackballConfig>,
 
     gesture_pad_config: GesturePadConfig,
 
@@ -73,7 +79,7 @@ impl TrackpadSession {
     ) -> Self {
         // Validate modes early so the warning appears before any device work.
         for (side, mode) in [("left", &trackpad.left.mode), ("right", &trackpad.right.mode)] {
-            if !["disabled", "mt-trackpad", "scroll"].contains(&mode.as_str()) {
+            if !["disabled", "mt-trackpad", "trackball", "scroll"].contains(&mode.as_str()) {
                 eprintln!(
                     "[makima] Warning: unrecognised trackpad mode {:?} for {} pad, treating as disabled.",
                     mode, side
@@ -106,13 +112,20 @@ impl TrackpadSession {
         let right_mt = MtTrackpadConfig::from_toml_value(&trackpad.right.handler_config);
         let gesture_pad_config = GesturePadConfig::from_toml_value(&trackpad.gesture_handler_config);
 
-        let (left_tx, left_rx) = if trackpad.left.mode == "mt-trackpad" {
+        let trackball_config = |mode: &str, raw: &toml::Value| {
+            (mode == "trackball").then(|| TrackballConfig::from_toml_value(raw))
+        };
+        let left_trackball  = trackball_config(&trackpad.left.mode, &trackpad.left.handler_config);
+        let right_trackball = trackball_config(&trackpad.right.mode, &trackpad.right.handler_config);
+
+        // Both handler modes read the router's per-pad channel.
+        let (left_tx, left_rx) = if trackpad.left.has_handler() {
             let (tx, rx) = mpsc::channel(64);
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
-        let (right_tx, right_rx) = if trackpad.right.mode == "mt-trackpad" {
+        let (right_tx, right_rx) = if trackpad.right.has_handler() {
             let (tx, rx) = mpsc::channel(64);
             (Some(tx), Some(rx))
         } else {
@@ -154,6 +167,8 @@ impl TrackpadSession {
             right_press_chain:    right_mt.press_chain(),
             right_release_chain:  right_mt.release_chain(),
             right_movement_pulse: right_mt.movement_pulse(),
+            left_trackball,
+            right_trackball,
             gesture_pad_config,
             _click_pressure: click_pressure,
         }
@@ -201,27 +216,39 @@ impl TrackpadSession {
                 }
             },
             async {
-                if let Some(rx) = self.left_rx {
-                    mt_trackpad::run_single(
-                        rx, outputs, lpad,
-                        HapticPad::Left,
-                        self.left_press_chain,
-                        self.left_release_chain,
-                        self.left_movement_pulse,
-                    )
-                    .await;
+                match (self.left_rx, self.left_trackball) {
+                    (Some(rx), Some(config)) => {
+                        trackball::run_single(rx, outputs, HapticPad::Left, config).await;
+                    }
+                    (Some(rx), None) => {
+                        mt_trackpad::run_single(
+                            rx, outputs, lpad,
+                            HapticPad::Left,
+                            self.left_press_chain,
+                            self.left_release_chain,
+                            self.left_movement_pulse,
+                        )
+                        .await;
+                    }
+                    (None, _) => {}
                 }
             },
             async {
-                if let Some(rx) = self.right_rx {
-                    mt_trackpad::run_single(
-                        rx, outputs, rpad,
-                        HapticPad::Right,
-                        self.right_press_chain,
-                        self.right_release_chain,
-                        self.right_movement_pulse,
-                    )
-                    .await;
+                match (self.right_rx, self.right_trackball) {
+                    (Some(rx), Some(config)) => {
+                        trackball::run_single(rx, outputs, HapticPad::Right, config).await;
+                    }
+                    (Some(rx), None) => {
+                        mt_trackpad::run_single(
+                            rx, outputs, rpad,
+                            HapticPad::Right,
+                            self.right_press_chain,
+                            self.right_release_chain,
+                            self.right_movement_pulse,
+                        )
+                        .await;
+                    }
+                    (None, _) => {}
                 }
             },
             async {
