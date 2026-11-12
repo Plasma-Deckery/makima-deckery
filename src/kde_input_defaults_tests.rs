@@ -66,7 +66,7 @@ fn deckery_section_first_is_removed() {
 }
 
 #[test]
-#[ignore = "bug: a comment directly after a Deckery section is removed with it"]
+#[ignore = "known bug, left unfixed: a comment directly after a Deckery section is removed with it; rare, since KConfig itself drops comments on write — only hand-edited files lose a line"]
 fn a_comment_after_a_deckery_section_is_kept() {
     // Removal runs from a Deckery header to the next header, so anything in
     // between counts as Deckery's — including a user comment that introduces
