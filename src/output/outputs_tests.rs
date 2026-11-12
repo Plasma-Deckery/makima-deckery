@@ -193,3 +193,84 @@ async fn a_haptic_with_room_is_delivered() {
     let got = haptic_rx.try_recv().expect("haptic not delivered");
     assert_eq!(got.pad, deckery_controller::HapticPad::Right);
 }
+
+// ── What the urgency does when the state writer is behind ─────────────────────
+//
+// The decision between the two urgencies is tested above and in the deciders.
+// These pin what each one actually does once the state channel is full, which
+// is the only moment the difference shows.
+
+fn publish(marker: &str, urgency: Urgency) -> OutputAction {
+    OutputAction::State(StateAction::Publish {
+        snapshot: Box::new(serde_json::json!({ "marker": marker })),
+        urgency,
+    })
+}
+
+/// The marker of a received snapshot, so the order of arrivals can be compared.
+fn marker_of(command: StateCommand) -> String {
+    match command {
+        StateCommand::SetEventState(Some(snapshot)) => {
+            snapshot["marker"].as_str().unwrap().to_string()
+        }
+        other => panic!("expected a snapshot, got {other:?}"),
+    }
+}
+
+/// A state port with room for one command, already taken.
+fn full_state_port() -> (Outputs, mpsc::Receiver<StateCommand>) {
+    let (tx, rx) = mpsc::channel(1);
+    tx.try_send(StateCommand::SetEventState(Some(serde_json::json!({ "marker": "filler" }))))
+        .unwrap();
+    (Outputs { state: Some(tx), ..Default::default() }, rx)
+}
+
+/// An analog tick at 60 Hz must not wait for a writer that is behind: the
+/// event loop would stall on the next stick movement. The tick is lost, and the
+/// next one carries newer values anyway.
+#[tokio::test]
+async fn an_analog_publish_on_a_full_channel_returns_at_once_and_is_lost() {
+    let (outputs, mut rx) = full_state_port();
+
+    // A zero timeout still polls the future once before looking at the clock,
+    // so this passes only if dispatch completes on its very first poll — that
+    // is, without waiting at all.
+    tokio::time::timeout(
+        std::time::Duration::ZERO,
+        outputs.dispatch(&[publish("tick", Urgency::Analog)]),
+    )
+    .await
+    .expect("an analog publish waited for room");
+
+    assert_eq!(marker_of(rx.try_recv().unwrap()), "filler");
+    // Room now, but the tick is not queued anywhere to take it.
+    assert!(rx.try_recv().is_err(), "the analog publish was delivered after all");
+}
+
+/// A discrete event — a press, a mode change — must reach the overlay, so it
+/// waits for room instead of being dropped, and arrives once there is some.
+#[tokio::test]
+async fn an_immediate_publish_on_a_full_channel_waits_and_is_delivered() {
+    let (outputs, mut rx) = full_state_port();
+
+    let pending = tokio::spawn({
+        let outputs = outputs.clone();
+        async move { outputs.dispatch(&[publish("press", Urgency::Immediate)]).await }
+    });
+
+    // Let the dispatch run as far as it can. On the current-thread runtime each
+    // yield hands the thread to it; with no room it can only park on the send.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!pending.is_finished(), "an immediate publish gave up on a full channel");
+
+    // Making room is what lets it through, and it arrives after what was
+    // already queued.
+    assert_eq!(marker_of(rx.recv().await.unwrap()), "filler");
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("the immediate publish never completed after room was made")
+        .unwrap();
+    assert_eq!(marker_of(rx.try_recv().unwrap()), "press");
+}

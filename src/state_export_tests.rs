@@ -828,6 +828,86 @@ fn origin_override_vs_base() {
     );
 }
 
+// ── config_stack and active_app ───────────────────────────────────────────
+//
+// The HUD shows which app config is active and tags every binding with the
+// config it was written in. Both come from the stack, so the stack and the two
+// fields read from it are pinned here for the two shapes it can have.
+
+#[test]
+fn the_stack_is_just_the_base_while_no_app_config_is_active() {
+    assert_eq!(config_stack("Steam Deck", "Steam Deck"), vec!["Steam Deck".to_string()]);
+}
+
+#[test]
+fn the_stack_is_base_then_app_while_an_app_config_is_active() {
+    assert_eq!(config_stack("Steam Deck", "firefox"),
+               vec!["Steam Deck".to_string(), "firefox".to_string()]);
+}
+
+#[test]
+fn base_only_reports_no_active_app_and_the_base_as_every_origin() {
+    // "default" is the HUD's word for "no app config"; an empty or missing
+    // field would read as a broken snapshot instead.
+    let mut config = make_config(
+        vec![(key(Key::BTN_SOUTH), vec![], vec![Key::KEY_ENTER])],
+        vec![(key(Key::BTN_WEST), vec![], vec!["true".to_string()])],
+        vec![],
+    );
+    config.name = "Steam Deck".to_string();
+    let stack = config_stack("Steam Deck", &config.name);
+
+    let state = build_state(&config, &[], false, false, &[], &None, &stack,
+                            &GamingModeConfig::default());
+
+    assert_eq!(state["context"]["active_app"], "default");
+    assert_eq!(state["context"]["config_stack"], serde_json::json!(["Steam Deck"]));
+    assert_eq!(state["bindings"]["BTN_SOUTH"]["origin"], "Steam Deck");
+    assert_eq!(state["bindings"]["BTN_WEST"]["origin"], "Steam Deck");
+}
+
+#[test]
+fn an_app_override_is_the_active_app_and_owns_only_what_it_wrote() {
+    // `origin_override_vs_base` covers plain remaps. This adds the context
+    // fields and the other two places origin is decided — commands, and the
+    // combo view under a held modifier — so an app that overrides one command
+    // is not credited with every command the base defines.
+    let btn_tl = key(Key::BTN_TL);
+    let mut config = make_config_with_override(
+        // Merged: the base's BTN_SOUTH and the app's combo.
+        vec![
+            (key(Key::BTN_SOUTH),   vec![],       vec![Key::KEY_ENTER]),
+            (key(Key::BTN_DPAD_UP), vec![btn_tl], vec![Key::KEY_LEFTALT, Key::KEY_LEFT]),
+        ],
+        // Merged commands: one from the base, one from the app.
+        vec![
+            (key(Key::BTN_WEST),  vec![], vec!["base-cmd".to_string()]),
+            (key(Key::BTN_NORTH), vec![], vec!["app-cmd".to_string()]),
+        ],
+        vec![btn_tl],
+        // What the app config itself wrote.
+        vec![(key(Key::BTN_DPAD_UP), vec![btn_tl], vec![Key::KEY_LEFTALT, Key::KEY_LEFT])],
+    );
+    config.name = "firefox".to_string();
+    config.override_bindings.as_mut().unwrap().commands
+        .entry(key(Key::BTN_NORTH)).or_default()
+        .insert(vec![], vec!["app-cmd".to_string()]);
+    let stack = config_stack("Steam Deck", &config.name);
+
+    let state = build_state(&config, &[btn_tl], false, false, &[btn_tl], &None, &stack,
+                            &GamingModeConfig::default());
+
+    assert_eq!(state["context"]["active_app"], "firefox");
+    assert_eq!(state["context"]["config_stack"], serde_json::json!(["Steam Deck", "firefox"]));
+
+    assert_eq!(state["bindings"]["BTN_SOUTH"]["origin"], "Steam Deck");
+    assert_eq!(state["bindings"]["BTN_TL-BTN_DPAD_UP"]["origin"], "firefox");
+    assert_eq!(state["bindings"]["BTN_WEST"]["origin"], "Steam Deck");
+    assert_eq!(state["bindings"]["BTN_NORTH"]["origin"], "firefox");
+    // The combo view the HUD switches to while BTN_TL is held.
+    assert_eq!(state["modifier_active"]["BTN_DPAD_UP"]["origin"], "firefox");
+}
+
 // ── write_state: analog fields ────────────────────────────────────────────
 
 fn empty_config() -> Config {

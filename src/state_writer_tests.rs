@@ -289,3 +289,190 @@ fn flush_skips_an_unchanged_document() {
                "the file was rewritten although nothing changed");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── The task itself, end to end ───────────────────────────────────────────────
+//
+// `flush` is tested above against a path; these run the whole task the same
+// way, through the handle every module holds, so that the parts which only
+// exist in the task — the drain that merges a burst, the dedup across commands,
+// shutting down — are covered too. Everything runs on the default
+// current-thread test runtime, which is what makes `settled` below exact.
+
+/// Generous upper bound for anything the task has to do. Never waited out in a
+/// passing run; it only turns a hang into a failure.
+const TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait until the task has taken every queued command *and* finished acting on
+/// them.
+///
+/// A slot frees up when the task receives a command. On a current-thread
+/// runtime the task then runs apply and flush — both synchronous — up to its
+/// next `recv().await` before anything else gets to run, so once the test is
+/// running again with the channel empty, the write for that command is done.
+async fn settled(tx: &StateWriterHandle) {
+    tokio::time::timeout(TASK_TIMEOUT, async {
+        while tx.capacity() < tx.max_capacity() {
+            tokio::task::yield_now().await;
+        }
+        // One more turn so the task is certainly parked again, not merely past
+        // the receive.
+        tokio::task::yield_now().await;
+    })
+    .await
+    .expect("the state writer never caught up with its queue");
+}
+
+/// Poll the file until `ready` accepts its document, and return that document.
+async fn wait_for_doc(
+    path: &std::path::Path,
+    ready: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    tokio::time::timeout(TASK_TIMEOUT, async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if ready(&doc) {
+                        return doc;
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the state file never reached the expected state")
+}
+
+/// Start the task at a fresh path and wait for its initial "starting" write,
+/// so every test begins from a file that is known to be there.
+async fn started(name: &str)
+    -> (std::path::PathBuf, std::path::PathBuf, StateWriterHandle, tokio::task::JoinHandle<()>)
+{
+    let dir = scratch(name);
+    let path = dir.join("makima-state.json");
+    let (tx, task) = spawn_state_writer_at(path.clone());
+    wait_for_doc(&path, |d| d["lifecycle"] == "starting").await;
+    (dir, path, tx, task)
+}
+
+#[tokio::test]
+async fn the_task_writes_every_kind_of_command_to_its_path() {
+    // Every slot a module can fill, sent the way modules send them, and read
+    // back the way the tray reads them.
+    let (dir, path, tx, _task) = started("deckery-task-all-slots").await;
+
+    tx.send(StateCommand::SetLifecycle(AppLifecycle::Ready)).await.unwrap();
+    tx.send(StateCommand::SetError {
+        id: "no_device".into(), message: "no matching device found".into(), severity: "error",
+    }).await.unwrap();
+    tx.send(StateCommand::SetError {
+        id: "base_config".into(), message: "TOML error".into(), severity: "warning",
+    }).await.unwrap();
+    tx.send(StateCommand::ClearError { id: "no_device".into() }).await.unwrap();
+    tx.send(StateCommand::SetEventState(Some(serde_json::json!({
+        "context":  { "paused": true },
+        "bindings": { "BTN_SOUTH": { "action": ["KEY_ENTER"] } },
+    })))).await.unwrap();
+    tx.send(StateCommand::SetLoadedConfigs(vec![
+        summary("Steam Deck",  "base",   None,               true),
+        summary("KDE Desktop", "module", Some("Steam Deck"), false),
+    ])).await.unwrap();
+    tx.send(StateCommand::SetConfigRoots(crate::config_registry::ConfigRoots {
+        system: std::path::PathBuf::from("/usr/share/deckery/configs"),
+        user:   std::path::PathBuf::from("/home/u/.config/deckery"),
+    })).await.unwrap();
+
+    // The last command decides when the document is complete; the earlier ones
+    // may have landed in the same write or in their own.
+    let doc = wait_for_doc(&path, |d| !d["config_roots"].is_null()).await;
+
+    assert_eq!(doc["lifecycle"], "ready");
+    let errors = doc["errors"].as_object().unwrap();
+    assert_eq!(errors.len(), 1, "the cleared error must be gone: {errors:?}");
+    assert_eq!(doc["errors"]["base_config"]["severity"], "warning");
+    assert_eq!(doc["errors"]["base_config"]["message"], "TOML error");
+    assert_eq!(doc["context"]["paused"], true);
+    assert_eq!(doc["bindings"]["BTN_SOUTH"]["action"][0], "KEY_ENTER");
+    let configs = doc["configs"].as_array().unwrap();
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[1]["name"], "KDE Desktop");
+    assert_eq!(configs[1]["enabled"], false);
+    assert_eq!(configs[1]["parent"], "Steam Deck");
+    assert_eq!(doc["config_roots"]["user"], "/home/u/.config/deckery");
+
+    // And the device going away takes its fields with it, rather than leaving
+    // the last device's bindings on screen.
+    tx.send(StateCommand::SetEventState(None)).await.unwrap();
+    let doc = wait_for_doc(&path, |d| d.get("context").is_none()).await;
+    assert!(doc.get("bindings").is_none());
+    assert_eq!(doc["lifecycle"], "ready", "the other slots must survive");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Something only an outside writer could have put there. If it survives a
+/// command, the task did not write; if it is gone, it did.
+const MARKER: &str = "not written by the state writer";
+
+#[tokio::test]
+async fn an_unchanged_document_is_not_rewritten() {
+    // A key press that changes nothing visible still sends a snapshot; the task
+    // must not turn that into a write.
+    let (dir, path, tx, _task) = started("deckery-task-unchanged").await;
+    settled(&tx).await;
+    std::fs::write(&path, MARKER).unwrap();
+
+    tx.send(StateCommand::SetLifecycle(AppLifecycle::Starting)).await.unwrap();
+    settled(&tx).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), MARKER,
+               "a command that changed nothing rewrote the file");
+
+    // The control: a real change does reach the file, so the marker surviving
+    // above was the dedup and not a task that had stopped writing.
+    tx.send(StateCommand::SetLifecycle(AppLifecycle::Ready)).await.unwrap();
+    let doc = wait_for_doc(&path, |d| d["lifecycle"] == "ready").await;
+    assert_eq!(doc["lifecycle"], "ready");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn commands_queued_together_become_one_write() {
+    // A burst has one outcome, and the states in between are never written.
+    // Observable through the dedup: a burst that goes somewhere and comes back
+    // ends where the file already is, so merged it writes nothing, whereas
+    // written one by one its first step would replace the marker.
+    let (dir, path, tx, _task) = started("deckery-task-burst").await;
+    settled(&tx).await;
+    std::fs::write(&path, MARKER).unwrap();
+
+    // try_send cannot yield, so on this single thread the task gets no chance
+    // to run between the two — they are queued together by construction.
+    tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Ready)).unwrap();
+    tx.try_send(StateCommand::SetError {
+        id: "transient".into(), message: "gone again".into(), severity: "info",
+    }).unwrap();
+    tx.try_send(StateCommand::ClearError { id: "transient".into() }).unwrap();
+    tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Starting)).unwrap();
+    settled(&tx).await;
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), MARKER,
+               "an intermediate state of the burst was written");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_task_exits_once_the_last_handle_is_dropped() {
+    // The writer has no shutdown command; it ends when nobody can send to it
+    // any more. A task that outlived its senders would be a leak per restart.
+    let (dir, _path, tx, task) = started("deckery-task-exit").await;
+
+    drop(tx);
+    tokio::time::timeout(TASK_TIMEOUT, task)
+        .await
+        .expect("the state writer outlived its last handle")
+        .expect("the state writer panicked on the way out");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

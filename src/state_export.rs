@@ -158,6 +158,20 @@ fn modifier_sort_key(key: &str) -> (u8, String) {
     (rank, key.to_owned())
 }
 
+/// The configs the active one is layered from, base first.
+///
+/// Just the base while no app config is active; base and app while one is.
+/// `build_state` reads both `active_app` and the base origin of inherited
+/// bindings from this, so it lives here, next to the reader, where it can be
+/// tested with it.
+pub fn config_stack(base_name: &str, active_name: &str) -> Vec<String> {
+    if active_name == base_name {
+        vec![base_name.to_string()]
+    } else {
+        vec![base_name.to_string(), active_name.to_string()]
+    }
+}
+
 // ── Pure state builder ────────────────────────────────────────────────────────
 
 /// Build the full state snapshot as a JSON value.

@@ -90,8 +90,21 @@ fn runtime_dir(xdg_runtime_dir: Option<&str>, uid: u32) -> PathBuf {
 /// Spawn the writer task and return the sender handle.
 /// The task writes the initial "starting" state immediately.
 pub fn spawn_state_writer() -> StateWriterHandle {
+    // Resolved once: the process keeps the directory it started in, and
+    // re-deriving it per write would let a mid-session environment change
+    // split the file in two.
+    spawn_state_writer_at(state_path()).0
+}
+
+/// The writer task, writing to `path` instead of the runtime directory.
+///
+/// Split out so the task itself — merging, skipping unchanged documents,
+/// shutting down — can be run against a throwaway file; production only ever
+/// reaches it through `spawn_state_writer`. The join handle is what lets a test
+/// see the task end once the last sender is gone.
+pub(crate) fn spawn_state_writer_at(path: PathBuf) -> (StateWriterHandle, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<StateCommand>(64);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut lifecycle   = AppLifecycle::Starting;
         let mut errors: HashMap<String, ErrorEntry> = HashMap::new();
         let mut event_state: Option<serde_json::Value> = None;
@@ -102,10 +115,6 @@ pub fn spawn_state_writer() -> StateWriterHandle {
         // but most presses change nothing a reader can see — re-writing the same
         // document would be pure disk traffic on the input path.
         let mut written = String::new();
-        // Resolved once: the process keeps the directory it started in, and
-        // re-deriving it per write would let a mid-session environment change
-        // split the file in two.
-        let path = state_path();
 
         // Write the initial "starting" state before any command arrives so the
         // tray sees a non-stale file the moment makima boots.
@@ -123,7 +132,7 @@ pub fn spawn_state_writer() -> StateWriterHandle {
             flush(&lifecycle, &errors, &event_state, &configs, &roots, &path, &mut written);
         }
     });
-    tx
+    (tx, task)
 }
 
 fn apply(

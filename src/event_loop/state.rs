@@ -127,12 +127,7 @@ impl EventReader {
                 return;
             }
         };
-        let base_name = self.base_name.clone();
-        let config_stack = if config.name == base_name {
-            vec![base_name]
-        } else {
-            vec![base_name, config.name.clone()]
-        };
+        let config_stack = crate::state_export::config_stack(&self.base_name, &config.name);
         let lpad_pos =                     *self.lpad.position.lock().await;
         let lpad_pressed = *self.lpad.pressed.lock().await;
         let rpad_pos =                     *self.rpad.position.lock().await;
