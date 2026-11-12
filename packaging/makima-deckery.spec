@@ -1,6 +1,6 @@
 Name:           makima-deckery
 Version:        2.0.0~beta1
-Release:        7%{?dist}
+Release:        8%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
 License:        GPL-3.0-only
@@ -91,6 +91,13 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Thu Nov 12 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-8
+- Tests drive the real event loop (read loop, IPC loop, Gaming Mode setter)
+  instead of a hand-written copy of it; no behaviour change
+- IPC lines and the Deck's raw events are decoded by pure functions; the
+  device lifecycle, state writer, KDE input defaults, preferences and
+  window-class matching gain tests
+
 * Thu Nov 12 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-7
 - Fix: a pause releases keys bound to triggers, stick directions and hats,
   and passed-through keys, instead of leaving them held (#63)
