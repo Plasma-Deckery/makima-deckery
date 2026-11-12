@@ -79,23 +79,17 @@ impl EventReader {
                     {
                         pen_events.push(event)
                     }
-                    // Left trackpad physical click (BTN_THUMB) is read directly
-                    // from hidraw by trackpad_router instead — click lives in
-                    // the same hidraw byte as touch, so it arrives atomically
-                    // with position/touch. Swallow it here so it doesn't fall
-                    // through to emit_default_event and leak onto the generic
-                    // key device.
-                    Key::BTN_THUMB if self.trackpad.left.has_handler() => {}
-                    // Right trackpad physical click (BTN_THUMB2) — same as above.
-                    Key::BTN_THUMB2 if self.trackpad.right.has_handler() => {}
-                    _ => {
-                        self.convert_event(
-                            event,
-                            Event::Key(Key(event.code())),
-                            event.value(),
-                            false,
-                        )
-                        .await
+                    // Everything the Deck sends lands here. Whether a key is
+                    // passed on — a trackpad's own click is swallowed, because
+                    // trackpad_router reads it from hidraw — is decided in
+                    // `decode::key_event`.
+                    key => {
+                        let decoded = crate::decode::key_event(
+                            key, self.trackpad.left.has_handler(), self.trackpad.right.has_handler(),
+                        );
+                        if let Some(logical) = decoded {
+                            self.convert_event(event, logical, event.value(), false).await
+                        }
                     }
                 },
                 (
@@ -142,93 +136,20 @@ impl EventReader {
                     }
                 }
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
-                (_, _, AbsoluteAxisType::ABS_HAT0X, _) => {
+                (_, _, AbsoluteAxisType::ABS_HAT0X | AbsoluteAxisType::ABS_HAT0Y, _) => {
                     // Trackpad position/touch now comes from hidraw (trackpad_router)
                     // whenever a handler owns the pad (mt-trackpad, trackball).
                     // This handler only remains for the D-pad hat-switch case on
-                    // non-Steam-Deck controllers.
+                    // non-Steam-Deck controllers — but on a Deck whose left pad has
+                    // no handler it is fed that pad's coordinates;
+                    // `decode::decode_hat` says what that means.
                     if !self.trackpad.left.has_handler() {
-                        match event.value() {
-                            -1 => {
-                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_LEFT), 1, false)
-                                    .await;
-                                dpad_values.0 = -1;
-                            }
-                            1 => {
-                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_RIGHT), 1, false)
-                                    .await;
-                                dpad_values.0 = 1;
-                            }
-                            0 => {
-                                match dpad_values.0 {
-                                    -1 => {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::BTN_DPAD_LEFT),
-                                            0,
-                                            false,
-                                        )
-                                        .await
-                                    }
-                                    1 => {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::BTN_DPAD_RIGHT),
-                                            0,
-                                            false,
-                                        )
-                                        .await
-                                    }
-                                    _ => {}
-                                }
-                                dpad_values.0 = 0;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                (_, _, AbsoluteAxisType::ABS_HAT0Y, _) => {
-                    // Trackpad position/touch now comes from hidraw (trackpad_router)
-                    // whenever a handler owns the pad (mt-trackpad, trackball).
-                    // This handler only remains for the D-pad hat-switch case on
-                    // non-Steam-Deck controllers.
-                    if !self.trackpad.left.has_handler() {
-                        match event.value() {
-                            -1 => {
-                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_UP), 1, false)
-                                    .await;
-                                dpad_values.1 = -1;
-                            }
-                            1 => {
-                                self.convert_event(event, Event::Axis(Axis::BTN_DPAD_DOWN), 1, false)
-                                    .await;
-                                dpad_values.1 = 1;
-                            }
-                            0 => {
-                                match dpad_values.1 {
-                                    -1 => {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::BTN_DPAD_UP),
-                                            0,
-                                            false,
-                                        )
-                                        .await
-                                    }
-                                    1 => {
-                                        self.convert_event(
-                                            event,
-                                            Event::Axis(Axis::BTN_DPAD_DOWN),
-                                            0,
-                                            false,
-                                        )
-                                        .await
-                                    }
-                                    _ => {}
-                                }
-                                dpad_values.1 = 0;
-                            }
-                            _ => {}
+                        let is_x = event.code() == AbsoluteAxisType::ABS_HAT0X.0;
+                        let held = if is_x { dpad_values.0 } else { dpad_values.1 };
+                        let (events, next) = crate::decode::decode_hat(is_x, event.value(), held);
+                        if is_x { dpad_values.0 = next } else { dpad_values.1 = next }
+                        for (axis, v) in events {
+                            self.convert_event(event, Event::Axis(axis), v, false).await;
                         }
                     }
                 }
@@ -260,15 +181,15 @@ impl EventReader {
                     // variants they named, and whether a guard sat in the
                     // pattern or inside the arm — copy-paste twins with no
                     // behavioural difference between them.
-                    let (stick, settings, position, raw_cell, values) =
-                        if event.code() < 3 {
-                            (crate::machine::Stick::Left, &self.settings.lstick,
-                             &self.lstick_position, &self.lstick_raw, &mut lstick_values)
+                    let (stick, is_x) = crate::decode::stick_for_code(event.code());
+                    let (settings, position, raw_cell, values) =
+                        if stick == crate::machine::Stick::Left {
+                            (&self.settings.lstick, &self.lstick_position,
+                             &self.lstick_raw, &mut lstick_values)
                         } else {
-                            (crate::machine::Stick::Right, &self.settings.rstick,
-                             &self.rstick_position, &self.rstick_raw, &mut rstick_values)
+                            (&self.settings.rstick, &self.rstick_position,
+                             &self.rstick_raw, &mut rstick_values)
                         };
-                    let is_x = event.code() == stick.base_code();
 
                     // The raw value is recorded whatever the stick is for, so the
                     // overlay can draw it even when nothing is bound.
@@ -283,24 +204,20 @@ impl EventReader {
                         }
                     }
 
-                    let value = crate::machine::axis_value(
-                        event.value() as i32, settings.deadzone, self.settings.axis_16_bit,
-                    );
-                    match settings.function.as_str() {
-                        "cursor" | "scroll" => {
-                            position.lock().await[(event.code() - stick.base_code()) as usize]
-                                = value;
+                    match crate::decode::stick_update(
+                        &settings.function, stick, is_x, event.value() as i32,
+                        settings.deadzone, self.settings.axis_16_bit, *values,
+                    ) {
+                        crate::decode::StickUpdate::Position { index, value } => {
+                            position.lock().await[index] = value;
                         }
-                        "bind" => {
-                            let clamped = value.signum();
-                            let (events, next) =
-                                crate::machine::decode_stick_bind(stick, is_x, clamped, *values);
-                            *values = next;
+                        crate::decode::StickUpdate::Bind { events, held } => {
+                            *values = held;
                             for (axis, v) in events {
                                 self.convert_event(event, Event::Axis(axis), v, false).await;
                             }
                         }
-                        _ => {}
+                        crate::decode::StickUpdate::Ignore => {}
                     }
                 }
 
@@ -386,7 +303,9 @@ impl EventReader {
                     if lstick_dirty { lstick_dirty = false; }
                     if rstick_dirty { rstick_dirty = false; }
                     if imu_dirty { imu_dirty = false; }
-                    if stick_changed && last_stick_state_write.elapsed().as_millis() >= 16 {
+                    if crate::decode::analog_write_due(
+                        stick_changed, last_stick_state_write.elapsed(),
+                    ) {
                         last_stick_state_write = std::time::Instant::now();
                         self.write_state_analog().await;
                     }

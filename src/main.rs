@@ -3,6 +3,7 @@ mod analog;
 mod auto_mute;
 mod config;
 mod config_registry;
+mod decode;
 mod device_session;
 mod device_tasks;
 mod game_focus;
