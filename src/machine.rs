@@ -64,10 +64,17 @@ pub fn key_up(key: Key) -> OutputAction {
 
 /// Every output key that the currently held modifier set resolves to.
 ///
+/// With no modifier held there is no combo to clean up, so the set is empty.
+/// Looking up the empty set would instead return the base output of *every*
+/// binding — releasing, say, the BTN_LEFT of a held R2 drag.
+///
 /// Reads nothing but the config, so it was already pure — it just happened to be
 /// an `async fn` on `&self`.
 pub fn released_keys(modifiers: &[Event], config: &Config) -> Vec<Key> {
     let mut out: Vec<Key> = Vec::new();
+    if modifiers.is_empty() {
+        return out;
+    }
     for hashmap in config.bindings.remap.values() {
         if let Some(event_list) = hashmap.get(modifiers) {
             out.extend(event_list);

@@ -335,3 +335,15 @@ fn released_keys_resolves_the_held_set() {
     assert_eq!(released_keys(&[ev(Key::BTN_TL)], &config), vec![Key::KEY_ENTER]);
     assert!(released_keys(&[ev(Key::BTN_TR)], &config).is_empty());
 }
+
+/// With no modifier held there is nothing to release — not the base output of
+/// every binding, which would end a held drag.
+#[test]
+fn released_keys_of_no_modifiers_is_empty() {
+    let config = make_config(
+        vec![(ev(Key::BTN_TR2), vec![], vec![Key::BTN_LEFT])],
+        vec![ev(Key::BTN_TL)],
+    );
+
+    assert!(released_keys(&[], &config).is_empty());
+}

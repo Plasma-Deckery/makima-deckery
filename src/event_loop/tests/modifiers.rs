@@ -136,15 +136,13 @@ async fn an_unused_steam_press_taps() {
 }
 
 /// Holding R2 is a held left mouse button — a drag. Pressing Steam, which is a
-/// layer key with no base binding of its own, should not end that drag.
+/// layer key with no base binding of its own, must not end that drag.
 ///
-/// It does: Steam resolves to nothing and takes `plan_nonmapped`, which
-/// releases `released_keys(modifiers)` for every modifier press. With nothing
-/// else held that set is the base output of *every* binding, BTN_LEFT among
-/// them. `plan_emit` guards the same release with `!modifiers.is_empty()`;
-/// `plan_nonmapped` has no such guard.
+/// Steam resolves to nothing and takes `plan_nonmapped`, which releases
+/// `released_keys(modifiers)` for every modifier press. With nothing else held
+/// that lookup once returned the base output of *every* binding, BTN_LEFT
+/// among them; an empty modifier set now releases nothing.
 #[tokio::test]
-#[ignore = "bug: a layer key with no base binding releases every base output, ending an R2 drag"]
 async fn pressing_steam_does_not_end_an_r2_drag() {
     let mut deck = Deck::new("steam-drag");
     let r2 = deck.press(Key::BTN_TR2).await;
