@@ -369,21 +369,50 @@ impl EventReader {
         }
     }
 
+    /// What the IPC `pause` does to the input path: release every output key
+    /// makima holds down, and keep what the user is still holding.
+    ///
+    /// The decision is `machine::plan_pause`, see there for why `modifiers` and
+    /// `held_keys` survive (issue #62). Only `emitted_outputs` is emptied, and
+    /// `modifier_was_activated` is set when a custom modifier is held across.
+    async fn pause_release_outputs(&self) {
+        // One lock at a time, so this never holds two of them in an order
+        // another task might take them in. The frames go out after every lock
+        // is dropped, so the device port is held for them alone.
+        let config = self.current_config.lock().await.clone();
+        let modifiers = self.modifiers.lock().await.clone();
+        let emitted = std::mem::take(&mut *self.emitted_outputs.lock().await);
+        let plan = {
+            let mut activated = self.modifier_was_activated.lock().await;
+            let plan = crate::machine::plan_pause(
+                &emitted, &modifiers, &config.mapped_modifiers.custom, *activated,
+            );
+            *activated = plan.modifier_was_activated;
+            plan
+        };
+        self.apply_frames(&plan.frames).await;
+    }
+
     /// Release all currently held output keys and clear modifier/held-key state.
     ///
-    /// Called on `ControllerEvent::Reconnected` after a suspend/resume cycle.
+    /// The full reset, for when edges really were lost: `ControllerEvent::Reconnected`
+    /// after a suspend/resume cycle, and `ReleaseAll`. Nothing sends either
+    /// variant today; the IPC `pause` used to call this too, and that is what
+    /// issue #62 was — a pause loses no edges, so it uses `pause_release_outputs`
+    /// and keeps the input state. Here clearing is right: after a reconnect the
+    /// held state cannot be trusted, and the next edges rebuild it.
+    ///
     /// Emits key-up events for all keys tracked in `emitted_outputs` (the
     /// actual output keys that got stuck) and clears `modifiers` and `held_keys`
     /// so combo and HUD state don't carry stale data across the reconnect.
     async fn release_all_held(&self) {
         // Collected before anything is sent, so the device port is held for the
         // frames alone rather than across the three locks below.
-        let frames: Vec<crate::output::action::OutputAction> = {
+        let frames = {
             let mut eo = self.emitted_outputs.lock().await;
-            eo.drain()
-                .flat_map(|(_input_ev, output_keys)| output_keys)
-                .map(|key| crate::machine::key_up(key))
-                .collect()
+            let frames = crate::machine::release_emitted(&eo);
+            eo.clear();
+            frames
         };
         self.apply_frames(&frames).await;
         // Release modifier output keys (e.g. Shift held via L4).

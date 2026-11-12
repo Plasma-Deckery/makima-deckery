@@ -304,6 +304,84 @@ pub fn gaming_mode_toggle(enabled: bool, preview: bool) -> Vec<OutputAction> {
     ]
 }
 
+/// What a pause amounts to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PausePlan {
+    /// One key-up for every output key a held button is down on. The caller
+    /// empties `emitted_outputs` along with sending them: nothing makima emitted
+    /// is down any more, so nothing is left to release when the button comes up.
+    pub frames: Vec<OutputAction>,
+    /// `modifier_was_activated` after the pause.
+    pub modifier_was_activated: bool,
+}
+
+/// Key-ups for everything in `emitted_outputs`.
+///
+/// Shared by a pause and by a full reset: both have to leave nothing stuck in
+/// whatever reads the virtual devices next. The order is the map's, which is
+/// arbitrary — every frame is a release, so no order means anything here.
+pub fn release_emitted(emitted_outputs: &std::collections::HashMap<Event, Vec<Key>>) -> Vec<OutputAction> {
+    emitted_outputs.values().flatten().map(|key| key_up(*key)).collect()
+}
+
+/// Decide what the IPC `pause` does (issue #62).
+///
+/// Pause releases outputs, not inputs. Every virtual key makima holds down goes
+/// up, so nothing stays stuck in another application — or while
+/// deckery-auth-daemon owns the controller. What the user is physically holding
+/// stays known: `modifiers` and `held_keys` are not touched, because input is
+/// edge-only and a button that is still down will never say so again. The edges
+/// that arrive during the pause keep both sets current, which is what already
+/// made a press *during* the pause work.
+///
+/// Resume needs no plan of its own: it re-presses nothing and emits nothing, so
+/// a button held across the pause stays released on the output side until it is
+/// pressed again, and a held layer key simply carries on resolving its layer.
+///
+/// A custom modifier held across the pause counts as used. Whatever the user did
+/// with it while the HUD was open happened where makima sends nothing, so the
+/// usual "a combo fired" signal never came — and releasing it after the pause
+/// must not turn into the unused-modifier tap (QAM or Steam opening Steam's
+/// menus, for instance).
+pub fn plan_pause(
+    emitted_outputs: &std::collections::HashMap<Event, Vec<Key>>,
+    modifiers: &[Event],
+    custom_modifiers: &[Event],
+    modifier_was_activated: bool,
+) -> PausePlan {
+    let holds_custom = modifiers.iter().any(|m| custom_modifiers.contains(m));
+    PausePlan {
+        frames: release_emitted(emitted_outputs),
+        modifier_was_activated: modifier_was_activated || holds_custom,
+    }
+}
+
+/// Whether a pause swallows an event that has no binding of its own, and if so,
+/// whether it is still tracked as a modifier.
+///
+/// `None`: not swallowed, the event is passed through as usual. `Some(true)`:
+/// swallowed, but the modifier set still follows it, so the HUD can show the
+/// layer and a combo pressed after the pause resolves through it. `Some(false)`:
+/// swallowed, and only the state is rewritten so the overlay sees the button.
+///
+/// A `no_pause` binding for the exact combo or for the bare button exempts it.
+pub fn paused_nonmapped(
+    config: &Config,
+    event: Event,
+    modifiers: &[Event],
+    paused: bool,
+) -> Option<bool> {
+    if !paused {
+        return None;
+    }
+    let is_no_pause = config.bindings.no_pause.contains(&(event, modifiers.to_vec()))
+        || config.bindings.no_pause.contains(&(event, vec![]));
+    if is_no_pause {
+        return None;
+    }
+    Some(config.mapped_modifiers.all.contains(&event))
+}
+
 /// How `held_keys` changes for one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeldUpdate {

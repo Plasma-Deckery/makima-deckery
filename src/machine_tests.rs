@@ -1003,3 +1003,420 @@ fn pause_silences_it_unless_the_binding_fires_anyway() {
 fn no_haptic_plays_nothing() {
     assert_eq!(binding_haptic(None, 1, false, false), None);
 }
+
+// ── pause keeps what is held (issue #62) ──────────────────────────────────
+//
+// These run whole sequences — press, pause, resume, combo, release — because
+// the bug was in how the decisions add up, not in any one of them. `Reader`
+// below is the reader's state plus `convert_event`'s applying of the pure
+// decisions for key events, in the reader's order: `held_update`, the release
+// of `emitted_outputs`, `plan_route`, the intercept, `resolve_binding`,
+// `plan_emit`, and for an unbound event `paused_nonmapped` then
+// `plan_nonmapped`. Pause is `plan_pause` as `pause_release_outputs` applies it;
+// resume is what the IPC handler does — flip the flag, nothing else.
+
+const L1: Key = Key::BTN_TL;
+const STEAM: Key = Key::BTN_MODE;
+const X: Key = Key::BTN_NORTH;
+const L4: Key = Key::BTN_TRIGGER_HAPPY1;
+const L2: Key = Key::BTN_TL2;
+
+/// The shape of the shipped base config, reduced to what these tests need: L1
+/// is a layer key (`L1 = []` plus `L1-X`), Steam a modifier with no binding of
+/// its own (`STEAM-X`), L4 a remap to Shift, L2 the right mouse button with
+/// `no_pause`.
+fn layered_config() -> Config {
+    let mut config = make_config(
+        vec![
+            (ev(L1), vec![], vec![]),
+            (ev(X), vec![], vec![Key::KEY_X]),
+            (ev(X), vec![ev(L1)], vec![Key::KEY_LEFTCTRL, Key::KEY_C]),
+            (ev(X), vec![ev(STEAM)], vec![Key::KEY_F5]),
+            (ev(L4), vec![], vec![Key::KEY_LEFTSHIFT]),
+            (ev(L2), vec![], vec![Key::BTN_RIGHT]),
+        ],
+        vec![ev(L1), ev(STEAM)],
+    );
+    config.bindings.no_pause.insert((ev(L2), vec![]));
+    config
+}
+
+struct Reader {
+    config: Config,
+    modifiers: Vec<Event>,
+    held_keys: Vec<Event>,
+    emitted: HashMap<Event, Vec<Key>>,
+    modifier_was_activated: bool,
+    paused: bool,
+    /// Every key frame sent, as (code, value), until `take` empties it.
+    sent: Vec<(u16, i32)>,
+}
+
+impl Reader {
+    fn new(config: Config) -> Self {
+        Reader {
+            config,
+            modifiers: vec![],
+            held_keys: vec![],
+            emitted: HashMap::new(),
+            modifier_was_activated: true,
+            paused: false,
+            sent: vec![],
+        }
+    }
+
+    fn send(&mut self, actions: &[OutputAction]) {
+        for action in actions {
+            match action {
+                OutputAction::Frame { events, .. } => {
+                    self.sent.extend(events.iter().map(|e| (e.code, e.value)))
+                }
+                OutputAction::Forward { events, .. } => {
+                    self.sent.extend(events.iter().map(|e| (e.0.code(), e.0.value())))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn take(&mut self) -> Vec<(u16, i32)> {
+        std::mem::take(&mut self.sent)
+    }
+
+    /// `toggle_modifiers`.
+    fn toggle(&mut self, modifier: Event, value: i32) {
+        if self.config.mapped_modifiers.all.contains(&modifier) {
+            match value {
+                1 => {
+                    self.modifiers.push(modifier);
+                    self.modifiers.sort();
+                    self.modifiers.dedup();
+                }
+                0 => self.modifiers.retain(|&m| m != modifier),
+                _ => {}
+            }
+        }
+    }
+
+    fn key(&mut self, key: Key, value: i32) {
+        let event = ev(key);
+        match held_update(event, value, false) {
+            HeldUpdate::Add => {
+                self.held_keys.push(event);
+                self.held_keys.sort();
+                self.held_keys.dedup();
+            }
+            HeldUpdate::Remove => self.held_keys.retain(|&k| k != event),
+            HeldUpdate::Leave => {}
+        }
+        if releases_emitted(event, value) {
+            if let Some(prev) = self.emitted.remove(&event) {
+                let frames: Vec<_> = prev.iter().map(|k| key_up(*k)).collect();
+                self.send(&frames);
+            }
+        }
+
+        let config = self.config.clone();
+        let mut modifiers = self.modifiers.clone();
+        modifiers.sort();
+        modifiers.dedup();
+        let route = plan_route(&Input {
+            event, value, config: &config, modifiers: &modifiers,
+            gaming_mode: false, paused: self.paused,
+            trigger: None, trigger_ts: None, now: Instant::now(),
+        });
+        match route.branch {
+            Branch::ModifierIntercept { out_keys, emit, .. } => {
+                if emit {
+                    let frames: Vec<_> = out_keys.iter().map(|k| key_at(*k, value)).collect();
+                    self.send(&frames);
+                    if value == 1 {
+                        self.emitted.insert(event, out_keys.clone());
+                    }
+                }
+                self.toggle(event, value);
+                return;
+            }
+            Branch::Resolve => {}
+            other => panic!("not modelled here: {other:?}"),
+        }
+
+        match crate::resolver::resolve_binding(&config.bindings, event, &modifiers, false) {
+            crate::resolver::ResolvedBinding::Keys { keys, no_pause, is_combo, is_fallback, .. } => {
+                let plan = plan_emit(&EmitRequest {
+                    config: &config,
+                    event_list: &keys,
+                    value,
+                    modifiers: &modifiers,
+                    release_keys: !is_combo && !is_fallback,
+                    ignore_modifiers: is_combo,
+                    modifier_was_activated: self.modifier_was_activated,
+                    paused: self.paused,
+                    no_pause,
+                });
+                self.modifier_was_activated = plan.modifier_was_activated;
+                self.send(&plan.frames);
+                for (m, v) in plan.toggles {
+                    self.toggle(m, v);
+                }
+                // As the reader does it: after every emit, the release too.
+                self.emitted.insert(event, keys);
+            }
+            crate::resolver::ResolvedBinding::Unbound => {
+                let live = self.modifiers.clone();
+                match paused_nonmapped(&config, event, &live, self.paused) {
+                    Some(true) => {
+                        self.toggle(event, value);
+                        return;
+                    }
+                    Some(false) => return,
+                    None => {}
+                }
+                let default_event = raw(EventType::KEY, key.code(), value);
+                let plan = plan_nonmapped(
+                    &config, event, &default_event, value, &modifiers,
+                    self.modifier_was_activated,
+                );
+                self.modifier_was_activated = plan.modifier_was_activated;
+                self.send(&plan.frames);
+                for (m, v) in plan.toggles {
+                    self.toggle(m, v);
+                }
+            }
+            other => panic!("not modelled here: {other:?}"),
+        }
+    }
+
+    fn press(&mut self, key: Key) {
+        self.key(key, 1);
+    }
+
+    fn release(&mut self, key: Key) {
+        self.key(key, 0);
+    }
+
+    /// The IPC `pause`.
+    fn pause(&mut self) {
+        self.paused = true;
+        let plan = plan_pause(
+            &self.emitted, &self.modifiers,
+            &self.config.mapped_modifiers.custom, self.modifier_was_activated,
+        );
+        self.emitted.clear();
+        self.modifier_was_activated = plan.modifier_was_activated;
+        self.send(&plan.frames);
+    }
+
+    /// The IPC `resume`: the flag, and nothing else.
+    fn resume(&mut self) {
+        self.paused = false;
+    }
+}
+
+/// The codes pressed among `sent`. A tap is a press, so is a re-pressed output,
+/// and neither may happen after a pause; the releases around them are not the
+/// question, because a modifier's press and release send key-ups for whatever
+/// the held set resolves to (`plan_nonmapped`), pause or no pause.
+fn presses(sent: &[(u16, i32)]) -> Vec<u16> {
+    sent.iter().filter(|&&(_, v)| v != 0).map(|&(c, _)| c).collect()
+}
+
+/// The reported bug: L1 held while the HUD opens is still L1 while it is open,
+/// and after it closes L1 + X is the L1 layer's combo, not plain X. Nothing is
+/// sent at resume, and letting go of L1 afterwards sends nothing either.
+#[test]
+fn a_layer_key_held_across_a_pause_keeps_its_layer() {
+    let mut r = Reader::new(layered_config());
+    r.press(L1);
+    assert_eq!(r.take(), vec![], "L1 = [] sends nothing");
+
+    r.pause();
+    assert_eq!(r.modifiers, vec![ev(L1)], "the pause forgot L1");
+    assert_eq!(r.held_keys, vec![ev(L1)], "the HUD would show L1 as released");
+    assert!(r.emitted.is_empty(), "pause leaves nothing recorded as emitted");
+
+    r.resume();
+    assert_eq!(r.take(), vec![], "resume sent something");
+
+    r.press(X);
+    assert_eq!(
+        r.take(),
+        vec![(Key::KEY_LEFTCTRL.code(), 1), (Key::KEY_C.code(), 1)],
+        "L1 + X after the pause has to be the L1 layer's combo",
+    );
+    r.release(X);
+    r.take();
+
+    r.release(L1);
+    assert_eq!(r.take(), vec![], "releasing L1 after the pause sent something");
+    assert!(r.modifiers.is_empty());
+    assert!(r.held_keys.is_empty());
+}
+
+/// The control case from the report, which already worked and must keep
+/// working: L1 pressed *during* the pause is tracked, and resolves its layer
+/// after it.
+#[test]
+fn a_layer_key_pressed_during_a_pause_still_works() {
+    let mut r = Reader::new(layered_config());
+    r.pause();
+    r.press(L1);
+    assert_eq!(r.modifiers, vec![ev(L1)]);
+    assert_eq!(r.held_keys, vec![ev(L1)]);
+    r.resume();
+    assert_eq!(r.take(), vec![]);
+
+    r.press(X);
+    assert_eq!(
+        r.take(),
+        vec![(Key::KEY_LEFTCTRL.code(), 1), (Key::KEY_C.code(), 1)],
+    );
+}
+
+/// The baseline the next test is measured against: Steam held and released on
+/// its own, with no pause, is a tap — the press and release of its own code.
+#[test]
+fn an_unused_steam_press_taps() {
+    let mut r = Reader::new(layered_config());
+    r.press(STEAM);
+    r.release(STEAM);
+    let sent = r.take();
+    assert_eq!(presses(&sent), vec![STEAM.code()], "{sent:?}");
+    assert!(sent.ends_with(&[(STEAM.code(), 1), (STEAM.code(), 0)]), "{sent:?}");
+}
+
+/// Steam held across the pause and used in the HUD: the combo sends nothing
+/// while paused, so nothing marked Steam as used — the pause does. Releasing it
+/// after the HUD closes is not a tap.
+#[test]
+fn a_modifier_held_across_a_pause_does_not_tap_on_release() {
+    let mut r = Reader::new(layered_config());
+    r.press(STEAM);
+    assert!(!r.modifier_was_activated, "precondition: Steam is armed");
+
+    r.pause();
+    assert!(r.modifier_was_activated, "the pause has to count Steam as used");
+    r.press(X);
+    r.release(X);
+    assert_eq!(presses(&r.take()), Vec::<u16>::new(), "a combo fired while paused");
+    r.resume();
+
+    r.release(STEAM);
+    assert_eq!(presses(&r.take()), Vec::<u16>::new(), "Steam tapped after the pause");
+    assert!(r.modifiers.is_empty());
+}
+
+/// The same with nothing pressed in between: holding Steam while the HUD is
+/// open and letting go afterwards is not a tap either.
+#[test]
+fn a_modifier_only_held_across_a_pause_does_not_tap() {
+    let mut r = Reader::new(layered_config());
+    r.press(STEAM);
+    r.pause();
+    r.resume();
+    r.release(STEAM);
+    assert_eq!(presses(&r.take()), Vec::<u16>::new(), "Steam tapped after the pause");
+}
+
+/// A pause with no custom modifier held leaves the flag as it was: it says
+/// something about a held modifier, and there is none.
+#[test]
+fn a_pause_without_a_held_modifier_leaves_the_flag_alone() {
+    let config = layered_config();
+    let plan = plan_pause(&HashMap::new(), &[], &config.mapped_modifiers.custom, false);
+    assert!(!plan.modifier_was_activated);
+    assert!(plan.frames.is_empty());
+}
+
+/// L4 → Shift held across the pause: Shift goes up at the pause and stays up —
+/// resume does not press it again. Letting go of L4 afterwards sends only a
+/// release, and only one: `emitted_outputs` no longer holds L4, so the reader's
+/// cleanup sends nothing and only the binding's own release goes out (which is
+/// for a key already up). An ordinary release sends that one plus the
+/// cleanup's.
+#[test]
+fn a_remapped_key_held_across_a_pause_stays_released() {
+    let shift = Key::KEY_LEFTSHIFT.code();
+    let mut r = Reader::new(layered_config());
+    r.press(L4);
+    assert_eq!(r.take(), vec![(shift, 1)]);
+
+    r.pause();
+    assert_eq!(r.take(), vec![(shift, 0)], "the pause has to release Shift");
+    assert_eq!(r.held_keys, vec![ev(L4)], "L4 is still held");
+
+    r.resume();
+    assert_eq!(r.take(), vec![], "resume pressed Shift again");
+
+    r.release(L4);
+    let sent = r.take();
+    assert!(sent.iter().all(|&(_, v)| v == 0), "a release pressed something: {sent:?}");
+    assert_eq!(sent, vec![(shift, 0)], "the cleanup released Shift a second time");
+    assert!(r.held_keys.is_empty());
+
+    // For comparison, the same release with no pause in between.
+    let mut plain = Reader::new(layered_config());
+    plain.press(L4);
+    plain.take();
+    plain.release(L4);
+    assert_eq!(plain.take(), vec![(shift, 0), (shift, 0)]);
+}
+
+/// Everything makima emitted goes up at the pause, whichever button emitted it
+/// and whether or not its binding is `no_pause` — a drag on L2 is dropped
+/// rather than left holding the right mouse button in another window.
+#[test]
+fn a_pause_still_releases_everything_emitted() {
+    let mut r = Reader::new(layered_config());
+    r.press(L4);
+    r.press(L2);
+    r.press(L1);
+    r.take();
+
+    r.pause();
+    let mut sent = r.take();
+    sent.sort();
+    let mut expected = vec![(Key::KEY_LEFTSHIFT.code(), 0), (Key::BTN_RIGHT.code(), 0)];
+    expected.sort();
+    assert_eq!(sent, expected);
+    assert!(r.emitted.is_empty());
+    assert_eq!(r.modifiers, vec![ev(L1)]);
+}
+
+/// `release_emitted` on its own: one key-up per recorded output key.
+#[test]
+fn release_emitted_releases_every_recorded_key() {
+    let mut emitted = HashMap::new();
+    emitted.insert(ev(Key::BTN_SOUTH), vec![Key::KEY_LEFTCTRL, Key::KEY_C]);
+    emitted.insert(ev(Key::BTN_EAST), vec![Key::KEY_A]);
+    let mut codes: Vec<_> = release_emitted(&emitted)
+        .iter()
+        .map(|a| match a {
+            OutputAction::Frame { events, .. } => (events[0].code, events[0].value),
+            other => panic!("not a frame: {other:?}"),
+        })
+        .collect();
+    codes.sort();
+    let mut expected = vec![
+        (Key::KEY_LEFTCTRL.code(), 0), (Key::KEY_C.code(), 0), (Key::KEY_A.code(), 0),
+    ];
+    expected.sort();
+    assert_eq!(codes, expected);
+}
+
+/// The paused branch for unbound events, now decided in the machine: a
+/// modifier is tracked, anything else only shown, and `no_pause` exempts it —
+/// for the exact combo or the bare button.
+#[test]
+fn paused_nonmapped_tracks_modifiers_and_honours_no_pause() {
+    let mut config = layered_config();
+    assert_eq!(paused_nonmapped(&config, ev(STEAM), &[], false), None, "not paused");
+    assert_eq!(paused_nonmapped(&config, ev(STEAM), &[], true), Some(true));
+    assert_eq!(paused_nonmapped(&config, ev(Key::BTN_SOUTH), &[], true), Some(false));
+
+    config.bindings.no_pause.insert((ev(Key::BTN_SOUTH), vec![ev(L1)]));
+    assert_eq!(paused_nonmapped(&config, ev(Key::BTN_SOUTH), &[ev(L1)], true), None);
+    assert_eq!(paused_nonmapped(&config, ev(Key::BTN_SOUTH), &[], true), Some(false));
+    config.bindings.no_pause.insert((ev(Key::BTN_SOUTH), vec![]));
+    assert_eq!(paused_nonmapped(&config, ev(Key::BTN_SOUTH), &[ev(L4)], true), None);
+}
