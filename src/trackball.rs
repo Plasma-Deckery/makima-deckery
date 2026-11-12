@@ -54,8 +54,11 @@
 //!   - `on_roll`: one pulse per `pixel_interval` raw units the ball rolls, so
 //!     the tick rate follows the speed. At most one per step, which caps it at
 //!     the roll tick rate. On by default; `on_roll = false` silences it.
-//!   - `on_movement`: the same distance gate while the finger drags. Off by
-//!     default, as in `mt-trackpad`.
+//!   - `on_movement`: while the finger drags, one pulse each time it crosses
+//!     into a new cell of a `grid` × `grid` raster over the pad. A finger
+//!     resting inside a cell never ticks, and a cell is only left once the
+//!     finger is [`GRID_HYSTERESIS`] of a cell past its edge, so one resting
+//!     on a boundary does not buzz either. Off by default, as in `mt-trackpad`.
 //!
 //! ## Being interrupted
 //!
@@ -79,8 +82,8 @@
 //! on_release = { duration_us = 8000, interval_us = 8000, count = 3, gain_db = 0 }
 //! # One tick per `pixel_interval` raw units rolled; `on_roll = false` to silence.
 //! on_roll    = { pixel_interval = 3000, duration_us = 4000, interval_us = 4000, count = 1, gain_db = 0 }
-//! # Ticks while the finger drags; off unless set.
-//! # on_movement = { pixel_interval = 3000, duration_us = 4000, interval_us = 4000, count = 1, gain_db = 0 }
+//! # Ticks while the finger drags into a new cell of a grid × grid raster; off unless set.
+//! # on_movement = { grid = 8, duration_us = 4000, interval_us = 4000, count = 1, gain_db = 0 }
 //! ```
 //!
 //! Every key is optional and parsed on its own: a bad value logs a warning and
@@ -129,9 +132,38 @@ fn default_roll_haptic() -> MovementHaptic {
     }
 }
 
+/// The finger-drag tick: one pulse per grid cell entered.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct GridHaptic {
+    /// Cells across the pad, per axis.
+    pub grid: u32,
+    #[serde(flatten)]
+    pub pulse: HapticPulse,
+}
+
+const DEFAULT_GRID: u32 = 8;
+
+/// How far past a cell's edge, in cells, the finger must be to leave it.
+pub const GRID_HYSTERESIS: f64 = 0.1;
+
+/// The pad's raw range per axis: the full i16.
+const PAD_MIN: f64 = i16::MIN as f64;
+const PAD_SPAN: f64 = 65_536.0;
+
 /// The finger-drag tick, when `on_movement = true` asks for it without a shape.
-fn default_movement_haptic() -> MovementHaptic {
-    default_roll_haptic()
+fn default_movement_haptic() -> GridHaptic {
+    GridHaptic { grid: DEFAULT_GRID, pulse: default_roll_haptic().pulse }
+}
+
+/// The cell `pos` is in along one axis, staying in `cell` until `pos` is
+/// [`GRID_HYSTERESIS`] past its edge. `i32::MIN` means no cell yet.
+fn grid_cell(cell: i32, pos: i32, grid: u32) -> i32 {
+    let at = (pos as f64 - PAD_MIN) * grid as f64 / PAD_SPAN;
+    if at < cell as f64 - GRID_HYSTERESIS || at >= (cell + 1) as f64 + GRID_HYSTERESIS {
+        at.floor() as i32
+    } else {
+        cell
+    }
 }
 
 /// This handler's own config, parsed from the raw `[trackpad.<side>]` table
@@ -150,7 +182,7 @@ pub struct TrackballConfig {
     pub stop_speed: f64,
     pub on_press: Option<HapticChain>,
     pub on_release: Option<HapticChain>,
-    pub on_movement: Option<MovementHaptic>,
+    pub on_movement: Option<GridHaptic>,
     pub on_roll: Option<MovementHaptic>,
 }
 
@@ -247,9 +279,7 @@ impl TrackballConfig {
                 }
                 c.on_press = parse_chain(h.get("on_press"), "on_press", &mut warnings);
                 c.on_release = parse_chain(h.get("on_release"), "on_release", &mut warnings);
-                c.on_movement = parse_distance_haptic(
-                    h.get("on_movement"), "on_movement", None, default_movement_haptic(), &mut warnings,
-                );
+                c.on_movement = parse_grid_haptic(h.get("on_movement"), &mut warnings);
                 c.on_roll = parse_distance_haptic(
                     h.get("on_roll"), "on_roll", Some(default_roll_haptic()), default_roll_haptic(),
                     &mut warnings,
@@ -327,6 +357,40 @@ fn parse_distance_haptic(
     }
 }
 
+/// The drag tick: absent, `false` or unusable is off, `true` the default, a
+/// table the default with its keys on top.
+fn parse_grid_haptic(v: Option<&toml::Value>, warnings: &mut Vec<String>) -> Option<GridHaptic> {
+    let d = default_movement_haptic();
+    let mut t = match v {
+        None | Some(toml::Value::Boolean(false)) => return None,
+        Some(toml::Value::Boolean(true)) => return Some(d),
+        Some(toml::Value::Table(t)) => t.clone(),
+        Some(other) => {
+            warnings.push(format!("haptic.on_movement must be a table or true/false, got {}; leaving it off", other.type_str()));
+            return None;
+        }
+    };
+    if t.remove("pixel_interval").is_some() {
+        warnings.push("haptic.on_movement.pixel_interval is ignored; drag ticks follow `grid` (cells across the pad)".into());
+    }
+    for (k, val) in [("grid", d.grid as i64), ("duration_us", d.pulse.duration_us as i64),
+                     ("interval_us", d.pulse.interval_us as i64), ("count", d.pulse.count as i64),
+                     ("gain_db", d.pulse.gain_db as i64)] {
+        t.entry(k).or_insert(val.into());
+    }
+    match toml::Value::Table(t).try_into::<GridHaptic>() {
+        Ok(m) if m.grid > 0 => Some(m),
+        Ok(m) => {
+            warnings.push(format!("haptic.on_movement.grid must be above 0; using {}", DEFAULT_GRID));
+            Some(GridHaptic { grid: DEFAULT_GRID, ..m })
+        }
+        Err(e) => {
+            warnings.push(format!("haptic.on_movement is not a valid tick ({}); leaving it off", e.to_string().trim()));
+            None
+        }
+    }
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /// One thing the handler reacts to.
@@ -353,8 +417,8 @@ pub struct Touch {
     clock: f64,
     /// The recent path, oldest first; only as much as the fling window needs.
     samples: VecDeque<Sample>,
-    /// Raw distance dragged since the last movement tick.
-    move_accum: f64,
+    /// The grid cell the finger is in, for the drag tick.
+    cell: (i32, i32),
 }
 
 impl Touch {
@@ -566,7 +630,9 @@ pub fn step(
             Phase::Touching(Touch {
                 clock: 0.0,
                 samples: VecDeque::from([Sample { t: 0.0, x: frame.x, y: frame.y }]),
-                move_accum: 0.0,
+                cell: cfg.on_movement.map_or((0, 0), |m| {
+                    (grid_cell(i32::MIN, frame.x, m.grid), grid_cell(i32::MIN, frame.y, m.grid))
+                }),
             })
         }
 
@@ -579,10 +645,10 @@ pub fn step(
             move_pointer(&mut s.remainder, raw_dx, raw_dy, cfg.sensitivity, &mut actions);
 
             if let Some(m) = cfg.on_movement {
-                touch.move_accum += raw_dx.hypot(raw_dy);
-                if touch.move_accum >= m.pixel_interval as f64 {
+                let cell = (grid_cell(touch.cell.0, frame.x, m.grid), grid_cell(touch.cell.1, frame.y, m.grid));
+                if cell != touch.cell {
                     actions.push(pulse(pad, m.pulse));
-                    touch.move_accum = 0.0;
+                    touch.cell = cell;
                 }
             }
 

@@ -505,17 +505,83 @@ fn silenced_roll_ticks_stay_silent() {
 }
 
 #[test]
-fn movement_ticks_are_off_by_default_and_distance_gated_when_on() {
+fn movement_ticks_are_off_by_default_and_grid_gated_when_on() {
     let off = TrackballConfig { on_press: None, on_release: None, ..Default::default() };
     let (_, a) = run(TrackballState::default(), &off, &drag(300_000.0, 20));
     assert_eq!(haptics(&a), 0);
 
     let on = TrackballConfig { on_movement: Some(default_movement_haptic()), ..off };
-    // 1200 units a frame against a 3000-unit gate: the gate is crossed on
-    // every third frame (3600), and the excess is dropped as in mt-trackpad,
-    // so 20 frames tick 6 times.
+    // 0 → 24 000 across 8192-unit cells, starting on a cell's lower edge:
+    // into the next cell past 8192 + 10 %, and the one after past 16 384.
     let (_, a) = run(TrackballState::default(), &on, &drag(300_000.0, 20));
-    assert_eq!(haptics(&a), 6);
+    assert_eq!(haptics(&a), 2);
+}
+
+/// Grid 8: cells are 8192 raw units, and x = 8192 is the edge between two.
+fn grid_on() -> TrackballConfig {
+    TrackballConfig { on_movement: Some(default_movement_haptic()), ..quiet() }
+}
+
+fn drag_through(points: &[(i32, i32)]) -> usize {
+    let inputs: Vec<_> = points.iter().map(|&(x, y)| (touch(x, y), ms(4))).collect();
+    haptics(&run(TrackballState::default(), &grid_on(), &inputs).1)
+}
+
+#[test]
+fn a_resting_finger_inside_a_cell_never_ticks() {
+    let jitter: Vec<_> = (0..200).map(|i| (4000 + (i % 7) * 300 - 900, 4000 - (i % 5) * 400)).collect();
+    assert_eq!(drag_through(&jitter), 0);
+}
+
+#[test]
+fn crossing_one_boundary_ticks_once() {
+    assert_eq!(drag_through(&[(4000, 4000), (6000, 4000), (9500, 4000), (12_000, 4000)]), 1);
+    assert_eq!(drag_through(&[(4000, 4000), (4000, -1000)]), 1, "vertical crossings count too");
+}
+
+#[test]
+fn jitter_on_a_boundary_ticks_at_most_once() {
+    let jitter: Vec<_> = (0..200).map(|i| (8192 + if i % 2 == 0 { -700 } else { 700 }, 4000)).collect();
+    assert!(drag_through(&jitter) <= 1);
+    // Started just below the edge, it stays put.
+    assert_eq!(drag_through(&jitter[1..]), 0);
+}
+
+#[test]
+fn crossing_several_cells_in_one_frame_ticks_once() {
+    assert_eq!(drag_through(&[(-30_000, 0), (30_000, 0)]), 1);
+}
+
+#[test]
+fn the_default_grid_is_8() {
+    assert_eq!(default_movement_haptic().grid, 8);
+    let (c, w) = parse("[haptic]\non_movement = { count = 2 }");
+    assert!(w.is_empty(), "{w:?}");
+    assert_eq!(c.on_movement.unwrap().grid, 8);
+    assert_eq!(c.on_movement.unwrap().pulse.duration_us, 4000);
+}
+
+#[test]
+fn bad_grids_warn_and_fall_back() {
+    let (c, w) = parse("[haptic]\non_movement = { grid = 0 }");
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert_eq!(c.on_movement.unwrap().grid, 8);
+
+    let (c, w) = parse("[haptic]\non_movement = { grid = -3 }");
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert_eq!(c.on_movement, None);
+
+    let (c, w) = parse("[haptic]\non_movement = { grid = \"big\" }");
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert_eq!(c.on_movement, None);
+}
+
+#[test]
+fn pixel_interval_on_movement_warns_and_is_ignored() {
+    let (c, w) = parse("[haptic]\non_movement = { pixel_interval = 3000, grid = 4 }");
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("grid"), "{w:?}");
+    assert_eq!(c.on_movement.unwrap().grid, 4);
 }
 
 // ── The handler loop ─────────────────────────────────────────────────────────
@@ -602,7 +668,7 @@ fn every_key_is_read() {
         [haptic]
         on_press = false
         on_release = [ { duration_us = 100, count = 1, pause_ms = 5 }, { duration_us = 200 } ]
-        on_movement = { pixel_interval = 1000 }
+        on_movement = { grid = 4 }
         on_roll = { pixel_interval = 5000, count = 2 }
     "#);
     assert!(w.is_empty(), "{w:?}");
@@ -612,7 +678,7 @@ fn every_key_is_read() {
     assert_eq!(c.stop_speed, 500.5);
     assert_eq!(c.on_press, None);
     assert!(matches!(c.on_release, Some(HapticChain::Chain(ref s)) if s.len() == 2));
-    assert_eq!(c.on_movement.unwrap().pixel_interval, 1000);
+    assert_eq!(c.on_movement.unwrap().grid, 4);
     let roll = c.on_roll.unwrap();
     assert_eq!(roll.pixel_interval, 5000);
     assert_eq!(roll.pulse.count, 2);
