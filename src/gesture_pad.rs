@@ -18,96 +18,112 @@
 //! This module owns that judgment call itself via `GesturePadConfig`,
 //! self-parsed from `[trackpad.gestures]` exactly like
 //! `mt_trackpad::MtTrackpadConfig` parses `[trackpad.left]`/`[trackpad.right]`.
-use crate::mt_trackpad::pulse;
-use deckery_controller::{HapticPad, HapticPulse};
+//!
+//! ## Config
+//!
+//! ```toml
+//! [trackpad.gestures]
+//! pixel_interval = 3000   # Raw units (both fingers summed) per on_gesture_move tick
+//!
+//! [trackpad.gestures.haptic]
+//! on_gesture_start = { duration_us = 8000, count = 1 }
+//! on_gesture_move  = { duration_us = 4000, interval_us = 4000, count = 1 }
+//! on_gesture_end   = [{ duration_us = 4000, count = 1, pause_ms = 40 }, { duration_us = 4000, count = 1 }]
+//! ```
+//!
+//! Each value takes the same form as a binding's `haptic =`, minus `pad`
+//! (always both): a single event or a list of steps. All three are off
+//! unless set; `true` switches one on with a default, `false` keeps it off.
+//! The distance gate is a key of the section, never of the haptic.
+use crate::config::{default_tick, parse_pad_haptic};
+use crate::mt_trackpad::{chain, parse_pixel_interval};
+use deckery_controller::{HapticChain, HapticPad};
 use crate::output::action::OutputAction;
 use crate::output::Outputs;
 use crate::trackpad::plan_gesture_frame;
 use crate::trackpad_router::{CombinedPadFrame, GestureEvent};
 use tokio::sync::mpsc;
 
-/// Raw-unit distance a finger must travel (summed across both pads, see
-/// `frame_distance`) since the last `on_gesture_move` pulse before another
-/// one fires — first live-tested naive time-based throttling (self-gap from
-/// the pulse's own duration) produced a continuous buzz during movement
-/// instead of discrete ticks, since frames arrive far faster than any
-/// reasonable pulse length. Distance-gating instead means faster movement
-/// ticks more often and slow movement ticks rarely, matching how a real
-/// click-wheel or Steam Input's own trackpad tick feedback behaves. Trackpad
-/// coordinates are raw firmware units in roughly ±32767 (see `analog.rs`'s
-/// `AXIS_SCALE`), so this default is a small fraction of the pad's full
-/// travel per tick.
-fn default_move_pixel_interval() -> u32 {
-    3000
-}
-
 /// Haptic policy for the gesture pad, keyed on gesture lifecycle rather than
 /// click (a click has no meaning mid-gesture — see the module doc above).
 /// Unlike `mt_trackpad`'s `on_press`/`on_release`, none of these three have
 /// an established "feel" to fall back to, so they're silent unless the user
-/// explicitly configures a pulse — see `GesturePadConfig::{start,move,end}_pulse`.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+/// explicitly configures one.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GestureHapticConfig {
-    /// Pulse fired when a gesture session begins (both pads become
+    /// Played when a gesture session begins (both pads become
     /// simultaneously touched).
-    pub on_gesture_start: Option<HapticPulse>,
-    /// Pulse policy for ongoing movement (e.g. per pinch or scroll step) —
-    /// see `GestureMoveHaptic`. `None` means silent, same as the other two.
+    pub on_gesture_start: Option<HapticChain>,
+    /// Played on ongoing movement — see `GestureMoveHaptic`.
     pub on_gesture_move: Option<GestureMoveHaptic>,
-    /// Pulse fired when a gesture session ends (either pad lifts).
-    pub on_gesture_end: Option<HapticPulse>,
+    /// Played when a gesture session ends (either pad lifts).
+    pub on_gesture_end: Option<HapticChain>,
 }
 
-/// `on_gesture_move`'s config shape: the pulse itself, plus the raw-unit
-/// distance threshold that gates it (see `default_move_pixel_interval`).
-/// Kept as its own struct (not a bare `HapticPulse`) because movement,
-/// unlike a click's press/release edges, has no natural single trigger
-/// instant — it needs its own firing policy alongside the pulse shape.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+/// `on_gesture_move` with its gate: the raw-unit distance a finger must travel
+/// (summed across both pads, see `frame_distance`) since the last tick before
+/// another one fires — the section's `pixel_interval`. Live-tested naive
+/// time-based throttling produced a continuous buzz during movement instead of
+/// discrete ticks, since frames arrive far faster than any reasonable pulse
+/// length. Distance-gating instead means faster movement ticks more often and
+/// slow movement ticks rarely, matching how a real click-wheel or Steam
+/// Input's own trackpad tick feedback behaves.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GestureMoveHaptic {
-    #[serde(default = "default_move_pixel_interval")]
     pub pixel_interval: u32,
-    #[serde(flatten)]
-    pub pulse: HapticPulse,
+    pub chain: HapticChain,
 }
 
-/// This handler's own config, self-deserialized from the raw
-/// `[trackpad.gestures]` TOML sub-table that Core (`config.rs`) hands it
-/// unparsed.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+/// This handler's own config, parsed from the raw `[trackpad.gestures]` TOML
+/// table that Core (`config.rs`) hands it unparsed.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GesturePadConfig {
-    #[serde(default)]
     pub haptic: GestureHapticConfig,
 }
 
+const HAPTIC_KEYS: &[&str] = &["on_gesture_start", "on_gesture_move", "on_gesture_end"];
+
 impl GesturePadConfig {
-    /// Parses `value` (the `[trackpad.gestures]` TOML table) into this
-    /// handler's config. Falls back to defaults (and logs a warning) on any
-    /// shape mismatch — a config typo here must never crash makima or block
-    /// gesture handling.
+    /// Parses `value` (the `[trackpad.gestures]` TOML table) and logs every
+    /// problem. Never fails — a config typo here must never crash makima or
+    /// block gesture handling.
     pub fn from_toml_value(value: &toml::Value) -> Self {
-        value.clone().try_into::<GesturePadConfig>().unwrap_or_else(|e| {
-            eprintln!("[makima] Warning: invalid gesture-pad handler config ({}), using defaults.", e);
-            GesturePadConfig::default()
-        })
+        let (config, warnings) = Self::parse(value);
+        for w in warnings {
+            eprintln!("[makima] Warning: gesture-pad config: {}", w);
+        }
+        config
     }
 
-    /// The pulse to fire when a gesture session starts, if the user
-    /// configured one. `None` (silence) by default — see `GestureHapticConfig`.
-    pub fn start_pulse(&self) -> Option<HapticPulse> {
-        self.haptic.on_gesture_start
-    }
-
-    /// The movement pulse/distance-gate policy, if configured. `None` by
-    /// default.
-    pub fn move_pulse(&self) -> Option<GestureMoveHaptic> {
-        self.haptic.on_gesture_move
-    }
-
-    /// The pulse to fire when a gesture session ends, if configured. `None`
-    /// by default.
-    pub fn end_pulse(&self) -> Option<HapticPulse> {
-        self.haptic.on_gesture_end
+    /// The parse itself, returning the warnings instead of printing them.
+    pub fn parse(value: &toml::Value) -> (Self, Vec<String>) {
+        let mut c = Self::default();
+        let mut warnings = Vec::new();
+        let Some(table) = value.as_table() else {
+            warnings.push(format!("expected a table, got {}; using defaults", value.type_str()));
+            return (c, warnings);
+        };
+        let pixel_interval = parse_pixel_interval(table, &mut warnings);
+        match table.get("haptic") {
+            None => {}
+            Some(toml::Value::Table(h)) => {
+                for key in h.keys() {
+                    if !HAPTIC_KEYS.contains(&key.as_str()) {
+                        warnings.push(format!("unknown key haptic.{:?} ignored", key));
+                    }
+                }
+                let gate = "the distance gate is `pixel_interval` in [trackpad.gestures]";
+                let h_ = &mut c.haptic;
+                h_.on_gesture_start = parse_pad_haptic(h, "on_gesture_start", None, HapticChain::default(), gate, &mut warnings);
+                h_.on_gesture_move = parse_pad_haptic(h, "on_gesture_move", None, default_tick(), gate, &mut warnings)
+                    .map(|chain| GestureMoveHaptic { pixel_interval, chain });
+                h_.on_gesture_end = parse_pad_haptic(h, "on_gesture_end", None, HapticChain::default(), gate, &mut warnings);
+            }
+            Some(other) => warnings.push(format!(
+                "haptic must be a table, got {}; using the default haptics", other.type_str()
+            )),
+        }
+        (c, warnings)
     }
 }
 
@@ -192,27 +208,27 @@ pub fn plan_haptics(
 
     match event {
         GestureEvent::Start(frame) => {
-            if let Some(p) = config.start_pulse() {
-                actions.push(pulse(HapticPad::Both, p));
+            if let Some(c) = &config.haptic.on_gesture_start {
+                actions.push(chain(HapticPad::Both, c));
             }
             next.prev_move_frame = Some(frame);
             next.move_accum = 0.0;
         }
         GestureEvent::Move(frame) => {
-            if let Some(m) = config.move_pulse() {
+            if let Some(m) = &config.haptic.on_gesture_move {
                 if let Some(prev) = progress.prev_move_frame {
                     next.move_accum += frame_distance(prev, frame);
                 }
                 if next.move_accum >= m.pixel_interval as f64 {
-                    actions.push(pulse(HapticPad::Both, m.pulse));
+                    actions.push(chain(HapticPad::Both, &m.chain));
                     next.move_accum = 0.0;
                 }
             }
             next.prev_move_frame = Some(frame);
         }
         GestureEvent::End => {
-            if let Some(p) = config.end_pulse() {
-                actions.push(pulse(HapticPad::Both, p));
+            if let Some(c) = &config.haptic.on_gesture_end {
+                actions.push(chain(HapticPad::Both, c));
             }
             next.prev_move_frame = None;
             next.move_accum = 0.0;

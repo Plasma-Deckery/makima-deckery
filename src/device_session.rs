@@ -36,11 +36,11 @@ pub struct TrackpadSession {
     combined_tx: Option<mpsc::Sender<GestureEvent>>,
     combined_rx: Option<mpsc::Receiver<GestureEvent>>,
 
-    left_press_chain:    HapticChain,
+    left_press_chain:    Option<HapticChain>,
     left_release_chain:  Option<HapticChain>,
     left_movement_pulse: Option<MovementHaptic>,
 
-    right_press_chain:    HapticChain,
+    right_press_chain:    Option<HapticChain>,
     right_release_chain:  Option<HapticChain>,
     right_movement_pulse: Option<MovementHaptic>,
 
@@ -108,8 +108,13 @@ impl TrackpadSession {
 
         // Each handler self-parses its own config slice — Core only knows
         // mode and click_pressure; everything else is handler-owned.
-        let left_mt  = MtTrackpadConfig::from_toml_value(&trackpad.left.handler_config);
-        let right_mt = MtTrackpadConfig::from_toml_value(&trackpad.right.handler_config);
+        // Only an mt-trackpad side reads the mt-trackpad keys; parsing a
+        // trackball section with them would warn about keys it does not own.
+        let mt_config = |mode: &str, raw: &toml::Value| {
+            if mode == "mt-trackpad" { MtTrackpadConfig::from_toml_value(raw) } else { MtTrackpadConfig::default() }
+        };
+        let left_mt  = mt_config(&trackpad.left.mode, &trackpad.left.handler_config);
+        let right_mt = mt_config(&trackpad.right.mode, &trackpad.right.handler_config);
         let gesture_pad_config = GesturePadConfig::from_toml_value(&trackpad.gesture_handler_config);
 
         let trackball_config = |mode: &str, raw: &toml::Value| {

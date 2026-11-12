@@ -223,6 +223,83 @@ impl TryFrom<RawBindingHaptic> for BindingHaptic {
     }
 }
 
+// ── Haptic values in the trackpad sections ───────────────────────────────────
+
+/// A haptic value in a `[trackpad.<side>.haptic]` or
+/// `[trackpad.gestures.haptic]` table: the binding `haptic = { … }` form
+/// without `pad`, which the section already implies. So a single event,
+///
+/// ```toml
+/// on_press = { duration_us = 8000, count = 3 }
+/// ```
+///
+/// or a list of steps, each optionally pausing before the next,
+///
+/// ```toml
+/// on_release = [{ duration_us = 8000, pause_ms = 40 }, { duration_us = 4000 }]
+/// ```
+///
+/// (`{ chain = [ … ] }`, the binding spelling of the list, works too). Pulse
+/// fields left out take the same defaults as everywhere else.
+pub(crate) fn parse_haptic_value(v: &toml::Value) -> Result<HapticChain, String> {
+    match v {
+        toml::Value::Array(_) => v
+            .clone()
+            .try_into::<Vec<deckery_controller::HapticChainStep>>()
+            .map(HapticChain::Chain)
+            .map_err(|e| e.to_string().trim().to_string()),
+        toml::Value::Table(t) if t.contains_key("pad") => {
+            Err("`pad` does not go here, the section already decides the pad".into())
+        }
+        toml::Value::Table(_) => v
+            .clone()
+            .try_into::<BindingHaptic>()
+            .map(|b| b.chain)
+            .map_err(|e| e.to_string().trim().to_string()),
+        other => Err(format!("expected a table or a list, got {}", other.type_str())),
+    }
+}
+
+/// The tick movement and rolling play when switched on with `true`: one
+/// short pulse.
+pub(crate) fn default_tick() -> HapticChain {
+    HapticChain::Single(HapticPulse { duration_us: 4000, interval_us: 4000, count: 1, gain_db: 0 })
+}
+
+/// One key of a trackpad `haptic` table. `absent` is what a missing key
+/// means and what an unusable one falls back to; `true` means `on_true`,
+/// `false` silences the key. `gate` says where the key's gate lives now, for
+/// the warning about the old flat form that had it inline.
+pub(crate) fn parse_pad_haptic(
+    h: &toml::value::Table,
+    key: &str,
+    absent: Option<HapticChain>,
+    on_true: HapticChain,
+    gate: &str,
+    warnings: &mut Vec<String>,
+) -> Option<HapticChain> {
+    let v = match h.get(key) {
+        None => return absent,
+        Some(toml::Value::Boolean(true)) => return Some(on_true),
+        Some(toml::Value::Boolean(false)) => return None,
+        Some(v) => v,
+    };
+    if let Some(old) = ["pixel_interval", "grid"].iter().find(|k| v.as_table().is_some_and(|t| t.contains_key(**k))) {
+        warnings.push(format!(
+            "haptic.{key}: `{old}` no longer goes inside the haptic ({gate}); the haptic itself is \
+             {{ duration_us = …, count = … }} or a list of such steps. Using the default for {key}"
+        ));
+        return absent;
+    }
+    match parse_haptic_value(v) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warnings.push(format!("haptic.{key} is not a valid haptic ({e}); using the default"));
+            absent
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
 pub enum Event {
     Axis(Axis),

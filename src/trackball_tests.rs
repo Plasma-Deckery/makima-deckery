@@ -488,7 +488,8 @@ fn roll_ticks_thin_out_as_the_ball_slows() {
 #[test]
 fn roll_ticks_are_at_most_one_per_step() {
     let cfg = TrackballConfig {
-        on_roll: Some(MovementHaptic { pixel_interval: 1, pulse: HapticPulse::default() }),
+        // One-unit cells: every step crosses several.
+        grid: MAX_GRID,
         on_press: None,
         on_release: None,
         ..Default::default()
@@ -510,7 +511,7 @@ fn movement_ticks_are_off_by_default_and_grid_gated_when_on() {
     let (_, a) = run(TrackballState::default(), &off, &drag(300_000.0, 20));
     assert_eq!(haptics(&a), 0);
 
-    let on = TrackballConfig { on_movement: Some(default_movement_haptic()), ..off };
+    let on = TrackballConfig { on_movement: Some(default_tick()), ..off };
     // 0 → 24 000 across 8192-unit cells, starting on a cell's lower edge:
     // into the next cell past 8192 + 10 %, and the one after past 16 384.
     let (_, a) = run(TrackballState::default(), &on, &drag(300_000.0, 20));
@@ -519,7 +520,7 @@ fn movement_ticks_are_off_by_default_and_grid_gated_when_on() {
 
 /// Grid 8: cells are 8192 raw units, and x = 8192 is the edge between two.
 fn grid_on() -> TrackballConfig {
-    TrackballConfig { on_movement: Some(default_movement_haptic()), ..quiet() }
+    TrackballConfig { on_movement: Some(default_tick()), ..quiet() }
 }
 
 fn drag_through(points: &[(i32, i32)]) -> usize {
@@ -554,34 +555,143 @@ fn crossing_several_cells_in_one_frame_ticks_once() {
 
 #[test]
 fn the_default_grid_is_8() {
-    assert_eq!(default_movement_haptic().grid, 8);
-    let (c, w) = parse("[haptic]\non_movement = { count = 2 }");
+    assert_eq!(TrackballConfig::default().grid, 8);
+    let (c, w) = parse("grid = 5\n[haptic]\non_movement = { count = 2 }");
     assert!(w.is_empty(), "{w:?}");
-    assert_eq!(c.on_movement.unwrap().grid, 8);
-    assert_eq!(c.on_movement.unwrap().pulse.duration_us, 4000);
+    assert_eq!(c.grid, 5);
+    assert_eq!(c.on_movement, Some(HapticChain::Single(HapticPulse { count: 2, ..Default::default() })));
 }
 
 #[test]
 fn bad_grids_warn_and_fall_back() {
-    let (c, w) = parse("[haptic]\non_movement = { grid = 0 }");
-    assert_eq!(w.len(), 1, "{w:?}");
-    assert_eq!(c.on_movement.unwrap().grid, 8);
-
-    let (c, w) = parse("[haptic]\non_movement = { grid = -3 }");
-    assert_eq!(w.len(), 1, "{w:?}");
-    assert_eq!(c.on_movement, None);
-
-    let (c, w) = parse("[haptic]\non_movement = { grid = \"big\" }");
-    assert_eq!(w.len(), 1, "{w:?}");
-    assert_eq!(c.on_movement, None);
+    for bad in ["0", "-3", "\"big\"", "2.5", "70000"] {
+        let (c, w) = parse(&format!("grid = {bad}\nfriction = 1.5"));
+        assert_eq!(w.len(), 1, "{bad}: {w:?}");
+        assert!(w[0].contains("grid"), "{w:?}");
+        assert_eq!(c.grid, 8, "{bad}");
+        assert_eq!(c.friction, 1.5, "a bad grid leaves the other keys alone");
+    }
 }
 
 #[test]
-fn pixel_interval_on_movement_warns_and_is_ignored() {
-    let (c, w) = parse("[haptic]\non_movement = { pixel_interval = 3000, grid = 4 }");
+fn old_flat_gate_keys_warn_once_and_use_the_key_default() {
+    let (c, w) = parse(r#"
+        grid = 4
+        [haptic]
+        on_movement = { grid = 4, duration_us = 4000 }
+        on_roll = { pixel_interval = 3000, duration_us = 2000 }
+    "#);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("`grid`") && w[0].contains("pad section"), "{w:?}");
+    assert!(w[1].contains("`pixel_interval`"), "{w:?}");
+    assert_eq!(c.on_movement, None, "on_movement's default is off");
+    assert_eq!(c.on_roll, Some(default_tick()));
+    assert_eq!(c.grid, 4);
+}
+
+#[test]
+fn every_haptic_key_takes_a_single_event_or_a_list() {
+    for key in ["on_press", "on_release", "on_movement", "on_roll"] {
+        let (c, w) = parse(&format!("[haptic]\n{key} = {{ duration_us = 1234, count = 2 }}"));
+        assert!(w.is_empty(), "{key}: {w:?}");
+        let single = HapticChain::Single(HapticPulse { duration_us: 1234, count: 2, ..Default::default() });
+        let got = |c: &TrackballConfig| match key {
+            "on_press" => c.on_press.clone(),
+            "on_release" => c.on_release.clone(),
+            "on_movement" => c.on_movement.clone(),
+            _ => c.on_roll.clone(),
+        };
+        assert_eq!(got(&c), Some(single), "{key}");
+
+        let (c, w) = parse(&format!(
+            "[haptic]\n{key} = [{{ duration_us = 8000, pause_ms = 40 }}, {{ duration_us = 4000 }}]"
+        ));
+        assert!(w.is_empty(), "{key}: {w:?}");
+        assert!(matches!(got(&c), Some(HapticChain::Chain(ref s)) if s.len() == 2 && s[0].pause_ms == Some(40)), "{key}");
+    }
+}
+
+#[test]
+fn a_pad_inside_a_trackpad_haptic_is_refused() {
+    let (c, w) = parse("[haptic]\non_press = { pad = \"left\", duration_us = 100 }");
     assert_eq!(w.len(), 1, "{w:?}");
-    assert!(w[0].contains("grid"), "{w:?}");
-    assert_eq!(c.on_movement.unwrap().grid, 4);
+    assert!(w[0].contains("pad"), "{w:?}");
+    assert_eq!(c.on_press, Some(HapticChain::default()));
+}
+
+/// Every haptic in `actions`, as how far the pointer had moved (x) when it
+/// fired. With `sensitivity = 1`, pixels are raw units.
+fn tick_positions(actions: &[OutputAction]) -> Vec<i64> {
+    let mut x = 0;
+    let mut at = Vec::new();
+    for a in actions {
+        match a {
+            OutputAction::Haptic { .. } => at.push(x),
+            other => x += motion(std::slice::from_ref(other)).0,
+        }
+    }
+    at
+}
+
+/// A drag right at 100 raw units per 4 ms frame for `frames` frames from the
+/// pad's centre, then a lift, then 8 ms roll ticks with no friction — ticking
+/// on the drag and the roll alike.
+fn drag_then_roll(grid: u32, frames: usize, roll_steps: usize) -> (Vec<i64>, usize) {
+    let cfg = TrackballConfig {
+        sensitivity: 1.0,
+        friction: 0.0,
+        min_fling_speed: 0.0,
+        stop_speed: 1.0,
+        grid,
+        on_movement: Some(default_tick()),
+        on_roll: Some(default_tick()),
+        ..quiet()
+    };
+    let mut inputs = vec![(touch(0, 0), ms(500))];
+    for i in 1..=frames {
+        inputs.push((touch(100 * i as i32, 0), ms(4)));
+    }
+    let (s, mut actions) = run(TrackballState::default(), &cfg, &inputs);
+    let drag_ticks = haptics(&actions);
+    let (s, lift_actions) = step(s, lift(), ms(4), &cfg, PAD);
+    assert!(s.is_rolling(), "setup: the drag must fling");
+    assert_eq!(haptics(&lift_actions), 0, "the lift itself never ticks");
+    actions.extend(lift_actions);
+    let (_, roll_actions) = run(s, &cfg, &vec![(Input::Tick, ROLL_TICK); roll_steps]);
+    actions.extend(roll_actions);
+    (tick_positions(&actions), drag_ticks)
+}
+
+#[test]
+fn one_grid_spaces_drag_and_roll_ticks_alike() {
+    // Grid 5: 13 107-unit cells. 300 frames drag 30 000 units, a couple of
+    // ticks; the roll (25 000 units/s, 200 per step) carries on for 60 000.
+    let (at, drag_ticks) = drag_then_roll(5, 300, 300);
+    assert!(drag_ticks >= 2 && at.len() >= drag_ticks + 3, "{drag_ticks} drag ticks of {at:?}");
+    let cell = 65_536.0 / 5.0;
+    for (i, w) in at.windows(2).enumerate() {
+        let gap = (w[1] - w[0]) as f64;
+        // Quantised to one frame (100) while dragging, one step (200) rolling.
+        assert!((gap - cell).abs() <= 200.0, "gap {i} is {gap}, not one {cell}-unit cell: {at:?}");
+    }
+}
+
+#[test]
+fn the_raster_carries_on_across_the_lift() {
+    // Lift just after a drag tick: the first roll tick comes one cell after
+    // it, not at the lift and not one cell after the lift.
+    let cell = 65_536.0 / 8.0;
+    let (at, drag_ticks) = drag_then_roll(8, 100, 100);
+    assert_eq!(drag_ticks, 1, "{at:?}");
+    let gap = (at[1] - at[0]) as f64;
+    assert!((gap - cell).abs() <= 200.0, "drag tick at {}, first roll tick at {}", at[0], at[1]);
+}
+
+#[test]
+fn the_pixel_interval_key_is_gone() {
+    let (_, w) = parse("pixel_interval = 3000");
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("pixel_interval"));
 }
 
 // ── The handler loop ─────────────────────────────────────────────────────────
@@ -632,7 +742,8 @@ fn an_empty_table_is_all_defaults() {
     let (c, w) = parse("");
     assert_eq!(c, TrackballConfig::default());
     assert!(w.is_empty());
-    assert_eq!(c.on_roll, Some(default_roll_haptic()), "roll ticks are on by default");
+    assert_eq!(c.on_roll, Some(default_tick()), "roll ticks are on by default");
+    assert_eq!(c.grid, 8);
     assert_eq!(c.on_movement, None);
 }
 
@@ -665,11 +776,12 @@ fn every_key_is_read() {
         friction = 2
         min_fling_speed = 10000
         stop_speed = 500.5
+        grid = 4
         [haptic]
         on_press = false
         on_release = [ { duration_us = 100, count = 1, pause_ms = 5 }, { duration_us = 200 } ]
-        on_movement = { grid = 4 }
-        on_roll = { pixel_interval = 5000, count = 2 }
+        on_movement = { count = 1 }
+        on_roll = { duration_us = 5000, count = 2 }
     "#);
     assert!(w.is_empty(), "{w:?}");
     assert_eq!(c.sensitivity, 0.05);
@@ -678,12 +790,10 @@ fn every_key_is_read() {
     assert_eq!(c.stop_speed, 500.5);
     assert_eq!(c.on_press, None);
     assert!(matches!(c.on_release, Some(HapticChain::Chain(ref s)) if s.len() == 2));
-    assert_eq!(c.on_movement.unwrap().grid, 4);
-    let roll = c.on_roll.unwrap();
-    assert_eq!(roll.pixel_interval, 5000);
-    assert_eq!(roll.pulse.count, 2);
-    // Fields left out keep the roll tick's own shape, not the 3-pulse burst.
-    assert_eq!(roll.pulse.duration_us, 4000);
+    assert_eq!(c.grid, 4);
+    assert_eq!(c.on_movement, Some(HapticChain::Single(HapticPulse { count: 1, ..Default::default() })));
+    // Fields left out take the pulse defaults, as in a binding's `haptic =`.
+    assert_eq!(c.on_roll, Some(HapticChain::Single(HapticPulse { duration_us: 5000, count: 2, ..Default::default() })));
 }
 
 #[test]
@@ -741,7 +851,7 @@ fn bad_haptics_warn_and_fall_back() {
     assert_eq!(c.on_press, Some(HapticChain::default()));
     assert_eq!(c.on_release, Some(HapticChain::default()));
     assert_eq!(c.on_movement, None, "a bad optional tick stays off");
-    assert_eq!(c.on_roll, Some(default_roll_haptic()));
+    assert_eq!(c.on_roll, Some(default_tick()));
 }
 
 #[test]
@@ -749,7 +859,7 @@ fn roll_ticks_can_be_silenced_and_movement_ticks_switched_on() {
     let (c, w) = parse("[haptic]\non_roll = false\non_movement = true");
     assert!(w.is_empty());
     assert_eq!(c.on_roll, None);
-    assert_eq!(c.on_movement, Some(default_movement_haptic()));
+    assert_eq!(c.on_movement, Some(default_tick()));
 }
 
 #[test]

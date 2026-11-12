@@ -15,100 +15,154 @@
 //! The haptic types (`HapticPulse`, `HapticChain`, `HapticChainStep`) live in
 //! `steam_deck_controller/haptic.rs` so any tool (makima, deckery-auth, etc.)
 //! can play chains without re-implementing the evaluation logic.
-use deckery_controller::{HapticChain, HapticPad, HapticPulse};
+//!
+//! ## Config
+//!
+//! ```toml
+//! [trackpad.left]
+//! mode = "mt-trackpad"
+//! pixel_interval = 3000   # Raw units the finger travels per on_movement tick
+//!
+//! [trackpad.left.haptic]
+//! on_press    = { duration_us = 8000, interval_us = 8000, count = 3 }
+//! on_release  = [{ duration_us = 8000, pause_ms = 40 }, { duration_us = 4000, count = 1 }]
+//! # Off unless set; `true` is one short tick.
+//! # on_movement = { duration_us = 4000, interval_us = 4000, count = 1 }
+//! ```
+//!
+//! Each haptic value takes the same form as a binding's `haptic =`, minus
+//! `pad`: a single event or a list of steps (`config::parse_haptic_value`).
+//! `false` silences a key. What gates a movement tick is a key of the pad
+//! section, never of the haptic. A bad value warns and falls back to that
+//! key's default.
+use deckery_controller::{HapticChain, HapticPad};
+use crate::config::{default_tick, parse_pad_haptic};
 use crate::output::action::OutputAction;
 use crate::output::Outputs;
 use crate::trackpad::PadState;
 use crate::trackpad_router::SinglePadFrame;
 use tokio::sync::mpsc;
 
-fn default_movement_pixel_interval() -> u32 { 3000 }
+const DEFAULT_PIXEL_INTERVAL: u32 = 3000;
 
-/// Distance-gated movement haptic: the pulse to fire plus the raw-unit
-/// distance threshold that gates it. Kept as its own struct (not a bare
-/// `HapticPulse`) for the same reason as `gesture_pad::GestureMoveHaptic` —
-/// movement has no natural single trigger instant, so it needs its own firing
-/// policy alongside the pulse shape. Live-tested naive time-based throttling
-/// produced a continuous buzz; distance-gating means faster movement ticks
-/// more often and slow movement ticks rarely, matching Steam Input's own
-/// trackpad feedback feel.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+/// Distance-gated movement haptic: what to play, plus the raw-unit distance
+/// that gates it. Movement has no natural single trigger instant, so it needs
+/// a firing policy alongside the haptic. Live-tested naive time-based
+/// throttling produced a continuous buzz; distance-gating means faster
+/// movement ticks more often and slow movement ticks rarely, matching Steam
+/// Input's own trackpad feedback feel.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MovementHaptic {
-    #[serde(default = "default_movement_pixel_interval")]
     pub pixel_interval: u32,
-    #[serde(flatten)]
-    pub pulse: HapticPulse,
+    pub chain: HapticChain,
 }
 
-/// Haptic policy for this handler: which events fire a pulse, and with what
-/// parameters. A physical click is really two distinct edges — press and
-/// release — and they deserve independent chains rather than being collapsed
-/// into a single "on_click". `on_movement` gates on cumulative pixel distance
-/// (see `MovementHaptic`) rather than time, to avoid continuous buzzing.
-/// `on_movement` intentionally keeps a single `HapticPulse` (not a chain):
-/// it fires on every distance threshold crossing, so a multi-step chain would
-/// overlap itself under fast movement.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct HapticConfig {
+/// This handler's own config, parsed from the raw `[trackpad.<side>]` table
+/// Core hands it unparsed — Core only knows `mode` and `click_pressure`.
+/// A physical click is two distinct edges, press and release, with a chain
+/// each.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MtTrackpadConfig {
     pub on_press:    Option<HapticChain>,
     pub on_release:  Option<HapticChain>,
     pub on_movement: Option<MovementHaptic>,
 }
 
-/// This handler's own config, self-deserialized from the raw `handler_config`
-/// TOML sub-table that Core (`config.rs`) hands it unparsed — Core only knows
-/// `mode` and `click_pressure`; everything below is owned by this module.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct MtTrackpadConfig {
-    #[serde(default)]
-    pub haptic: HapticConfig,
+impl Default for MtTrackpadConfig {
+    fn default() -> Self {
+        Self {
+            on_press:    Some(HapticChain::default()),
+            on_release:  Some(HapticChain::default()),
+            // Movement haptics have no established feel to fall back to,
+            // unlike click edges, so silence is the right default.
+            on_movement: None,
+        }
+    }
 }
 
+/// `pixel_interval` of a pad or gesture section: a whole number of raw units
+/// of at least 0, default 3000.
+pub(crate) fn parse_pixel_interval(table: &toml::value::Table, warnings: &mut Vec<String>) -> u32 {
+    match table.get("pixel_interval") {
+        None => DEFAULT_PIXEL_INTERVAL,
+        Some(v) => match v.as_integer().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) => n,
+            None => {
+                warnings.push(format!(
+                    "pixel_interval = {} is not valid (must be a whole number of at least 0); using {}",
+                    v, DEFAULT_PIXEL_INTERVAL
+                ));
+                DEFAULT_PIXEL_INTERVAL
+            }
+        },
+    }
+}
+
+const HAPTIC_KEYS: &[&str] = &["on_press", "on_release", "on_movement"];
+
 impl MtTrackpadConfig {
-    /// Parses `value` (a `[trackpad.left]`/`[trackpad.right]` TOML table) into
-    /// this handler's config. Falls back to defaults (and logs a warning) on
-    /// any shape mismatch — a config typo in a handler-owned field must never
-    /// crash makima or block input handling on the pad.
+    /// Parses `value` (a `[trackpad.left]`/`[trackpad.right]` TOML table) and
+    /// logs every problem. Never fails — a config typo in a handler-owned
+    /// field must never crash makima or block input handling on the pad.
     pub fn from_toml_value(value: &toml::Value) -> Self {
-        value.clone().try_into::<MtTrackpadConfig>().unwrap_or_else(|e| {
-            eprintln!("[makima] Warning: invalid mt-trackpad handler config ({}), using defaults.", e);
-            MtTrackpadConfig::default()
-        })
+        let (config, warnings) = Self::parse(value);
+        for w in warnings {
+            eprintln!("[makima] Warning: mt-trackpad config: {}", w);
+        }
+        config
     }
 
-    /// The haptic chain to fire on the press edge — user-configured `on_press`,
-    /// or the built-in default single-pulse chain.
-    pub fn press_chain(&self) -> HapticChain {
-        self.haptic.on_press.clone().unwrap_or_default()
+    /// The parse itself, returning the warnings instead of printing them.
+    pub fn parse(value: &toml::Value) -> (Self, Vec<String>) {
+        let mut c = Self::default();
+        let mut warnings = Vec::new();
+        let Some(table) = value.as_table() else {
+            warnings.push(format!("expected a table, got {}; using defaults", value.type_str()));
+            return (c, warnings);
+        };
+        let pixel_interval = parse_pixel_interval(table, &mut warnings);
+        match table.get("haptic") {
+            None => {}
+            Some(toml::Value::Table(h)) => {
+                for key in h.keys() {
+                    if !HAPTIC_KEYS.contains(&key.as_str()) {
+                        warnings.push(format!("unknown key haptic.{:?} ignored", key));
+                    }
+                }
+                let gate = "the distance gate is `pixel_interval` in the pad section";
+                let click = || Some(HapticChain::default());
+                c.on_press = parse_pad_haptic(h, "on_press", click(), HapticChain::default(), gate, &mut warnings);
+                c.on_release = parse_pad_haptic(h, "on_release", click(), HapticChain::default(), gate, &mut warnings);
+                c.on_movement = parse_pad_haptic(h, "on_movement", None, default_tick(), gate, &mut warnings)
+                    .map(|chain| MovementHaptic { pixel_interval, chain });
+            }
+            Some(other) => warnings.push(format!(
+                "haptic must be a table, got {}; using the default haptics", other.type_str()
+            )),
+        }
+        (c, warnings)
     }
 
-    /// The haptic chain to fire on the release edge — user-configured
-    /// `on_release`, or the same built-in default as `press_chain`.
-    /// Returns `Option` so a user can silence release-only by omitting it,
-    /// while press still fires.
+    /// The haptic chain to fire on the press edge, `None` when silenced.
+    pub fn press_chain(&self) -> Option<HapticChain> {
+        self.on_press.clone()
+    }
+
+    /// The haptic chain to fire on the release edge, `None` when silenced.
     pub fn release_chain(&self) -> Option<HapticChain> {
-        Some(self.haptic.on_release.clone().unwrap_or_default())
+        self.on_release.clone()
     }
 
-    /// The movement pulse/distance-gate policy, if configured. `None` by
-    /// default — movement haptics have no established "feel" to fall back to,
-    /// unlike click edges, so silence is the right default.
+    /// The movement haptic and its distance gate, if switched on.
     pub fn movement_pulse(&self) -> Option<MovementHaptic> {
-        self.haptic.on_movement
+        self.on_movement.clone()
     }
 }
 
 // ── Haptic helpers ────────────────────────────────────────────────────────────
 
-/// A single-step haptic, as an action.
-///
-/// `pub(crate)`: shared with `gesture_pad.rs`, which wraps its pulses the same
-/// way.
-pub(crate) fn pulse(pad: HapticPad, pulse: HapticPulse) -> OutputAction {
-    OutputAction::Haptic { pad, chain: HapticChain::single(pulse) }
-}
-
-/// A whole chain, as an action. The controller's haptic player evaluates it
+/// A haptic chain, as an action. `pub(crate)`: shared with `gesture_pad.rs`
+/// and `trackball.rs`. The controller's haptic player evaluates it
 /// (including the inter-step sleeps) once `Outputs::dispatch` hands it over, so
 /// deciding one costs nothing here.
 pub(crate) fn chain(pad: HapticPad, chain: &HapticChain) -> OutputAction {
@@ -136,9 +190,9 @@ pub fn plan_haptics(
     progress: HapticProgress,
     frame: &SinglePadFrame,
     pad: HapticPad,
-    press_chain: &HapticChain,
+    press_chain: Option<&HapticChain>,
     release_chain: Option<&HapticChain>,
-    movement_pulse: Option<MovementHaptic>,
+    movement_pulse: Option<&MovementHaptic>,
 ) -> (HapticProgress, Vec<OutputAction>) {
     let mut next = progress;
     let mut actions = Vec::new();
@@ -148,7 +202,9 @@ pub fn plan_haptics(
     next.prev_click  = frame.click;
 
     if press_edge {
-        actions.push(chain(pad, press_chain));
+        if let Some(c) = press_chain {
+            actions.push(chain(pad, c));
+        }
     } else if release_edge {
         if let Some(c) = release_chain {
             actions.push(chain(pad, c));
@@ -162,7 +218,7 @@ pub fn plan_haptics(
                 let dy = (frame.y - py) as f64;
                 next.move_accum += (dx * dx + dy * dy).sqrt();
                 if next.move_accum >= m.pixel_interval as f64 {
-                    actions.push(pulse(pad, m.pulse));
+                    actions.push(chain(pad, &m.chain));
                     next.move_accum = 0.0;
                 }
             }
@@ -190,7 +246,7 @@ pub async fn run_single(
     outputs:         &Outputs,
     pad:             &PadState,
     haptic_pad:      HapticPad,
-    press_chain:     HapticChain,
+    press_chain:     Option<HapticChain>,
     release_chain:   Option<HapticChain>,
     movement_pulse:  Option<MovementHaptic>,
 ) {
@@ -211,7 +267,7 @@ pub async fn run_single(
 
         let (next, actions) = plan_haptics(
             progress, &frame, haptic_pad,
-            &press_chain, release_chain.as_ref(), movement_pulse,
+            press_chain.as_ref(), release_chain.as_ref(), movement_pulse.as_ref(),
         );
         progress = next;
         outputs.dispatch(&actions).await;
