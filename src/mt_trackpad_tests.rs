@@ -8,7 +8,7 @@ use super::*;
 use deckery_controller::{HapticChain, HapticPad, HapticPulse};
 
 fn frame(x: i32, y: i32, touching: bool, click: bool) -> SinglePadFrame {
-    SinglePadFrame { x, y, touching, click }
+    SinglePadFrame { x, y, touching, click, interrupted: false }
 }
 
 /// Pulses that differ only in duration, so a test can tell which one fired.
