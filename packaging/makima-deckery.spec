@@ -1,6 +1,6 @@
 Name:           makima-deckery
 Version:        2.0.0~beta1
-Release:        8%{?dist}
+Release:        9%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
 License:        GPL-3.0-only
@@ -91,6 +91,13 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Thu Nov 12 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-9
+- Sticks are as fast left/up as right/down (full deflection was -15 vs 17)
+- Pressing Steam no longer ends an R2 drag
+- A disabled left pad's position is never read as a D-pad press
+- A hat switch reversed without passing centre releases the old direction
+- The evdev access check matches whole group names (uinput is not input)
+
 * Thu Nov 12 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-8
 - Tests drive the real event loop (read loop, IPC loop, Gaming Mode setter)
   instead of a hand-written copy of it; no behaviour change
