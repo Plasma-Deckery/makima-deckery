@@ -110,9 +110,12 @@ mode = "mt-trackpad"   # creates "Deckery Right Trackpad" virtual MT device
 [trackpad]
 combined_gesture_device = true   # also creates "Deckery Combined Trackpad" for two-finger gestures
 # mode = "disabled" # default per pad — no virtual device, but position is still tracked in state.json
+# mode = "trackball" # relative pointer with momentum, like Steam Input's trackball option
 ```
 
 Setting `combined_gesture_device = true` enables both trackpads simultaneously for pinch-zoom and scroll — individual pads seamlessly resume their own device the instant one finger lifts.
+
+A pad in `mode = "trackball"` drives the pointer instead of acting as a touchpad: finger movement moves it, a flick sets it rolling, friction slows it down, and touching the pad again stops it. The pad ticks as the ball rolls, faster at speed. Its keys (`sensitivity`, `friction`, `min_fling_speed`, `stop_speed`, `haptic.on_roll`) are documented at the top of `src/trackball.rs`.
 
 Haptic feedback is configurable per pad: press and release edges are independent events with separate pulse shapes, and distance-gated movement haptics are also supported. See the [trackpad configuration docs](https://plasma-deckery.github.io/deckery/projects/makima-deckery/trackpad/) for the full config reference.
 

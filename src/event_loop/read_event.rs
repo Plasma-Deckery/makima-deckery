@@ -85,9 +85,9 @@ impl EventReader {
                     // with position/touch. Swallow it here so it doesn't fall
                     // through to emit_default_event and leak onto the generic
                     // key device.
-                    Key::BTN_THUMB if self.trackpad.left.mode == "mt-trackpad" => {}
+                    Key::BTN_THUMB if self.trackpad.left.has_handler() => {}
                     // Right trackpad physical click (BTN_THUMB2) — same as above.
-                    Key::BTN_THUMB2 if self.trackpad.right.mode == "mt-trackpad" => {}
+                    Key::BTN_THUMB2 if self.trackpad.right.has_handler() => {}
                     _ => {
                         self.convert_event(
                             event,
@@ -143,10 +143,11 @@ impl EventReader {
                 }
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
                 (_, _, AbsoluteAxisType::ABS_HAT0X, _) => {
-                    // Trackpad position/touch now comes from hidraw (trackpad_router) in
-                    // MtTrackpad mode. This handler only remains for the D-pad
-                    // hat-switch case on non-Steam-Deck controllers.
-                    if self.trackpad.left.mode != "mt-trackpad" {
+                    // Trackpad position/touch now comes from hidraw (trackpad_router)
+                    // whenever a handler owns the pad (mt-trackpad, trackball).
+                    // This handler only remains for the D-pad hat-switch case on
+                    // non-Steam-Deck controllers.
+                    if !self.trackpad.left.has_handler() {
                         match event.value() {
                             -1 => {
                                 self.convert_event(event, Event::Axis(Axis::BTN_DPAD_LEFT), 1, false)
@@ -187,10 +188,11 @@ impl EventReader {
                     }
                 }
                 (_, _, AbsoluteAxisType::ABS_HAT0Y, _) => {
-                    // Trackpad position/touch now comes from hidraw (trackpad_router) in
-                    // MtTrackpad mode. This handler only remains for the D-pad
-                    // hat-switch case on non-Steam-Deck controllers.
-                    if self.trackpad.left.mode != "mt-trackpad" {
+                    // Trackpad position/touch now comes from hidraw (trackpad_router)
+                    // whenever a handler owns the pad (mt-trackpad, trackball).
+                    // This handler only remains for the D-pad hat-switch case on
+                    // non-Steam-Deck controllers.
+                    if !self.trackpad.left.has_handler() {
                         match event.value() {
                             -1 => {
                                 self.convert_event(event, Event::Axis(Axis::BTN_DPAD_UP), 1, false)

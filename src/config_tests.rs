@@ -856,3 +856,15 @@ fn merge_base_override_haptic_wins() {
 
     assert_eq!(over.bindings.haptics.get(&(r2, vec![])), Some(&tick(deckery_controller::HapticPad::Both)));
 }
+
+/// The modes that read the pad from hidraw are the ones whose evdev
+/// duplicates (click, hat position) must be swallowed by the event loop.
+#[test]
+fn trackball_and_mt_trackpad_own_their_pad() {
+    let side = |mode: &str| TrackpadSideConfig { mode: mode.to_string(), ..Default::default() };
+    assert!(side("mt-trackpad").has_handler());
+    assert!(side("trackball").has_handler());
+    assert!(!side("disabled").has_handler());
+    assert!(!side("scroll").has_handler(), "no handler yet, see issue #24");
+    assert!(!side("nonsense").has_handler());
+}

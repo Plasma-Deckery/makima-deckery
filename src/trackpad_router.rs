@@ -71,6 +71,21 @@ pub struct SinglePadFrame {
     pub y: i32,
     pub touching: bool,
     pub click: bool,
+    /// Set only on the synthetic lift the router sends when it takes the pad
+    /// away from its handler — a gesture session starting, or Gaming Mode.
+    /// For a handler that only mirrors touch state (`mt_trackpad`) it is an
+    /// ordinary lift and the flag changes nothing. For one where a lift
+    /// *means* something (`trackball`, where it flings the ball) the two must
+    /// be told apart: the finger did not leave the pad, the router did.
+    pub interrupted: bool,
+}
+
+impl SinglePadFrame {
+    /// The synthetic lift that ends a handler's touch because routing moved
+    /// elsewhere: untouched, unclicked, and marked as an interruption.
+    pub fn interrupt() -> Self {
+        Self { interrupted: true, ..Self::default() }
+    }
 }
 
 /// Both pads' data as delivered to the combined-gesture handler while a
@@ -254,13 +269,14 @@ pub async fn run(
                 // Transition into gaming mode: send synthetic lift to all
                 // three virtual devices to prevent stuck-touch in the kernel.
                 gaming_mode_was_active = true;
-                // SinglePadFrame::default() = touching:false, click:false, x:0, y:0
-                // — a synthetic lift frame that clears the handler's touch state.
+                // A synthetic lift (touching:false, click:false) that clears
+                // the handler's touch state, marked as an interruption so a
+                // trackball stops instead of flinging.
                 if let Some(ref tx) = left_tx {
-                    let _ = tx.send(SinglePadFrame::default()).await;
+                    let _ = tx.send(SinglePadFrame::interrupt()).await;
                 }
                 if let Some(ref tx) = right_tx {
-                    let _ = tx.send(SinglePadFrame::default()).await;
+                    let _ = tx.send(SinglePadFrame::interrupt()).await;
                 }
                 if let Some(ref tx) = combined_tx {
                     let _ = tx.send(GestureEvent::End).await;
@@ -306,10 +322,10 @@ pub async fn run(
             // state before combined events start.
             if transition.entering {
                 if let Some(tx) = &left_tx {
-                    let _ = tx.send(SinglePadFrame::default()).await;
+                    let _ = tx.send(SinglePadFrame::interrupt()).await;
                 }
                 if let Some(tx) = &right_tx {
-                    let _ = tx.send(SinglePadFrame::default()).await;
+                    let _ = tx.send(SinglePadFrame::interrupt()).await;
                 }
             }
 
@@ -369,6 +385,7 @@ pub async fn run(
                                 y: frame.ly,
                                 touching: frame.ltouch,
                                 click: frame.lclick,
+                                interrupted: false,
                             })
                             .await;
                     }
@@ -392,6 +409,7 @@ pub async fn run(
                                 y: frame.ry,
                                 touching: frame.rtouch,
                                 click: frame.rclick,
+                                interrupted: false,
                             })
                             .await;
                     }
@@ -610,9 +628,9 @@ mod tests {
             Some(left_tx), Some(right_tx), Some(combined_tx), gaming_mode,
         ).await;
 
-        assert_eq!(left_rx.try_recv().unwrap(), SinglePadFrame::default(),
+        assert_eq!(left_rx.try_recv().unwrap(), SinglePadFrame::interrupt(),
             "left pad: synthetic lift (touching=false) must be sent on Gaming Mode activation");
-        assert_eq!(right_rx.try_recv().unwrap(), SinglePadFrame::default(),
+        assert_eq!(right_rx.try_recv().unwrap(), SinglePadFrame::interrupt(),
             "right pad: synthetic lift (touching=false) must be sent on Gaming Mode activation");
         assert_eq!(comb_rx.try_recv().unwrap(), GestureEvent::End,
             "gesture device: GestureEvent::End must be sent on Gaming Mode activation");
@@ -647,7 +665,7 @@ mod tests {
         ).await;
 
         // Exactly one lift expected (from the first frame transition).
-        assert_eq!(left_rx.try_recv().unwrap(), SinglePadFrame::default(),
+        assert_eq!(left_rx.try_recv().unwrap(), SinglePadFrame::interrupt(),
             "first frame: lift must arrive");
         assert!(left_rx.try_recv().is_err(),
             "frames 2 and 3 must not produce additional lifts");
@@ -742,5 +760,38 @@ mod tests {
             Some(Urgency::Analog),
             "the gate is inclusive, so ~60 Hz means 16ms and not 17",
         );
+    }
+
+    /// A gesture session starting takes the pad away from its handler while
+    /// the finger is still down (or, for a rolling trackball, while it is
+    /// coming down). The handler must be told that apart from a real lift —
+    /// a trackball would otherwise fling — so the lift it gets is marked.
+    #[tokio::test]
+    async fn gesture_entry_sends_an_interrupt_not_a_plain_lift() {
+        let (right_tx,    mut right_rx) = mpsc::channel::<SinglePadFrame>(8);
+        let (combined_tx, mut comb_rx)  = mpsc::channel::<GestureEvent>(8);
+        let (pad_tx,          pad_rx)   = mpsc::channel::<PadFrame>(8);
+        let (outputs, _emissions)       = watched_outputs();
+
+        let gaming_mode     = Arc::new(Mutex::new(false));
+        let gesture_session = Arc::new(Mutex::new(false));
+        let lpad            = PadState::new(true);
+        let rpad            = PadState::new(false);
+
+        // The left pad (no handler) touches first, then the right joins.
+        pad_tx.send(touch_frame(true, false)).await.unwrap();
+        pad_tx.send(touch_frame(true, true)).await.unwrap();
+        drop(pad_tx);
+
+        run(
+            pad_rx, &lpad, &rpad, &gesture_session, &outputs,
+            None, Some(right_tx), Some(combined_tx), gaming_mode,
+        ).await;
+
+        assert_eq!(right_rx.try_recv().unwrap(), SinglePadFrame::interrupt(),
+            "the right handler's only frame is the interruption");
+        assert!(right_rx.try_recv().is_err(),
+            "while the session runs, the right handler hears nothing else");
+        assert!(matches!(comb_rx.try_recv().unwrap(), GestureEvent::Start(_)));
     }
 }

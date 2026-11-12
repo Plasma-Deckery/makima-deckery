@@ -38,6 +38,15 @@ pub struct TrackpadSideConfig {
     pub kde_config: toml::Value,
 }
 
+impl TrackpadSideConfig {
+    /// Whether a handler reads this pad from hidraw — position, touch *and*
+    /// the physical click. When one does, the pad's evdev events are its
+    /// duplicates and must not be remapped or forwarded as well.
+    pub fn has_handler(&self) -> bool {
+        matches!(self.mode.as_str(), "mt-trackpad" | "trackball")
+    }
+}
+
 impl Default for TrackpadSideConfig {
     fn default() -> Self {
         TrackpadSideConfig {
