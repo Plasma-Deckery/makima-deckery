@@ -1,6 +1,6 @@
 Name:           makima-deckery
 Version:        2.0.0~beta1
-Release:        6%{?dist}
+Release:        7%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
 License:        GPL-3.0-only
@@ -91,6 +91,13 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Thu Nov 12 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-7
+- Fix: a pause releases keys bound to triggers, stick directions and hats,
+  and passed-through keys, instead of leaving them held (#63)
+- Fix: a Hold binding released after its modifier no longer stays down
+- Fix: releasing a button after its modifier no longer sends a key-up for a
+  key that was never pressed
+
 * Thu Nov 12 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-6
 - Fix: auto_mute spawns nothing while it is off (no pactl listing on focus
   changes, pactl subscribe stopped when switched off); pactl subscribe

@@ -1,4 +1,5 @@
 use super::*;
+use crate::ledger::{self, Ledger, Pressed};
 use crate::config::{Bindings, MappedModifiers};
 
 use std::collections::{HashMap, HashSet};
@@ -59,6 +60,7 @@ fn a_plain_key_is_one_frame() {
     let config = make_config(vec![], vec![]);
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_A],
         value: 1,
         modifiers: &[],
@@ -67,7 +69,7 @@ fn a_plain_key_is_one_frame() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, &mut Ledger::new());
 
     assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 1)]);
     assert!(plan.toggles.is_empty());
@@ -81,6 +83,7 @@ fn each_key_is_its_own_frame_in_order() {
     let config = make_config(vec![], vec![]);
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_LEFTCTRL, Key::KEY_C],
         value: 1,
         modifiers: &[],
@@ -89,7 +92,7 @@ fn each_key_is_its_own_frame_in_order() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, &mut Ledger::new());
 
     assert_eq!(
         frames(&plan),
@@ -104,24 +107,41 @@ fn each_key_is_its_own_frame_in_order() {
 #[test]
 fn an_unused_modifier_taps_on_release() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&EmitRequest {
-        config: &config,
-        event_list: &[Key::BTN_TL],
-        value: 0,
-        modifiers: &[],
-        release_keys: true,
-        ignore_modifiers: false,
-        modifier_was_activated: false,
-        paused: false,
-        no_pause: false,
-    });
+    let mut ledger = Ledger::new();
+    let press = plan_emit(&arm_tl(&config), &mut ledger);
+    let plan = ledger::plan_release(&mut ledger, ev(Key::BTN_SOUTH), press.modifier_was_activated);
 
+    let sent: Vec<_> = plan.frames.iter().map(frame_code).collect();
     assert_eq!(
-        frames(&plan),
+        sent,
         vec![(Key::BTN_TL.code(), 1), (Key::BTN_TL.code(), 0)],
         "a tap is a press followed by a release",
     );
+    assert_eq!(plan.toggles, vec![(ev(Key::BTN_TL), 0)], "the release untracks it");
     assert!(plan.modifier_was_activated, "the tap counts as having used it");
+}
+
+/// The press of a base binding to `BTN_TL`, a custom modifier: armed, tracked.
+fn arm_tl(config: &Config) -> EmitRequest<'_> {
+    EmitRequest {
+        config,
+        event: ev(Key::BTN_SOUTH),
+        event_list: &[Key::BTN_TL],
+        value: 1,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    }
+}
+
+fn frame_code(action: &OutputAction) -> (u16, i32) {
+    match action {
+        OutputAction::Frame { events, .. } => (events[0].code, events[0].value),
+        other => panic!("not a frame: {other:?}"),
+    }
 }
 
 /// Once the modifier *was* used, releasing it sends nothing — otherwise every
@@ -129,9 +149,24 @@ fn an_unused_modifier_taps_on_release() {
 #[test]
 fn a_used_modifier_sends_nothing_on_release() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
+    let mut ledger = Ledger::new();
+    plan_emit(&arm_tl(&config), &mut ledger);
+    let plan = ledger::plan_release(&mut ledger, ev(Key::BTN_SOUTH), true);
+
+    assert!(plan.frames.is_empty());
+    assert_eq!(plan.toggles, vec![(ev(Key::BTN_TL), 0)]);
+}
+
+/// A release is the ledger's, so `plan_emit` plans nothing for one — not the
+/// key-ups of what the binding resolves to now, which may never have been
+/// pressed.
+#[test]
+fn plan_emit_plans_nothing_for_a_release() {
+    let config = make_config(vec![], vec![]);
     let plan = plan_emit(&EmitRequest {
         config: &config,
-        event_list: &[Key::BTN_TL],
+        event: ev(Key::BTN_SOUTH),
+        event_list: &[Key::KEY_A],
         value: 0,
         modifiers: &[],
         release_keys: true,
@@ -139,9 +174,35 @@ fn a_used_modifier_sends_nothing_on_release() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, &mut Ledger::new());
 
-    assert!(frames(&plan).is_empty());
+    assert!(plan.frames.is_empty());
+    assert!(plan.toggles.is_empty());
+}
+
+/// What a press sends down is what it records: plain keys as keys, a custom
+/// modifier as armed.
+#[test]
+fn a_press_records_what_it_pressed() {
+    let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
+    let mut ledger = Ledger::new();
+    plan_emit(&EmitRequest {
+        config: &config,
+        event: ev(Key::BTN_SOUTH),
+        event_list: &[Key::KEY_LEFTCTRL, Key::BTN_TL],
+        value: 1,
+        modifiers: &[],
+        release_keys: true,
+        ignore_modifiers: false,
+        modifier_was_activated: true,
+        paused: false,
+        no_pause: false,
+    }, &mut ledger);
+
+    assert_eq!(
+        ledger[&ev(Key::BTN_SOUTH)],
+        Pressed { keys: vec![Key::KEY_LEFTCTRL], armed: vec![Key::BTN_TL], tracked: true },
+    );
 }
 
 /// Pressing a custom modifier arms it: nothing is sent, and the "was used" flag
@@ -151,6 +212,7 @@ fn pressing_a_modifier_arms_it_without_sending() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::BTN_TL],
         value: 1,
         modifiers: &[],
@@ -159,7 +221,7 @@ fn pressing_a_modifier_arms_it_without_sending() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, &mut Ledger::new());
 
     assert!(frames(&plan).is_empty());
     assert!(!plan.modifier_was_activated);
@@ -167,15 +229,20 @@ fn pressing_a_modifier_arms_it_without_sending() {
 }
 
 /// An explicit combo consumed its modifier, so the modifier's *output* key is
-/// released first — `KEY_LEFTCTRL`, not the raw `BTN_TL` code.
+/// released first — `KEY_LEFTCTRL`, not the raw `BTN_TL` code — and the ledger
+/// forgets it, so letting go of the modifier later does not release it again.
 #[test]
 fn ignore_modifiers_releases_the_output_key_not_the_input() {
     let config = make_config(
         vec![(ev(Key::BTN_TL), vec![], vec![Key::KEY_LEFTCTRL])],
         vec![ev(Key::BTN_TL)],
     );
+    // As the modifier intercept records it.
+    let mut ledger = Ledger::new();
+    ledger::press(&mut ledger, ev(Key::BTN_TL), &[Key::KEY_LEFTCTRL], 1);
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_TAB],
         value: 1,
         modifiers: &[ev(Key::BTN_TL)],
@@ -184,22 +251,25 @@ fn ignore_modifiers_releases_the_output_key_not_the_input() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, &mut ledger);
 
     assert_eq!(
         frames(&plan),
         vec![(Key::KEY_LEFTCTRL.code(), 0), (Key::KEY_TAB.code(), 1)],
         "the modifier's output goes down before the combo key goes out",
     );
+    assert!(!ledger.contains_key(&ev(Key::BTN_TL)), "Ctrl is still recorded as down");
 }
 
 /// With no remap behind it, a modifier releases its own code — there is nothing
-/// else it could mean.
+/// else it could mean — but only if it is down. A custom modifier is armed,
+/// not pressed, so there is nothing to release; a passed-through one is.
 #[test]
 fn ignore_modifiers_falls_back_to_the_modifier_code() {
     let config = make_config(vec![], vec![ev(Key::BTN_TL)]);
-    let plan = plan_emit(&EmitRequest {
+    let request = |ledger: &mut Ledger| plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_TAB],
         value: 1,
         modifiers: &[ev(Key::BTN_TL)],
@@ -208,9 +278,16 @@ fn ignore_modifiers_falls_back_to_the_modifier_code() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, ledger);
 
-    assert_eq!(frames(&plan), vec![(Key::BTN_TL.code(), 0), (Key::KEY_TAB.code(), 1)]);
+    assert_eq!(frames(&request(&mut Ledger::new())), vec![(Key::KEY_TAB.code(), 1)]);
+
+    let mut ledger = Ledger::new();
+    ledger::press(&mut ledger, ev(Key::BTN_TL), &[Key::BTN_TL], 1);
+    assert_eq!(
+        frames(&request(&mut ledger)),
+        vec![(Key::BTN_TL.code(), 0), (Key::KEY_TAB.code(), 1)],
+    );
 }
 
 /// With no modifiers held there is nothing to clean up, and the release branch
@@ -224,6 +301,7 @@ fn nothing_is_released_when_no_modifier_is_held() {
     );
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_X],
         value: 1,
         modifiers: &[],
@@ -232,7 +310,7 @@ fn nothing_is_released_when_no_modifier_is_held() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, &mut Ledger::new());
 
     assert_eq!(frames(&plan), vec![(Key::KEY_X.code(), 1)]);
 }
@@ -247,6 +325,7 @@ fn a_repeat_does_not_release_or_track() {
     );
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_A],
         value: 2,
         modifiers: &[ev(Key::BTN_TL)],
@@ -255,7 +334,7 @@ fn a_repeat_does_not_release_or_track() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, &mut Ledger::new());
 
     assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 2)]);
     assert!(plan.toggles.is_empty());
@@ -263,6 +342,7 @@ fn a_repeat_does_not_release_or_track() {
 
 /// The release branch only releases keys that are modifiers themselves. A plain
 /// remap output that happens to resolve under the same modifier set stays put.
+/// Both are down here, recorded by hand: which of them goes up is the question.
 #[test]
 fn only_modifier_outputs_are_released() {
     let config = make_config(
@@ -274,8 +354,11 @@ fn only_modifier_outputs_are_released() {
         ],
         vec![ev(Key::BTN_TL), ev(Key::BTN_TR)],
     );
+    let mut ledger = Ledger::new();
+    ledger::press(&mut ledger, ev(Key::BTN_EAST), &[Key::BTN_TR, Key::KEY_ENTER], 1);
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_Z],
         value: 1,
         modifiers: &[ev(Key::BTN_TL)],
@@ -284,7 +367,7 @@ fn only_modifier_outputs_are_released() {
         modifier_was_activated: true,
         paused: false,
         no_pause: false,
-    });
+    }, &mut ledger);
 
     let sent = frames(&plan);
     assert!(sent.contains(&(Key::BTN_TR.code(), 0)), "the modifier output was released: {sent:?}");
@@ -544,6 +627,7 @@ fn a_release_always_clears_what_it_emitted() {
     assert!(releases_emitted(ev(Key::BTN_SOUTH), 0));
     assert!(!releases_emitted(ev(Key::BTN_SOUTH), 1));
     assert!(!releases_emitted(ev(Key::BTN_SOUTH), 2), "a repeat clears nothing");
+    assert!(releases_emitted(Event::Axis(Axis::ABS_Z), 0), "an axis edge's release too (#63)");
 }
 
 /// The first click arms the window and the event goes on to mean whatever else
@@ -723,6 +807,7 @@ fn a_paused_binding_sends_nothing() {
     let config = make_config(vec![], vec![]);
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_A],
         value: 1,
         modifiers: &[],
@@ -731,7 +816,7 @@ fn a_paused_binding_sends_nothing() {
         modifier_was_activated: true,
         paused: true,
         no_pause: false,
-    });
+    }, &mut Ledger::new());
 
     assert!(frames(&plan).is_empty());
     assert!(plan.toggles.is_empty());
@@ -744,6 +829,7 @@ fn a_no_pause_binding_fires_while_paused() {
     let config = make_config(vec![], vec![]);
     let plan = plan_emit(&EmitRequest {
         config: &config,
+        event: ev(Key::BTN_SOUTH),
         event_list: &[Key::KEY_A],
         value: 1,
         modifiers: &[],
@@ -752,7 +838,7 @@ fn a_no_pause_binding_fires_while_paused() {
         modifier_was_activated: true,
         paused: true,
         no_pause: true,
-    });
+    }, &mut Ledger::new());
 
     assert_eq!(frames(&plan), vec![(Key::KEY_A.code(), 1)]);
 }
@@ -1009,10 +1095,10 @@ fn no_haptic_plays_nothing() {
 // These run whole sequences — press, pause, resume, combo, release — because
 // the bug was in how the decisions add up, not in any one of them. `Reader`
 // below is the reader's state plus `convert_event`'s applying of the pure
-// decisions for key events, in the reader's order: `held_update`, the release
-// of `emitted_outputs`, `plan_route`, the intercept, `resolve_binding`,
-// `plan_emit`, and for an unbound event `paused_nonmapped` then
-// `plan_nonmapped`. Pause is `plan_pause` as `pause_release_outputs` applies it;
+// decisions for key and axis-edge events, in the reader's order:
+// `held_update`, `ledger::plan_release` on a release, `plan_route`, the
+// intercept, `resolve_binding`, `plan_emit` for a Keys or Hold binding, and
+// for an unbound event `paused_nonmapped` then `plan_nonmapped`. Pause is `plan_pause` as `pause_release_outputs` applies it;
 // resume is what the IPC handler does — flip the flag and apply
 // `resume_modifier_was_activated`, sending nothing.
 
@@ -1046,9 +1132,11 @@ struct Reader {
     config: Config,
     modifiers: Vec<Event>,
     held_keys: Vec<Event>,
-    emitted: HashMap<Event, Vec<Key>>,
+    emitted: Ledger,
     modifier_was_activated: bool,
     paused: bool,
+    /// The `CHAIN_ONLY` setting: a Hold binding fires only with a modifier held.
+    chain_only: bool,
     /// Every key frame sent, as (code, value), until `take` empties it.
     sent: Vec<(u16, i32)>,
 }
@@ -1059,9 +1147,10 @@ impl Reader {
             config,
             modifiers: vec![],
             held_keys: vec![],
-            emitted: HashMap::new(),
+            emitted: Ledger::new(),
             modifier_was_activated: true,
             paused: false,
+            chain_only: false,
             sent: vec![],
         }
     }
@@ -1100,7 +1189,12 @@ impl Reader {
     }
 
     fn key(&mut self, key: Key, value: i32) {
-        let event = ev(key);
+        self.input(ev(key), value);
+    }
+
+    /// One edge of any input — a button, or an axis bound like one (a trigger,
+    /// a stick direction, a hat).
+    fn input(&mut self, event: Event, value: i32) {
         match held_update(event, value, false) {
             HeldUpdate::Add => {
                 self.held_keys.push(event);
@@ -1110,12 +1204,12 @@ impl Reader {
             HeldUpdate::Remove => self.held_keys.retain(|&k| k != event),
             HeldUpdate::Leave => {}
         }
-        let mut released = Vec::new();
         if releases_emitted(event, value) {
-            if let Some(prev) = self.emitted.remove(&event) {
-                let frames: Vec<_> = prev.iter().map(|k| key_up(*k)).collect();
-                self.send(&frames);
-                released = prev;
+            let plan = ledger::plan_release(&mut self.emitted, event, self.modifier_was_activated);
+            self.modifier_was_activated = plan.modifier_was_activated;
+            self.send(&plan.frames);
+            for (m, v) in plan.toggles {
+                self.toggle(m, v);
             }
         }
 
@@ -1131,11 +1225,8 @@ impl Reader {
         match route.branch {
             Branch::ModifierIntercept { out_keys, emit, .. } => {
                 if emit {
-                    let frames: Vec<_> = out_keys.iter().map(|k| key_at(*k, value)).collect();
+                    let frames = ledger::press(&mut self.emitted, event, &out_keys, value);
                     self.send(&frames);
-                    if value == 1 {
-                        self.emitted.insert(event, out_keys.clone());
-                    }
                 }
                 self.toggle(event, value);
                 return;
@@ -1144,29 +1235,14 @@ impl Reader {
             other => panic!("not modelled here: {other:?}"),
         }
 
-        match crate::resolver::resolve_binding(&config.bindings, event, &modifiers, false) {
+        let resolved = crate::resolver::resolve_binding(
+            &config.bindings, event, &modifiers, self.chain_only,
+        );
+        let (keys, release_keys, ignore_modifiers, no_pause) = match resolved {
             crate::resolver::ResolvedBinding::Keys { keys, no_pause, is_combo, is_fallback, .. } => {
-                let plan = plan_emit(&EmitRequest {
-                    config: &config,
-                    event_list: &keys,
-                    value,
-                    modifiers: &modifiers,
-                    release_keys: !is_combo && !is_fallback,
-                    ignore_modifiers: is_combo,
-                    modifier_was_activated: self.modifier_was_activated,
-                    paused: self.paused,
-                    no_pause,
-                });
-                self.modifier_was_activated = plan.modifier_was_activated;
-                self.send(&skip_released(plan.frames, &released));
-                for (m, v) in plan.toggles {
-                    self.toggle(m, v);
-                }
-                // As the reader does it: after every emit but the release.
-                if value != 0 {
-                    self.emitted.insert(event, keys);
-                }
+                (keys, !is_combo && !is_fallback, is_combo, no_pause)
             }
+            crate::resolver::ResolvedBinding::Hold { keys } => (keys, false, false, false),
             crate::resolver::ResolvedBinding::Unbound => {
                 let live = self.modifiers.clone();
                 match paused_nonmapped(&config, event, &live, self.paused) {
@@ -1177,18 +1253,40 @@ impl Reader {
                     Some(false) => return,
                     None => {}
                 }
-                let default_event = raw(EventType::KEY, key.code(), value);
+                let default_event = match event {
+                    Event::Key(key) => raw(EventType::KEY, key.code(), value),
+                    _ => raw(EventType::ABSOLUTE, 0, value),
+                };
                 let plan = plan_nonmapped(
                     &config, event, &default_event, value, &modifiers,
-                    self.modifier_was_activated,
+                    self.modifier_was_activated, &mut self.emitted,
                 );
                 self.modifier_was_activated = plan.modifier_was_activated;
                 self.send(&plan.frames);
                 for (m, v) in plan.toggles {
                     self.toggle(m, v);
                 }
+                return;
             }
             other => panic!("not modelled here: {other:?}"),
+        };
+        // `emit_event`: the press or repeat; the release was the ledger's above.
+        let plan = plan_emit(&EmitRequest {
+            config: &config,
+            event,
+            event_list: &keys,
+            value,
+            modifiers: &modifiers,
+            release_keys,
+            ignore_modifiers,
+            modifier_was_activated: self.modifier_was_activated,
+            paused: self.paused,
+            no_pause,
+        }, &mut self.emitted);
+        self.modifier_was_activated = plan.modifier_was_activated;
+        self.send(&plan.frames);
+        for (m, v) in plan.toggles {
+            self.toggle(m, v);
         }
     }
 
@@ -1204,10 +1302,9 @@ impl Reader {
     fn pause(&mut self) {
         self.paused = true;
         let plan = plan_pause(
-            &self.emitted, &self.modifiers,
+            &mut self.emitted, &self.modifiers,
             &self.config.mapped_modifiers.custom, self.modifier_was_activated,
         );
-        self.emitted.clear();
         self.modifier_was_activated = plan.modifier_was_activated;
         self.send(&plan.frames);
     }
@@ -1333,17 +1430,15 @@ fn a_modifier_only_held_across_a_pause_does_not_tap() {
 #[test]
 fn a_pause_without_a_held_modifier_leaves_the_flag_alone() {
     let config = layered_config();
-    let plan = plan_pause(&HashMap::new(), &[], &config.mapped_modifiers.custom, false);
+    let plan = plan_pause(&mut Ledger::new(), &[], &config.mapped_modifiers.custom, false);
     assert!(!plan.modifier_was_activated);
     assert!(plan.frames.is_empty());
 }
 
 /// L4 → Shift held across the pause: Shift goes up at the pause and stays up —
-/// resume does not press it again. Letting go of L4 afterwards sends only a
-/// release, and only one: `emitted_outputs` no longer holds L4, so the reader's
-/// cleanup sends nothing and only the binding's own release goes out (which is
-/// for a key already up). An ordinary release sends one as well: the cleanup's,
-/// with the binding's repeat of it dropped.
+/// resume does not press it again. Letting go of L4 afterwards sends nothing:
+/// the pause lifted Shift and the ledger forgot it, and a release sends only
+/// what is recorded. An ordinary release sends exactly one key-up.
 #[test]
 fn a_remapped_key_held_across_a_pause_stays_released() {
     let shift = Key::KEY_LEFTSHIFT.code();
@@ -1359,9 +1454,7 @@ fn a_remapped_key_held_across_a_pause_stays_released() {
     assert_eq!(r.take(), vec![], "resume pressed Shift again");
 
     r.release(L4);
-    let sent = r.take();
-    assert!(sent.iter().all(|&(_, v)| v == 0), "a release pressed something: {sent:?}");
-    assert_eq!(sent, vec![(shift, 0)], "the cleanup released Shift a second time");
+    assert_eq!(r.take(), vec![], "Shift went up a second time");
     assert!(r.held_keys.is_empty());
 
     // For comparison, the same release with no pause in between.
@@ -1391,27 +1484,6 @@ fn a_pause_still_releases_everything_emitted() {
     assert_eq!(sent, expected);
     assert!(r.emitted.is_empty());
     assert_eq!(r.modifiers, vec![ev(L1)]);
-}
-
-/// `release_emitted` on its own: one key-up per recorded output key.
-#[test]
-fn release_emitted_releases_every_recorded_key() {
-    let mut emitted = HashMap::new();
-    emitted.insert(ev(Key::BTN_SOUTH), vec![Key::KEY_LEFTCTRL, Key::KEY_C]);
-    emitted.insert(ev(Key::BTN_EAST), vec![Key::KEY_A]);
-    let mut codes: Vec<_> = release_emitted(&emitted)
-        .iter()
-        .map(|a| match a {
-            OutputAction::Frame { events, .. } => (events[0].code, events[0].value),
-            other => panic!("not a frame: {other:?}"),
-        })
-        .collect();
-    codes.sort();
-    let mut expected = vec![
-        (Key::KEY_LEFTCTRL.code(), 0), (Key::KEY_C.code(), 0), (Key::KEY_A.code(), 0),
-    ];
-    expected.sort();
-    assert_eq!(codes, expected);
 }
 
 /// The paused branch for unbound events, now decided in the machine: a
@@ -1462,9 +1534,8 @@ fn a_resume_without_a_held_modifier_leaves_the_flag_alone() {
     assert!(resume_modifier_was_activated(&[ev(STEAM)], custom, false));
 }
 
-/// A plain remap, pressed and released: one key-down, one key-up. The reader's
-/// cleanup releases what the press emitted, and the binding's own release must
-/// not send the same key-up a second time. Nothing stays recorded as emitted
+/// A plain remap, pressed and released: one key-down, one key-up. The ledger
+/// releases what the press recorded, and nothing else sends a key-up for it. Nothing stays recorded as emitted
 /// either, or the next pause would release the key yet again.
 #[test]
 fn a_plain_remap_release_sends_one_key_up() {
@@ -1500,19 +1571,105 @@ fn a_combo_release_with_a_held_modifier_sends_one_key_up_each() {
     assert_eq!(r.modifiers, vec![ev(L1)], "L1 is still held");
 }
 
-/// `skip_released` on its own: a key-up for a key the cleanup already released
-/// is dropped, unless the frames press it again first (a tap's release is a
-/// release of its own), and everything else is left as it is.
+// ── one owner for every key-up: the ledger ────────────────────────────────
+
+/// Sorted, so a test about a set of key-ups does not depend on map order.
+fn sorted(mut sent: Vec<(u16, i32)>) -> Vec<(u16, i32)> {
+    sent.sort();
+    sent
+}
+
+/// A Hold binding fires while a modifier is held. Letting go of the modifier
+/// first and the button second must still release what the Hold pressed: with
+/// the modifier gone the button no longer resolves to the Hold, so only what
+/// the press recorded can say which key is down.
 #[test]
-fn skip_released_drops_only_repeated_key_ups() {
-    let a = Key::KEY_A;
-    let b = Key::KEY_B;
-    let frames = vec![key_up(a), key_up(b)];
-    assert_eq!(skip_released(frames, &[a]), vec![key_up(b)]);
+fn a_hold_binding_released_after_its_modifier_goes_up() {
+    let enter = Key::KEY_ENTER.code();
+    let south = Key::BTN_SOUTH;
+    let mut config = layered_config();
+    config
+        .bindings
+        .remap
+        .entry(ev(south))
+        .or_default()
+        .insert(vec![Event::Hold], vec![Key::KEY_ENTER]);
+    let mut r = Reader::new(config);
+    r.chain_only = true;
 
-    let tap = vec![key_up(a), key_at(a, 1), key_up(a)];
-    assert_eq!(skip_released(tap, &[a]), vec![key_at(a, 1), key_up(a)]);
+    r.press(L1);
+    r.press(south);
+    assert_eq!(r.take(), vec![(enter, 1)], "precondition: the Hold fired");
+    r.release(L1);
+    r.take();
+    r.release(south);
+    assert_eq!(r.take(), vec![(enter, 0)], "Enter stayed down");
+    assert!(r.emitted.is_empty());
+}
 
-    let untouched = vec![key_at(a, 1), key_up(b)];
-    assert_eq!(skip_released(untouched.clone(), &[]), untouched);
+/// A button with no binding is passed through, and a pause releases it like
+/// anything else makima holds down. Its release during the pause, and the
+/// resume, send nothing more.
+#[test]
+fn a_passthrough_key_held_across_a_pause_goes_up_once() {
+    let south = Key::BTN_SOUTH;
+    let mut r = Reader::new(layered_config());
+    r.press(south);
+    assert_eq!(r.take(), vec![(south.code(), 1)], "precondition: passed through");
+
+    r.pause();
+    assert_eq!(r.take(), vec![(south.code(), 0)], "the pause left it down");
+    r.release(south);
+    assert_eq!(r.take(), vec![], "the release during the pause sent something");
+    r.resume();
+    assert_eq!(r.take(), vec![], "resume sent something");
+
+    // Without a pause: one key-down, one key-up.
+    r.press(south);
+    r.release(south);
+    assert_eq!(r.take(), vec![(south.code(), 1), (south.code(), 0)]);
+    assert!(r.emitted.is_empty());
+}
+
+/// Issue #63: a key bound to an axis edge — a trigger here, a stick direction
+/// or a hat alike — is held down like any button's, so a pause has to release
+/// it too.
+#[test]
+fn an_axis_bound_key_held_across_a_pause_goes_up() {
+    let space = Key::KEY_SPACE.code();
+    let trigger = Event::Axis(Axis::ABS_Z);
+    let mut config = layered_config();
+    config.bindings.remap.entry(trigger).or_default().insert(vec![], vec![Key::KEY_SPACE]);
+    let mut r = Reader::new(config);
+
+    r.input(trigger, 1);
+    assert_eq!(r.take(), vec![(space, 1)]);
+    r.pause();
+    assert_eq!(r.take(), vec![(space, 0)], "the pause left Space down");
+    r.input(trigger, 0);
+    r.resume();
+    assert_eq!(r.take(), vec![], "Space went up twice");
+
+    // Without a pause: one key-up at the release.
+    r.input(trigger, 1);
+    r.input(trigger, 0);
+    assert_eq!(r.take(), vec![(space, 1), (space, 0)]);
+    assert!(r.emitted.is_empty());
+}
+
+/// L1 + X is Ctrl+C. Letting go of L1 first changes what X resolves to (plain
+/// X), but the release of X has to release what was pressed — Ctrl and C — and
+/// nothing else: no key-up for an X that never went down.
+#[test]
+fn a_resolution_change_mid_hold_sends_no_stray_key_up() {
+    let ctrl = Key::KEY_LEFTCTRL.code();
+    let c = Key::KEY_C.code();
+    let mut r = Reader::new(layered_config());
+    r.press(L1);
+    r.press(X);
+    assert_eq!(r.take(), vec![(ctrl, 1), (c, 1)]);
+    r.release(L1);
+    assert_eq!(r.take(), vec![]);
+    r.release(X);
+    assert_eq!(sorted(r.take()), sorted(vec![(ctrl, 0), (c, 0)]));
 }

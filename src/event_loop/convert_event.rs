@@ -41,17 +41,12 @@ impl EventReader {
             crate::machine::HeldUpdate::Leave => {}
         }
 
-        // What the cleanup released, so the binding's own release below does not
-        // send the same key-ups again.
-        let mut released: Vec<Key> = Vec::new();
+        // The only key-ups a release sends: what its press recorded. Nothing
+        // below sends one for it, so a branch that returns early, a pause that
+        // swallows the event, or a binding that has changed since cannot leave a
+        // key down or send one for a key that never went down.
         if crate::machine::releases_emitted(event, value) {
-            let prev_keys = self.emitted_outputs.lock().await.remove(&event);
-            if let Some(prev_keys) = prev_keys {
-                let frames: Vec<_> =
-                    prev_keys.iter().map(|key| crate::machine::key_up(*key)).collect();
-                self.apply_frames(&frames).await;
-                released = prev_keys;
-            }
+            self.release_recorded(event).await;
         }
 
         // A press may be the one that changed the focused window, so the config
@@ -93,14 +88,10 @@ impl EventReader {
             }
             crate::machine::Branch::ModifierIntercept { out_keys, emit, announce } => {
                 if emit {
-                    let frames: Vec<_> = out_keys
-                        .iter()
-                        .map(|key| crate::machine::key_at(*key, value))
-                        .collect();
+                    let frames = crate::ledger::press(
+                        &mut *self.emitted_outputs.lock().await, event, &out_keys, value,
+                    );
                     self.apply_frames(&frames).await;
-                    if value == 1 {
-                        self.store_emitted_outputs(&event, &out_keys).await;
-                    }
                 }
                 if announce {
                     let hint = if value == 1 { self.hint_label(&event).await } else { None };
@@ -150,23 +141,16 @@ impl EventReader {
                     self.outputs.dispatch(&actions).await;
                 }
                 self.write_state().await;
-                self.emit_event(&keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause, &released).await;
+                self.emit_event(event, &keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
                 if send_zero {
-                    let mut modifiers = self.modifiers.lock().await.clone();
-                    modifiers.sort();
-                    modifiers.dedup();
-                    self.emit_event(&keys, 0, &modifiers, &config, release_keys, ignore_modifiers, no_pause, &released).await;
-                }
-                // Not on the release: the cleanup above has just emptied the
-                // entry, and putting it back would leave keys that are up
-                // recorded as down for the next pause or release to send again.
-                if value != 0 {
-                    self.store_emitted_outputs(&event, &keys).await;
+                    // A scroll notch is a press with no release edge of its
+                    // own, so it is released at once, from what it recorded.
+                    self.release_recorded(event).await;
                 }
                 return;
             }
             ResolvedBinding::Hold { keys } => {
-                self.emit_event(&keys, value, &modifiers, &config, false, false, false, &released).await;
+                self.emit_event(event, &keys, value, &modifiers, &config, false, false, false).await;
                 return;
             }
             ResolvedBinding::Command { commands, label, no_pause, while_gaming: _, silent, haptic, .. } => {
@@ -225,7 +209,27 @@ impl EventReader {
         self.outputs.dispatch(actions).await;
     }
 
-    /// Emit what a resolved key binding amounts to.
+    /// Release what `event`'s press recorded — `ledger::plan_release` — and
+    /// apply the release's own bookkeeping.
+    pub(super) async fn release_recorded(&self, event: Event) {
+        let plan = {
+            let mut ledger = self.emitted_outputs.lock().await;
+            let mut modifier_was_activated = self.modifier_was_activated.lock().await;
+            let plan = crate::ledger::plan_release(&mut ledger, event, *modifier_was_activated);
+            *modifier_was_activated = plan.modifier_was_activated;
+            plan
+        };
+        self.apply_frames(&plan.frames).await;
+        if !plan.toggles.is_empty() {
+            let config = self.current_config.lock().await.clone();
+            for (modifier, value) in plan.toggles {
+                self.toggle_modifiers(modifier, value, &config).await;
+            }
+        }
+    }
+
+    /// Emit what a resolved key binding's press or repeat amounts to; its
+    /// release is `release_recorded`.
     ///
     /// The decision is `machine::plan_emit`, which is pure and tested; this
     /// applies it. The two used to be one interleaved loop — read state, mutate
@@ -240,6 +244,7 @@ impl EventReader {
     /// them. Only the overlay sees that, and only as timing.
     pub(super) async fn emit_event(
         &self,
+        event: Event,
         event_list: &Vec<Key>,
         value: i32,
         modifiers: &Vec<Event>,
@@ -247,14 +252,18 @@ impl EventReader {
         release_keys: bool,
         ignore_modifiers: bool,
         no_pause: bool,
-        already_released: &[Key],
     ) {
+        if value == 0 {
+            return;
+        }
         let paused = *self.paused.lock().await;
 
         let plan = {
+            let mut ledger = self.emitted_outputs.lock().await;
             let mut modifier_was_activated = self.modifier_was_activated.lock().await;
             let plan = crate::machine::plan_emit(&crate::machine::EmitRequest {
                 config,
+                event,
                 event_list,
                 value,
                 modifiers,
@@ -263,13 +272,12 @@ impl EventReader {
                 modifier_was_activated: *modifier_was_activated,
                 paused,
                 no_pause,
-            });
+            }, &mut ledger);
             *modifier_was_activated = plan.modifier_was_activated;
             plan
         };
 
-        let frames = crate::machine::skip_released(plan.frames, already_released);
-        self.apply_frames(&frames).await;
+        self.apply_frames(&plan.frames).await;
 
         for (modifier, value) in plan.toggles {
             self.toggle_modifiers(modifier, value, config).await;
@@ -308,9 +316,11 @@ impl EventReader {
         }
         // Passthrough keys are held state — last_action is only for combos and commands.
         let plan = {
+            let mut ledger = self.emitted_outputs.lock().await;
             let mut modifier_was_activated = self.modifier_was_activated.lock().await;
             let plan = crate::machine::plan_nonmapped(
                 config, event, &default_event, value, modifiers, *modifier_was_activated,
+                &mut ledger,
             );
             *modifier_was_activated = plan.modifier_was_activated;
             plan

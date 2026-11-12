@@ -92,11 +92,9 @@ pub struct EventReader {
     gaming_mode: Arc<Mutex<bool>>,
     last_action: Arc<Mutex<Option<LastAction>>>,
     held_keys: Arc<Mutex<Vec<Event>>>,
-    /// Maps each currently held physical button to the output keys it last emitted.
-    /// On key-up (value=0), every stored output key for this button is released,
-    /// ensuring that base-remap outputs (e.g. KEY_F10) are always cleaned up even
-    /// when a mid-hold modifier change (e.g. R1) switched the resolution to a combo.
-    emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>>,
+    /// The ledger: every output key makima holds down, against the input that
+    /// pressed it. The only source of key-ups — see `crate::ledger`.
+    emitted_outputs: Arc<Mutex<crate::ledger::Ledger>>,
     device_is_connected: Arc<Mutex<bool>>,
     /// Held as an `Arc` because it is cloned out of the mutex on every event so
     /// the lock is not carried into the conversion — a deep copy there would put
@@ -176,7 +174,7 @@ impl EventReader {
         let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
         let (state_write_tx, state_write_rx) = mpsc::channel(8);
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
-        let emitted_outputs: Arc<Mutex<HashMap<Event, Vec<Key>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let emitted_outputs: Arc<Mutex<crate::ledger::Ledger>> = Arc::new(Mutex::new(HashMap::new()));
         let current_config: Arc<Mutex<Arc<Config>>> =
             Arc::new(Mutex::new(Arc::new(base_config.clone())));
 
@@ -373,19 +371,20 @@ impl EventReader {
     /// makima holds down, and keep what the user is still holding.
     ///
     /// The decision is `machine::plan_pause`, see there for why `modifiers` and
-    /// `held_keys` survive (issue #62). Only `emitted_outputs` is emptied, and
-    /// `modifier_was_activated` is set when a custom modifier is held across.
+    /// `held_keys` survive (issue #62). Only the keys in the ledger are
+    /// released, and `modifier_was_activated` is set when a custom modifier is
+    /// held across.
     async fn pause_release_outputs(&self) {
-        // One lock at a time, so this never holds two of them in an order
-        // another task might take them in. The frames go out after every lock
-        // is dropped, so the device port is held for them alone.
+        // The ledger before `modifier_was_activated`, the order every planner
+        // call takes them in. The frames go out after every lock is dropped, so
+        // the device port is held for them alone.
         let config = self.current_config.lock().await.clone();
         let modifiers = self.modifiers.lock().await.clone();
-        let emitted = std::mem::take(&mut *self.emitted_outputs.lock().await);
         let plan = {
+            let mut ledger = self.emitted_outputs.lock().await;
             let mut activated = self.modifier_was_activated.lock().await;
             let plan = crate::machine::plan_pause(
-                &emitted, &modifiers, &config.mapped_modifiers.custom, *activated,
+                &mut ledger, &modifiers, &config.mapped_modifiers.custom, *activated,
             );
             *activated = plan.modifier_was_activated;
             plan
@@ -421,9 +420,9 @@ impl EventReader {
         // Collected before anything is sent, so the device port is held for the
         // frames alone rather than across the three locks below.
         let frames = {
-            let mut eo = self.emitted_outputs.lock().await;
-            let frames = crate::machine::release_emitted(&eo);
-            eo.clear();
+            let mut ledger = self.emitted_outputs.lock().await;
+            let frames = crate::ledger::release_all(&mut ledger);
+            ledger.clear();
             frames
         };
         self.apply_frames(&frames).await;
@@ -487,20 +486,11 @@ impl EventReader {
         self.write_state().await;
     }
 
-    /// Store emitted output keys for a physical button so they can be released
-    /// in full on key-up, even if a mid-hold modifier change switched the resolution.
-    async fn store_emitted_outputs(&self, event: &Event, keys: &[Key]) {
-        if let Event::Key(_) = event {
-            self.emitted_outputs.lock().await.insert(*event, keys.to_vec());
-        }
-    }
-
-
 }
 
 // No test module. What was testable here lives in `machine.rs` now, and what
 // was left were five tests that built a local HashMap, inserted, removed and
 // asserted HashMap semantics — no production code in any of them. The behaviour
 // they meant to pin, that a release clears what its press emitted even when a
-// combo overwrote it mid-hold, is covered by `machine::releases_emitted` and
-// the key-up frames it produces.
+// combo overwrote it mid-hold, is covered by `ledger::plan_release` and the
+// sequences in `machine_tests.rs`.

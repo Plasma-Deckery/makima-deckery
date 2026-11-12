@@ -23,6 +23,7 @@
 //! its own justification rather than a remainder of this one.
 
 use crate::config::{Axis, Config, Event};
+use crate::ledger::{self, Ledger, Pressed};
 use crate::output::action::{
     Ev, InternalCommand, LastActionSpec, OutputAction, OutputDevice, Raw, StateAction,
 };
@@ -52,9 +53,6 @@ fn key_frame(code: u16, value: i32) -> OutputAction {
 }
 
 /// One key at a given value, as a frame.
-///
-/// The three cleanup paths in the reader all amount to this, and all three used
-/// to spell out the same `InputEvent::new_now` by hand.
 pub fn key_at(key: Key, value: i32) -> OutputAction {
     key_frame(key.code(), value)
 }
@@ -115,6 +113,9 @@ pub fn binding_haptic(
 /// is an invitation to pass them in the wrong order with nothing to notice it.
 pub struct EmitRequest<'a> {
     pub config: &'a Config,
+    /// The input the binding belongs to, which is what its press is recorded
+    /// against in the ledger.
+    pub event: Event,
     /// The output keys the binding resolved to.
     pub event_list: &'a [Key],
     pub value: i32,
@@ -131,14 +132,16 @@ pub struct EmitRequest<'a> {
     pub no_pause: bool,
 }
 
-/// Decide what `emit_event` sends, without sending it.
+/// Decide what a key binding's press or repeat sends, without sending it, and
+/// record the press in the ledger.
 ///
-/// Mirrors the three branches of the existing function exactly, including the
-/// order the frames go out in — a plan that agreed about the set but not the
-/// sequence would be agreeing about something the kernel does not see.
-pub fn plan_emit(req: &EmitRequest) -> EmitPlan {
+/// A release is not decided here: it is `ledger::plan_release`, from what the
+/// press recorded, whatever the button resolves to by then. So a value of 0
+/// plans nothing. The key-ups this does send — the cleanup before a press —
+/// also come from the ledger, and only for keys that are actually down.
+pub fn plan_emit(req: &EmitRequest, ledger: &mut Ledger) -> EmitPlan {
     let EmitRequest {
-        config, event_list, value, modifiers,
+        config, event, event_list, value, modifiers,
         release_keys, ignore_modifiers, modifier_was_activated, paused, no_pause,
     } = *req;
     let mut plan = EmitPlan {
@@ -146,9 +149,9 @@ pub fn plan_emit(req: &EmitRequest) -> EmitPlan {
         toggles: Vec::new(),
         modifier_was_activated,
     };
-    if !fires_while_paused(paused, no_pause) {
-        // Nothing at all, not even the bookkeeping: the press never happened as
-        // far as the rest of the system is concerned.
+    if value == 0 || !fires_while_paused(paused, no_pause) {
+        // Paused: nothing at all, not even the bookkeeping — the press never
+        // happened as far as the rest of the system is concerned.
         return plan;
     }
 
@@ -157,54 +160,54 @@ pub fn plan_emit(req: &EmitRequest) -> EmitPlan {
         // that are modifiers themselves. With no modifiers held there is nothing
         // to clean up, and releasing everything would knock out a system modifier
         // that merely shares a key code with a base remap output.
-        for key in released_keys(modifiers, config) {
-            if config.mapped_modifiers.all.contains(&Event::Key(key)) {
-                plan.toggles.push((Event::Key(key), 0));
-                plan.frames.push(key_frame(key.code(), 0));
-            }
-        }
+        let keys: Vec<Key> = released_keys(modifiers, config)
+            .into_iter()
+            .filter(|key| config.mapped_modifiers.all.contains(&Event::Key(*key)))
+            .collect();
+        plan.toggles.extend(keys.iter().map(|key| (Event::Key(*key), 0)));
+        plan.frames.extend(ledger::release_keys(ledger, &keys));
     } else if ignore_modifiers {
         // An explicit combo consumed its modifier, so the modifier's *output* key
         // is released before the combo's keys go out — not the raw input code.
         for modifier in modifiers {
-            let codes: Vec<u16> = config
+            let keys: Vec<Key> = config
                 .bindings
                 .remap
                 .get(modifier)
                 .and_then(|m| m.get(&vec![]))
-                .map(|keys| keys.iter().map(|k| k.code()).collect())
+                .cloned()
                 .unwrap_or_else(|| match modifier {
-                    Event::Key(k) => vec![k.code()],
+                    Event::Key(k) => vec![*k],
                     _ => vec![],
                 });
-            for code in codes {
-                plan.frames.push(key_frame(code, 0));
-            }
+            plan.frames.extend(ledger::release_keys(ledger, &keys));
         }
     }
 
+    let mut pressed = Pressed { tracked: release_keys, ..Default::default() };
     for key in event_list {
-        if release_keys && value != 2 && config.mapped_modifiers.custom.contains(&Event::Key(*key))
-        {
-            // Only custom modifiers are tracked. Tracking a system modifier that
-            // appears as a remap output would corrupt the set and break the next
-            // combo lookup.
-            plan.toggles.push((Event::Key(*key), value));
-        }
         if config.mapped_modifiers.custom.contains(&Event::Key(*key)) {
-            if value == 0 && !plan.modifier_was_activated {
-                // Held and released without being used as a modifier, so it acts
-                // as a tap: press and release, two frames, not one.
-                plan.frames.push(key_frame(key.code(), 1));
-                plan.frames.push(key_frame(key.code(), 0));
-                plan.modifier_was_activated = true;
-            } else if value == 1 {
+            if release_keys && value != 2 {
+                // Only custom modifiers are tracked. Tracking a system modifier
+                // that appears as a remap output would corrupt the set and break
+                // the next combo lookup.
+                plan.toggles.push((Event::Key(*key), value));
+            }
+            if value == 1 {
+                // Armed, not pressed: its release taps it if nothing used it.
                 plan.modifier_was_activated = false;
+                pressed.armed.push(*key);
             }
         } else {
             plan.frames.push(key_frame(key.code(), value));
             plan.modifier_was_activated = true;
+            if value == 1 {
+                pressed.keys.push(*key);
+            }
         }
+    }
+    if value == 1 {
+        ledger::record(ledger, event, pressed);
     }
 
     plan
@@ -307,47 +310,12 @@ pub fn gaming_mode_toggle(enabled: bool, preview: bool) -> Vec<OutputAction> {
 /// What a pause amounts to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PausePlan {
-    /// One key-up for every output key a held button is down on. The caller
-    /// empties `emitted_outputs` along with sending them: nothing makima emitted
-    /// is down any more, so nothing is left to release when the button comes up.
+    /// One key-up for every output key a held button is down on, which the
+    /// ledger forgets along with them: nothing makima emitted is down any more,
+    /// so nothing is left to release when the button comes up.
     pub frames: Vec<OutputAction>,
     /// `modifier_was_activated` after the pause.
     pub modifier_was_activated: bool,
-}
-
-/// Key-ups for everything in `emitted_outputs`.
-///
-/// Shared by a pause and by a full reset: both have to leave nothing stuck in
-/// whatever reads the virtual devices next. The order is the map's, which is
-/// arbitrary — every frame is a release, so no order means anything here.
-pub fn release_emitted(emitted_outputs: &std::collections::HashMap<Event, Vec<Key>>) -> Vec<OutputAction> {
-    emitted_outputs.values().flatten().map(|key| key_up(*key)).collect()
-}
-
-/// `frames` without the key-ups the release cleanup has already sent.
-///
-/// A release goes out twice otherwise: the reader's cleanup releases what the
-/// press emitted, and then the binding's own release (`plan_emit` at value 0)
-/// releases the same keys again. The cleanup stays first, because it is what
-/// matches the key-down when the resolution changed mid-hold; this drops only
-/// the repeat. A key the frames press again first (a tap) gets its release.
-pub fn skip_released(frames: Vec<OutputAction>, already_released: &[Key]) -> Vec<OutputAction> {
-    let mut up: Vec<u16> = already_released.iter().map(|k| k.code()).collect();
-    frames
-        .into_iter()
-        .filter(|frame| match frame {
-            OutputAction::Frame { device: OutputDevice::Keys, events } if events.len() == 1 => {
-                let Ev { code, value, .. } = events[0];
-                if value == 0 {
-                    !up.contains(&code)
-                } else {
-                    up.retain(|&c| c != code);
-                    true
-                }
-            }
-            _ => true,
-        })
-        .collect()
 }
 
 /// Decide what the IPC `pause` does (issue #62).
@@ -371,13 +339,13 @@ pub fn skip_released(frames: Vec<OutputAction>, already_released: &[Key]) -> Vec
 /// must not turn into the unused-modifier tap (QAM or Steam opening Steam's
 /// menus, for instance).
 pub fn plan_pause(
-    emitted_outputs: &std::collections::HashMap<Event, Vec<Key>>,
+    ledger: &mut Ledger,
     modifiers: &[Event],
     custom_modifiers: &[Event],
     modifier_was_activated: bool,
 ) -> PausePlan {
     PausePlan {
-        frames: release_emitted(emitted_outputs),
+        frames: ledger::release_all(ledger),
         modifier_was_activated: held_modifier_counts_as_used(
             modifiers, custom_modifiers, modifier_was_activated,
         ),
@@ -486,12 +454,13 @@ pub fn held_update(event: Event, value: i32, gaming_mode: bool) -> HeldUpdate {
     }
 }
 
-/// Whether this event releases whatever the button emitted last time.
+/// Whether this event releases whatever its press recorded in the ledger.
 ///
-/// Every release does, whatever the button resolves to now — the resolution can
-/// have changed while it was held, and the key-up has to match the key-down.
-pub fn releases_emitted(event: Event, value: i32) -> bool {
-    value == 0 && matches!(event, Event::Key(_))
+/// Every release does, a button's or an axis edge's, whatever it resolves to
+/// now — the resolution can have changed while it was held, and the key-up has
+/// to match the key-down.
+pub fn releases_emitted(_event: Event, value: i32) -> bool {
+    value == 0
 }
 
 /// What to do with one event, decided before any of it is done.
@@ -600,8 +569,12 @@ pub struct NonmappedPlan {
 /// Decide what an event with no binding of its own amounts to.
 ///
 /// This is the `Unbound` tail of the resolver: the event is passed through, but
-/// first any modifier output the held set resolves to is released, and a custom
-/// modifier released unused is turned into a tap instead.
+/// first any modifier output the held set resolves to is released (if it is
+/// down), and a custom modifier released unused is turned into a tap instead.
+///
+/// A passed-through key's press is recorded in the ledger like any other, and
+/// its release is the ledger's too, so it is not forwarded here: a pause lifts
+/// it, and a release swallowed by the pause cannot leave it down.
 ///
 /// One quirk is preserved rather than corrected: the tap is synthesised from
 /// `default_event`'s type and code but always goes to the keyboard device, even
@@ -614,6 +587,7 @@ pub fn plan_nonmapped(
     value: i32,
     modifiers: &[Event],
     modifier_was_activated: bool,
+    ledger: &mut Ledger,
 ) -> NonmappedPlan {
     let mut plan = NonmappedPlan {
         frames: Vec::new(),
@@ -622,10 +596,9 @@ pub fn plan_nonmapped(
     };
 
     if config.mapped_modifiers.all.contains(&event) && value != 2 {
-        for key in released_keys(modifiers, config) {
-            plan.toggles.push((Event::Key(key), 0));
-            plan.frames.push(key_frame(key.code(), 0));
-        }
+        let keys = released_keys(modifiers, config);
+        plan.toggles.extend(keys.iter().map(|key| (Event::Key(*key), 0)));
+        plan.frames.extend(ledger::release_keys(ledger, &keys));
     }
     // Always, and after the released keys — the event's own tracking does not
     // depend on them and they do not depend on it.
@@ -641,6 +614,14 @@ pub fn plan_nonmapped(
         }
     } else {
         plan.modifier_was_activated = true;
+        let is_key = default_event.event_type() == EventType::KEY;
+        if is_key && value == 0 {
+            return plan;
+        }
+        if is_key && value == 1 {
+            let pressed = Pressed { keys: vec![Key(default_event.code())], ..Default::default() };
+            ledger::record(ledger, event, pressed);
+        }
         if let Some(device) = device_for(default_event.event_type()) {
             plan.frames.push(OutputAction::Forward {
                 device,
