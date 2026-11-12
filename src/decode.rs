@@ -44,16 +44,15 @@ pub fn key_event(key: Key, left_has_handler: bool, right_has_handler: bool) -> O
 ///
 /// Mirrors `decode_stick_bind` for an axis that only ever reports -1, 0 or 1:
 /// -1 and 1 press a direction, 0 releases whichever one was held, and any
-/// other value is not a hat value at all and changes nothing. Unlike a stick,
+/// other value is not a hat value at all and changes nothing. Going straight
+/// from one direction to the other releases the old one first. Unlike a stick,
 /// a press is sent again if the same direction arrives twice — that is how the
 /// reader always behaved, and hats do not repeat a value on their own.
 ///
-/// The Deck's own D-pad never comes through here — it arrives as key edges, see
-/// `key_event`. What does come through, whenever no handler owns the left
-/// pad, is the *left pad's* coordinates, because the Deck reports
-/// them on ABS_HAT0X/Y, the codes a hat switch uses. A coordinate of exactly -1
-/// or 1 therefore decodes as a D-pad press. That is inherited from upstream and
-/// kept as it is; whether it goes is the maintainer's decision.
+/// Only for an evdev-class controller with a real hat switch. A Steam Deck
+/// never comes through here: its D-pad arrives as key edges (see `key_event`),
+/// and the ABS_HAT0X/Y it reports are the left pad's coordinates, which the
+/// reader swallows.
 pub fn decode_hat(is_x: bool, value: i32, held: i32) -> (Vec<(Axis, i32)>, i32) {
     let (negative, positive) = if is_x {
         (Axis::BTN_DPAD_LEFT, Axis::BTN_DPAD_RIGHT)
@@ -61,6 +60,8 @@ pub fn decode_hat(is_x: bool, value: i32, held: i32) -> (Vec<(Axis, i32)>, i32) 
         (Axis::BTN_DPAD_UP, Axis::BTN_DPAD_DOWN)
     };
     match value {
+        -1 if held == 1 => (vec![(positive, 0), (negative, 1)], -1),
+        1 if held == -1 => (vec![(negative, 0), (positive, 1)], 1),
         -1 => (vec![(negative, 1)], -1),
         1 => (vec![(positive, 1)], 1),
         0 => {

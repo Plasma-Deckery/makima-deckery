@@ -112,7 +112,7 @@ fn a_hat_at_rest_sends_nothing() {
 }
 
 /// Anything other than -1, 0 or 1 is not a hat value and leaves the held
-/// direction alone. On a Deck this is almost every left-pad coordinate.
+/// direction alone.
 #[test]
 fn a_value_that_is_not_a_hat_value_changes_nothing() {
     assert_eq!(decode_hat(true, 12000, 1), (vec![], 1));
@@ -121,11 +121,8 @@ fn a_value_that_is_not_a_hat_value_changes_nothing() {
 }
 
 /// Going straight from one direction to the other without passing centre
-/// presses the new one and forgets the old one, which then never gets its
-/// release and stays held. A real hat switch reports 0 in between; the Deck's
-/// left pad, which feeds this when it is not a trackpad, does not.
+/// releases the old one before pressing the new one, so it cannot stay held.
 #[test]
-#[ignore = "bug: reversing a hat without passing 0 leaves the old direction held (no release sent)"]
 fn reversing_a_hat_releases_the_old_direction() {
     let (events, held) = decode_hat(true, 1, -1);
     assert_eq!(held, 1);
