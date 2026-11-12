@@ -581,5 +581,5 @@ pub fn build_state(
 
 
 #[cfg(test)]
-#[path = "state_export_tests.rs"]
+#[path = "state_export_tests/mod.rs"]
 mod tests;

@@ -1283,5 +1283,5 @@ fn report_device_conflicts(entries: &mut HashMap<String, ConfigEntry>) {
 }
 
 #[cfg(test)]
-#[path = "config_registry_tests.rs"]
+#[path = "config_registry_tests/mod.rs"]
 mod tests;
