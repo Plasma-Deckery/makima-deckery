@@ -195,3 +195,7 @@ impl Preferences {
         self.groups.disabled.sort();
     }
 }
+
+#[cfg(test)]
+#[path = "preferences_tests.rs"]
+mod tests;

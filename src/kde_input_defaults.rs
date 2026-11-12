@@ -206,8 +206,18 @@ pub fn ensure_kde_input_defaults(
             return;
         }
     };
+    write_kde_input_defaults_to(&path, left, right, gesture);
+}
 
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+/// The file-writing half of `ensure_kde_input_defaults`, split off so tests can
+/// point it at a throwaway file instead of the user's real kcminputrc.
+fn write_kde_input_defaults_to(
+    path: &std::path::Path,
+    left: &PadKdeConfig,
+    right: &PadKdeConfig,
+    gesture: &GestureKdeConfig,
+) {
+    let existing = fs::read_to_string(path).unwrap_or_default();
     let mut new_content = remove_deckery_sections(&existing);
 
     write_pad_section(&mut new_content, "Deckery Left Trackpad", left);
@@ -216,8 +226,12 @@ pub fn ensure_kde_input_defaults(
 
     new_content.push('\n');
 
-    match fs::write(&path, &new_content) {
+    match fs::write(path, &new_content) {
         Ok(_) => {}
         Err(e) => eprintln!("[makima] Warning: could not write kcminputrc ({}); libinput defaults may not apply.", e),
     }
 }
+
+#[cfg(test)]
+#[path = "kde_input_defaults_tests.rs"]
+mod tests;

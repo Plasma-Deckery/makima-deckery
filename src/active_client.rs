@@ -16,6 +16,18 @@ fn match_class(class: String, modules: &[Config]) -> Client {
     }
 }
 
+/// Extracts the class part of an X11 `WM_CLASS` property value.
+///
+/// The property holds two NUL-terminated strings, instance then class
+/// (`"konsole\0Konsole\0"`). Only the class is matched against modules.
+/// Returns `None` when there is no separator or the class is not UTF-8.
+fn wm_class_name(bytes: &[u8]) -> Option<String> {
+    let middle = bytes.iter().position(|&b| b == 0)?;
+    let rest = &bytes[middle + 1..];
+    let rest = rest.strip_suffix(&[0]).unwrap_or(rest);
+    std::str::from_utf8(rest).ok().map(str::to_string)
+}
+
 pub async fn get_active_window(environment: &Environment, modules: &[Config]) -> Client {
     match &environment.server {
         Server::Connected(server) => {
@@ -124,16 +136,9 @@ pub async fn get_active_window(environment: &Environment, modules: &[Config]) ->
                         },
                         Err(_) => return Client::Default,
                     };
-                    let bytes = class_reply.value;
-                    if let Some(middle) = bytes.iter().position(|&b| b == 0) {
-                        let rest = &bytes[middle + 1..];
-                        let rest = rest.strip_suffix(&[0]).unwrap_or(rest);
-                        let Ok(class_str) = std::str::from_utf8(rest) else {
-                            return Client::Default;
-                        };
-                        match_class(class_str.to_string(), modules)
-                    } else {
-                        Client::Default
+                    match wm_class_name(&class_reply.value) {
+                        Some(class) => match_class(class, modules),
+                        None => Client::Default,
                     }
                 }
                 _ => Client::Default,
@@ -143,3 +148,7 @@ pub async fn get_active_window(environment: &Environment, modules: &[Config]) ->
         Server::Failed => Client::Default,
     }
 }
+
+#[cfg(test)]
+#[path = "active_client_tests.rs"]
+mod tests;
