@@ -770,7 +770,9 @@ pub fn axis_value(raw: i32, deadzone: i32, axis_16_bit: bool) -> i32 {
     if distance_from_center.abs() <= deadzone * 200 {
         0
     } else {
-        (distance_from_center + 2000 - 1) / 2000
+        // Ceiling of the magnitude, sign reapplied: integer division truncates
+        // towards zero, so rounding the signed value would favour one side.
+        distance_from_center.signum() * ((distance_from_center.abs() + 2000 - 1) / 2000)
     }
 }
 

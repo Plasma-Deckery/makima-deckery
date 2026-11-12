@@ -212,14 +212,11 @@ fn a_disabled_stick_drives_nothing() {
     );
 }
 
-/// The same distance from centre should give the same speed in both
-/// directions. It does not: `axis_value` rounds up by adding 1999 before
-/// dividing, which is a ceiling for positive values but, with integer division
-/// truncating towards zero, pulls negative ones towards zero instead. At full
-/// deflection on the shipped settings that is 17 one way and -15 the other, and
-/// between -3001 and -3998 a value outside the deadzone still comes out as 0.
+/// The same distance from centre gives the same speed in both directions.
+/// `axis_value` once added 1999 before dividing, a ceiling only for positive
+/// values: integer division truncates towards zero, so full deflection gave 17
+/// one way and -15 the other, and just past the deadzone negative values were 0.
 #[test]
-#[ignore = "bug: axis_value is asymmetric — full deflection gives 17 right/down but -15 left/up"]
 fn a_stick_is_as_fast_in_one_direction_as_in_the_other() {
     for raw in [3500, 10000, 32767] {
         assert_eq!(
