@@ -400,9 +400,9 @@ pub fn plan_route(input: &Input) -> Route {
     let Input { event, value, config, modifiers, gaming_mode, paused, .. } = *input;
 
     // The double-click trigger, before the Gaming Mode guard so the second
-    // press is never swallowed — that is how the mode gets switched off. It runs
-    // while paused too: pause and Gaming Mode are orthogonal, so the toggle has
-    // to stay reachable from both.
+    // press is never swallowed — that is how the mode gets switched off. While
+    // paused it is only a preview, like any binding without no_pause: the
+    // overlay says what it would do, and the mode stays as it is.
     let mut trigger_ts = input.trigger_ts;
     if let Some(trigger) = input.trigger {
         if event == Event::Key(trigger.key) && value == 1 {

@@ -76,6 +76,9 @@ pub struct EventReader {
     /// Last written analog snapshot (rounded to 3 dp). Skips write when unchanged.
     /// Order: [lstick_x, lstick_y, rstick_x, rstick_y, lpad_x, lpad_y, rpad_x, rpad_y]
     analog_snapshot: Arc<Mutex<[f32; 8]>>,
+    /// The last `build_state` result and what it was built from — see
+    /// `state::StateCache`.
+    state_cache: Arc<Mutex<Option<state::StateCache>>>,
     /// Raw IMU values (ABS_HAT2X, ABS_HAT2Y) — gyroscope/accelerometer, range 0..32767.
     imu_raw: Arc<Mutex<(i32, i32)>>,
     /// When false, write_state_analog() is a no-op — no 60 Hz analog writes to state.json.
@@ -165,6 +168,7 @@ impl EventReader {
         let imu_raw = Arc::new(Mutex::new((0i32, 0i32)));
         let analog_state_export = Arc::new(Mutex::new(false));
         let analog_snapshot = Arc::new(Mutex::new([f32::NAN; 8]));
+        let state_cache = Arc::new(Mutex::new(None));
         let cursor_movement = Arc::new(Mutex::new((0, 0)));
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -224,6 +228,7 @@ impl EventReader {
             imu_raw,
             analog_state_export,
             analog_snapshot,
+            state_cache,
             cursor_movement,
             scroll_movement,
             modifiers,

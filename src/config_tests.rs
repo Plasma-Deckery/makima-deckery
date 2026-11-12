@@ -206,6 +206,7 @@ fn parse_raw_config_populates_while_gaming_for_remap() {
             label: None,
             silent: false,
             haptic: None,
+            note: None,
         },
     );
     // BTN_EAST → KEY_B without while_gaming
@@ -218,6 +219,7 @@ fn parse_raw_config_populates_while_gaming_for_remap() {
             label: None,
             silent: false,
             haptic: None,
+            note: None,
         },
     );
     let raw = RawConfig {
@@ -258,6 +260,7 @@ fn parse_raw_config_populates_while_gaming_for_command() {
             label: None,
             silent: false,
             haptic: None,
+            note: None,
         },
     );
     let raw = RawConfig {
@@ -867,4 +870,39 @@ fn trackball_and_mt_trackpad_own_their_pad() {
     assert!(!side("disabled").has_handler());
     assert!(!side("scroll").has_handler(), "no handler yet, see issue #24");
     assert!(!side("nonsense").has_handler());
+}
+
+// ── note = "…" on a binding ──────────────────────────────────────────────────
+
+/// `note` is free text under the label — how the action is used ("hold"),
+/// not what it does. Both binding kinds that take attributes accept it.
+#[test]
+fn note_deserialises_on_remap_and_command() {
+    let r: RemapWrapper = toml::from_str(r#"val = { keys = ["KEY_A"], note = "halten" }"#).unwrap();
+    let c: CommandWrapper = toml::from_str(r#"val = { run = ["true"], note = "halten" }"#).unwrap();
+    assert!(matches!(r.val, RemapValue::WithAttrs { note: Some(ref n), .. } if n == "halten"));
+    assert!(matches!(c.val, CommandValue::WithAttrs { note: Some(ref n), .. } if n == "halten"));
+    let plain: RemapWrapper = toml::from_str(r#"val = { keys = ["KEY_A"] }"#).unwrap();
+    assert!(matches!(plain.val, RemapValue::WithAttrs { note: None, .. }));
+}
+
+/// Like the label, a note belongs to the action: replacing the action drops
+/// it, an untouched binding keeps it.
+#[test]
+fn merge_base_evicts_the_note_of_a_replaced_action_and_keeps_the_rest() {
+    let r2 = key(Key::BTN_TR2);
+    let r5 = key(Key::BTN_GRIPR2);
+    let mut base_b = make_remap_bindings(vec![
+        (r2, vec![], vec![Key::BTN_LEFT]),
+        (r5, vec![], vec![Key::KEY_LEFTCTRL]),
+    ]);
+    base_b.notes.insert((r2, vec![]), "halten".to_string());
+    base_b.notes.insert((r5, vec![]), "halten".to_string());
+    let base = config_with("base", base_b);
+
+    let mut over = config_with("app", make_remap_bindings(vec![(r2, vec![], vec![Key::KEY_ENTER])]));
+    over.merge_base(&base);
+
+    assert!(!over.bindings.notes.contains_key(&(r2, vec![])), "kept the replaced action's note");
+    assert_eq!(over.bindings.notes.get(&(r5, vec![])).map(String::as_str), Some("halten"));
 }

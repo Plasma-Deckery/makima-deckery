@@ -203,6 +203,16 @@ pub fn resolve_binding(
         return resolved;
     }
 
+    // 8. Fallback: base command (combo=[]) while modifiers are held — step 5
+    //    for commands. A held modifier with no combo on this button leaves the
+    //    button doing what it does on its own: L1 + L3 still toggles the HUD,
+    //    as L1 + L4 is still Shift. The flags are the base entry's, as in 5.
+    if !mods.is_empty() {
+        if let Some(resolved) = resolve_command(bindings, event, no_mods) {
+            return resolved;
+        }
+    }
+
     ResolvedBinding::Unbound
 }
 
@@ -380,6 +390,54 @@ mod tests {
 
     /// A remap with `while_gaming` in bindings.while_gaming must report
     /// `while_gaming: true` in the resolved binding.
+    #[test]
+    fn fallback_command_while_modifier_held() {
+        let btn_thumbl = key_event(Key::BTN_THUMBL);
+        let btn_tl = key_event(Key::BTN_TL);
+        let bindings = make_bindings(
+            vec![],
+            vec![(btn_thumbl, vec![], vec!["deckery-hud-toggle".to_string()])],
+            vec![(btn_thumbl, vec![])],
+            vec![((btn_thumbl, vec![]), "Toggle HUD".to_string())],
+        );
+        // No L1 combo on L3: the base command fires, with the base entry's
+        // flags (no_pause), and it is not a combo.
+        assert_eq!(
+            resolve_binding(&bindings, btn_thumbl, &[btn_tl], false),
+            ResolvedBinding::Command {
+                commands: vec!["deckery-hud-toggle".to_string()],
+                label: Some("Toggle HUD".to_string()),
+                no_pause: true,
+                while_gaming: false,
+                silent: false,
+                is_combo: false,
+                haptic: None,
+            }
+        );
+    }
+
+    #[test]
+    fn combo_command_takes_priority_over_fallback_command() {
+        let btn_thumbl = key_event(Key::BTN_THUMBL);
+        let btn_tl = key_event(Key::BTN_TL);
+        let bindings = make_bindings(
+            vec![],
+            vec![
+                (btn_thumbl, vec![], vec!["deckery-hud-toggle".to_string()]),
+                (btn_thumbl, vec![btn_tl], vec!["other".to_string()]),
+            ],
+            vec![],
+            vec![],
+        );
+        match resolve_binding(&bindings, btn_thumbl, &[btn_tl], false) {
+            ResolvedBinding::Command { commands, is_combo, .. } => {
+                assert_eq!(commands, vec!["other".to_string()]);
+                assert!(is_combo);
+            }
+            other => panic!("expected the combo command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn while_gaming_remap_flagged() {
         let btn_south = key_event(Key::BTN_SOUTH);

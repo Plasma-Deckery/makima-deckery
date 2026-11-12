@@ -1128,6 +1128,23 @@ fn hint_modifier_leaves_available_modifiers_once_held() {
     assert!(state["context"]["available_modifiers"].get("BTN_GRIPR2").is_none());
 }
 
+/// A held hint modifier counts as held for the real modifiers too. No combo
+/// contains R5 alongside L1, so while R5 is down L1 unlocks nothing new and
+/// must not be advertised — before, it was matched against an empty held
+/// set and every real modifier with any combo showed up.
+#[test]
+fn held_hint_modifier_hides_real_modifiers_without_a_combo_on_it() {
+    let config = config_with_ctrl_hints();
+    let state = build_state(
+        &config, &[], false, false,
+        &[key(Key::BTN_GRIPR2)],
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert!(state["context"]["available_modifiers"].get("BTN_TL").is_none(),
+        "L1 advertised while only R5 is held: {}", state["context"]["available_modifiers"]);
+}
+
 // ── Modifier-less hints ───────────────────────────────────────────────────
 
 /// `from_override` mirrors the merge: the hint is in the merged map either way,
@@ -1270,4 +1287,35 @@ fn matching_hint_is_per_trigger() {
                    .map(|h| h.label.as_str()), Some("Jump to Bottom"));
     assert_eq!(matching_hint(&config, &key(Key::BTN_SOUTH), &mods).map(|h| h.label.as_str()),
                None);
+}
+
+// ── Binding notes ─────────────────────────────────────────────────────────
+
+/// A `note` reaches the HUD next to the label, both for the plain binding
+/// and, once its modifier is held, in modifier_active. Bindings without one
+/// carry no `note` key at all.
+#[test]
+fn binding_note_is_exported_in_bindings_and_modifier_active() {
+    let l1 = key(Key::BTN_TL);
+    let r5 = key(Key::BTN_GRIPR2);
+    let a = key(Key::BTN_SOUTH);
+    let mut config = make_config(
+        vec![
+            (r5, vec![l1], vec![Key::KEY_LEFTCTRL, Key::KEY_PAGEDOWN]),
+            (a, vec![], vec![Key::KEY_ENTER]),
+        ],
+        vec![(key(Key::BTN_NORTH), vec![l1], vec!["true".to_string()])],
+        vec![l1],
+    );
+    config.bindings.notes.insert((r5, vec![l1]), "halten".to_string());
+    config.bindings.notes.insert((key(Key::BTN_NORTH), vec![l1]), "halten".to_string());
+
+    let idle = build_state(&config, &[], false, false, &[], &None, &["test".to_string()], &GamingModeConfig::default());
+    assert_eq!(idle["bindings"]["BTN_TL-BTN_GRIPR2"]["note"], "halten");
+    assert_eq!(idle["bindings"]["BTN_TL-BTN_NORTH"]["note"], "halten");
+    assert!(idle["bindings"]["BTN_SOUTH"].get("note").is_none());
+
+    let held = build_state(&config, &[l1], false, false, &[l1], &None, &["test".to_string()], &GamingModeConfig::default());
+    assert_eq!(held["modifier_active"]["BTN_GRIPR2"]["note"], "halten");
+    assert_eq!(held["modifier_active"]["BTN_NORTH"]["note"], "halten");
 }
