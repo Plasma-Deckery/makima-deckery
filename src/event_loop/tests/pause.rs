@@ -56,6 +56,19 @@ async fn a_paused_command_is_announced_but_only_a_no_pause_one_runs() {
     assert_eq!(announced(&l3), vec![Some("Toggle HUD".to_string())]);
 }
 
+/// The line arrives as the socket delivers it, newline and all; the reader
+/// trims it before matching. A line it does not know changes nothing.
+#[tokio::test]
+async fn a_pause_line_with_its_line_ending_pauses_and_an_unknown_one_does_not() {
+    let mut deck = Deck::new("pause-line");
+    deck.ipc("Pause\n").await;
+    assert!(!*deck.reader.paused.lock().await, "matching is case sensitive");
+
+    deck.ipc("  pause\r\n").await;
+    assert!(*deck.reader.paused.lock().await);
+    assert!(keys(&deck.press(A).await).is_empty());
+}
+
 /// A resume sends nothing, and after it A is Enter again.
 #[tokio::test]
 async fn after_a_resume_bindings_fire_again() {
