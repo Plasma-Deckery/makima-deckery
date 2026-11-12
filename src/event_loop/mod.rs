@@ -134,6 +134,14 @@ pub struct EventReader {
     state_write_rx: Mutex<Option<mpsc::Receiver<crate::output::action::Urgency>>>,
 }
 
+/// The effect side of a reader: where its actions go, plus the two handles the
+/// reader keeps the other end of — the `last_action` cell its snapshots read,
+/// and the receiver of the `publish` port.
+struct Ports {
+    outputs: crate::output::Outputs,
+    last_action: Arc<Mutex<Option<LastAction>>>,
+    state_write_rx: mpsc::Receiver<crate::output::action::Urgency>,
+}
 
 impl EventReader {
     pub fn new(
@@ -155,6 +163,58 @@ impl EventReader {
         gaming_mode_tx: mpsc::Sender<bool>,
         state_tx: StateWriterHandle,
     ) -> Self {
+        // The production ports. `last_action` and the publish channel are made
+        // here because the reader keeps the other end of each: it reads the
+        // cell when it builds a snapshot, and it drains the channel in
+        // `state_write_loop`.
+        let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
+        let (state_write_tx, state_write_rx) = mpsc::channel(8);
+        let ports = Ports {
+            outputs: crate::output::Outputs {
+                devices:  Some(virt_dev),
+                state:    Some(state_tx.clone()),
+                commands: Some(environment.clone()),
+                internal: Some(gaming_mode_tx.clone()),
+                haptics:  haptic_tx.map(crate::output::outputs::HapticPort::new),
+                last_action: Some(last_action.clone()),
+                publish:  Some(state_write_tx),
+                tap:      None,
+            },
+            last_action,
+            state_write_rx,
+        };
+        Self::assemble(
+            base_config, registry, base_name, event_rx, is_tablet, max_abs_wheel,
+            lizard_mode, modifiers, modifier_was_activated, environment, active_client,
+            window_changed, gaming_mode, gaming_mode_tx, state_tx, ports,
+        )
+    }
+
+    /// Everything `new` does once the ports are decided.
+    ///
+    /// The seam the tests build a reader through: they pass `Ports` whose
+    /// `Outputs` hold a tap and nothing else, so no `/dev/uinput`, no session
+    /// and no state file is needed, and everything below — the state the reader
+    /// keeps and the code that drives it — is the production one.
+    fn assemble(
+        base_config: Config,
+        registry: Arc<ConfigRegistry>,
+        base_name: String,
+        event_rx: mpsc::Receiver<ControllerEvent>,
+        is_tablet: bool,
+        max_abs_wheel: i32,
+        lizard_mode: Option<LizardModeHandle>,
+        modifiers: Arc<Mutex<Vec<Event>>>,
+        modifier_was_activated: Arc<Mutex<bool>>,
+        environment: Environment,
+        active_client: Arc<Mutex<Client>>,
+        window_changed: Arc<Notify>,
+        gaming_mode: Arc<Mutex<bool>>,
+        gaming_mode_tx: mpsc::Sender<bool>,
+        state_tx: StateWriterHandle,
+        ports: Ports,
+    ) -> Self {
+        let Ports { outputs, last_action, state_write_rx } = ports;
         let mut position_vector: Vec<i32> = Vec::new();
         for i in [0, 0] {
             position_vector.push(i)
@@ -171,8 +231,6 @@ impl EventReader {
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
         let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let last_action: Arc<Mutex<Option<LastAction>>> = Arc::new(Mutex::new(None));
-        let (state_write_tx, state_write_rx) = mpsc::channel(8);
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let emitted_outputs: Arc<Mutex<crate::ledger::Ledger>> = Arc::new(Mutex::new(HashMap::new()));
         let current_config: Arc<Mutex<Arc<Config>>> =
@@ -209,16 +267,7 @@ impl EventReader {
             event_rx: Mutex::new(event_rx),
             is_tablet,
             max_abs_wheel,
-            outputs: crate::output::Outputs {
-                devices:  Some(virt_dev.clone()),
-                state:    Some(state_tx.clone()),
-                commands: Some(environment.clone()),
-                internal: Some(gaming_mode_tx.clone()),
-                haptics:  haptic_tx.clone().map(crate::output::outputs::HapticPort::new),
-                last_action: Some(last_action.clone()),
-                publish:  Some(state_write_tx.clone()),
-                tap:      None,
-            },
+            outputs,
             lstick_position,
             rstick_position,
             lstick_raw,
@@ -488,9 +537,9 @@ impl EventReader {
 
 }
 
-// No test module. What was testable here lives in `machine.rs` now, and what
-// was left were five tests that built a local HashMap, inserted, removed and
-// asserted HashMap semantics — no production code in any of them. The behaviour
-// they meant to pin, that a release clears what its press emitted even when a
-// combo overwrote it mid-hold, is covered by `ledger::plan_release` and the
-// sequences in `machine_tests.rs`.
+// What was testable piece by piece lives in `machine` and `ledger`. The reader
+// as a whole — the order `convert_event` applies those decisions in, pause and
+// resume through the real IPC loop — is driven end to end from `tests/`,
+// built through `assemble` with a tap for its only port.
+#[cfg(test)]
+mod tests;
