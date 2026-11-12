@@ -324,6 +324,32 @@ pub fn release_emitted(emitted_outputs: &std::collections::HashMap<Event, Vec<Ke
     emitted_outputs.values().flatten().map(|key| key_up(*key)).collect()
 }
 
+/// `frames` without the key-ups the release cleanup has already sent.
+///
+/// A release goes out twice otherwise: the reader's cleanup releases what the
+/// press emitted, and then the binding's own release (`plan_emit` at value 0)
+/// releases the same keys again. The cleanup stays first, because it is what
+/// matches the key-down when the resolution changed mid-hold; this drops only
+/// the repeat. A key the frames press again first (a tap) gets its release.
+pub fn skip_released(frames: Vec<OutputAction>, already_released: &[Key]) -> Vec<OutputAction> {
+    let mut up: Vec<u16> = already_released.iter().map(|k| k.code()).collect();
+    frames
+        .into_iter()
+        .filter(|frame| match frame {
+            OutputAction::Frame { device: OutputDevice::Keys, events } if events.len() == 1 => {
+                let Ev { code, value, .. } = events[0];
+                if value == 0 {
+                    !up.contains(&code)
+                } else {
+                    up.retain(|&c| c != code);
+                    true
+                }
+            }
+            _ => true,
+        })
+        .collect()
+}
+
 /// Decide what the IPC `pause` does (issue #62).
 ///
 /// Pause releases outputs, not inputs. Every virtual key makima holds down goes

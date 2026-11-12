@@ -41,12 +41,16 @@ impl EventReader {
             crate::machine::HeldUpdate::Leave => {}
         }
 
+        // What the cleanup released, so the binding's own release below does not
+        // send the same key-ups again.
+        let mut released: Vec<Key> = Vec::new();
         if crate::machine::releases_emitted(event, value) {
             let prev_keys = self.emitted_outputs.lock().await.remove(&event);
             if let Some(prev_keys) = prev_keys {
                 let frames: Vec<_> =
                     prev_keys.iter().map(|key| crate::machine::key_up(*key)).collect();
                 self.apply_frames(&frames).await;
+                released = prev_keys;
             }
         }
 
@@ -146,18 +150,23 @@ impl EventReader {
                     self.outputs.dispatch(&actions).await;
                 }
                 self.write_state().await;
-                self.emit_event(&keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
+                self.emit_event(&keys, value, &modifiers, &config, release_keys, ignore_modifiers, no_pause, &released).await;
                 if send_zero {
                     let mut modifiers = self.modifiers.lock().await.clone();
                     modifiers.sort();
                     modifiers.dedup();
-                    self.emit_event(&keys, 0, &modifiers, &config, release_keys, ignore_modifiers, no_pause).await;
+                    self.emit_event(&keys, 0, &modifiers, &config, release_keys, ignore_modifiers, no_pause, &released).await;
                 }
-                self.store_emitted_outputs(&event, &keys).await;
+                // Not on the release: the cleanup above has just emptied the
+                // entry, and putting it back would leave keys that are up
+                // recorded as down for the next pause or release to send again.
+                if value != 0 {
+                    self.store_emitted_outputs(&event, &keys).await;
+                }
                 return;
             }
             ResolvedBinding::Hold { keys } => {
-                self.emit_event(&keys, value, &modifiers, &config, false, false, false).await;
+                self.emit_event(&keys, value, &modifiers, &config, false, false, false, &released).await;
                 return;
             }
             ResolvedBinding::Command { commands, label, no_pause, while_gaming: _, silent, haptic, .. } => {
@@ -238,6 +247,7 @@ impl EventReader {
         release_keys: bool,
         ignore_modifiers: bool,
         no_pause: bool,
+        already_released: &[Key],
     ) {
         let paused = *self.paused.lock().await;
 
@@ -258,7 +268,8 @@ impl EventReader {
             plan
         };
 
-        self.apply_frames(&plan.frames).await;
+        let frames = crate::machine::skip_released(plan.frames, already_released);
+        self.apply_frames(&frames).await;
 
         for (modifier, value) in plan.toggles {
             self.toggle_modifiers(modifier, value, config).await;

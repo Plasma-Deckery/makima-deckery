@@ -1110,10 +1110,12 @@ impl Reader {
             HeldUpdate::Remove => self.held_keys.retain(|&k| k != event),
             HeldUpdate::Leave => {}
         }
+        let mut released = Vec::new();
         if releases_emitted(event, value) {
             if let Some(prev) = self.emitted.remove(&event) {
                 let frames: Vec<_> = prev.iter().map(|k| key_up(*k)).collect();
                 self.send(&frames);
+                released = prev;
             }
         }
 
@@ -1156,12 +1158,14 @@ impl Reader {
                     no_pause,
                 });
                 self.modifier_was_activated = plan.modifier_was_activated;
-                self.send(&plan.frames);
+                self.send(&skip_released(plan.frames, &released));
                 for (m, v) in plan.toggles {
                     self.toggle(m, v);
                 }
-                // As the reader does it: after every emit, the release too.
-                self.emitted.insert(event, keys);
+                // As the reader does it: after every emit but the release.
+                if value != 0 {
+                    self.emitted.insert(event, keys);
+                }
             }
             crate::resolver::ResolvedBinding::Unbound => {
                 let live = self.modifiers.clone();
@@ -1338,8 +1342,8 @@ fn a_pause_without_a_held_modifier_leaves_the_flag_alone() {
 /// resume does not press it again. Letting go of L4 afterwards sends only a
 /// release, and only one: `emitted_outputs` no longer holds L4, so the reader's
 /// cleanup sends nothing and only the binding's own release goes out (which is
-/// for a key already up). An ordinary release sends that one plus the
-/// cleanup's.
+/// for a key already up). An ordinary release sends one as well: the cleanup's,
+/// with the binding's repeat of it dropped.
 #[test]
 fn a_remapped_key_held_across_a_pause_stays_released() {
     let shift = Key::KEY_LEFTSHIFT.code();
@@ -1365,7 +1369,7 @@ fn a_remapped_key_held_across_a_pause_stays_released() {
     plain.press(L4);
     plain.take();
     plain.release(L4);
-    assert_eq!(plain.take(), vec![(shift, 0), (shift, 0)]);
+    assert_eq!(plain.take(), vec![(shift, 0)]);
 }
 
 /// Everything makima emitted goes up at the pause, whichever button emitted it
@@ -1456,4 +1460,59 @@ fn a_resume_without_a_held_modifier_leaves_the_flag_alone() {
     let custom = &config.mapped_modifiers.custom;
     assert!(!resume_modifier_was_activated(&[], custom, false));
     assert!(resume_modifier_was_activated(&[ev(STEAM)], custom, false));
+}
+
+/// A plain remap, pressed and released: one key-down, one key-up. The reader's
+/// cleanup releases what the press emitted, and the binding's own release must
+/// not send the same key-up a second time. Nothing stays recorded as emitted
+/// either, or the next pause would release the key yet again.
+#[test]
+fn a_plain_remap_release_sends_one_key_up() {
+    let shift = Key::KEY_LEFTSHIFT.code();
+    let mut r = Reader::new(layered_config());
+    r.press(L4);
+    assert_eq!(r.take(), vec![(shift, 1)]);
+    r.release(L4);
+    assert_eq!(r.take(), vec![(shift, 0)], "one release, two key-ups");
+    assert!(r.emitted.is_empty(), "the release left L4 recorded as emitted");
+
+    r.pause();
+    assert_eq!(r.take(), vec![], "a pause after the release sent a stale key-up");
+}
+
+/// The combo while a layer key is held: L1 + X is Ctrl+C, and letting go of X
+/// releases Ctrl and C once each.
+#[test]
+fn a_combo_release_with_a_held_modifier_sends_one_key_up_each() {
+    let ctrl = Key::KEY_LEFTCTRL.code();
+    let c = Key::KEY_C.code();
+    let mut r = Reader::new(layered_config());
+    r.press(L1);
+    r.press(X);
+    assert_eq!(r.take(), vec![(ctrl, 1), (c, 1)]);
+    r.release(X);
+    let mut sent = r.take();
+    sent.sort();
+    let mut expected = vec![(ctrl, 0), (c, 0)];
+    expected.sort();
+    assert_eq!(sent, expected, "the combo's keys were released twice");
+    assert!(!r.emitted.contains_key(&ev(X)), "the release left X recorded as emitted");
+    assert_eq!(r.modifiers, vec![ev(L1)], "L1 is still held");
+}
+
+/// `skip_released` on its own: a key-up for a key the cleanup already released
+/// is dropped, unless the frames press it again first (a tap's release is a
+/// release of its own), and everything else is left as it is.
+#[test]
+fn skip_released_drops_only_repeated_key_ups() {
+    let a = Key::KEY_A;
+    let b = Key::KEY_B;
+    let frames = vec![key_up(a), key_up(b)];
+    assert_eq!(skip_released(frames, &[a]), vec![key_up(b)]);
+
+    let tap = vec![key_up(a), key_at(a, 1), key_up(a)];
+    assert_eq!(skip_released(tap, &[a]), vec![key_at(a, 1), key_up(a)]);
+
+    let untouched = vec![key_at(a, 1), key_up(b)];
+    assert_eq!(skip_released(untouched.clone(), &[]), untouched);
 }
