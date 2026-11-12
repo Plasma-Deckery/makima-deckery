@@ -131,3 +131,65 @@ async fn a_full_tap_drops_rather_than_waits() {
     assert_eq!(drain(&mut rx).len(), 2);
     assert_eq!(outputs.tap.as_ref().unwrap().dropped(), 3);
 }
+
+fn haptic() -> OutputAction {
+    OutputAction::Haptic {
+        pad: deckery_controller::HapticPad::Right,
+        chain: deckery_controller::HapticChain::default(),
+    }
+}
+
+/// A backlog of haptic chains must not hold up motion: with the haptic queue
+/// full, dispatching a tick's haptic alongside its motion returns at once,
+/// everything after the haptic still goes out, and the tick is dropped.
+#[tokio::test]
+async fn a_full_haptic_queue_does_not_block_motion() {
+    let (haptic_tx, mut haptic_rx) = mpsc::channel(1);
+    haptic_tx.try_send(HapticRequest {
+        pad: deckery_controller::HapticPad::Right,
+        chain: deckery_controller::HapticChain::default(),
+    }).unwrap();
+    let (internal_tx, mut internal_rx) = mpsc::channel(4);
+    let (tap_tx, mut tap_rx) = mpsc::channel(16);
+    let port = HapticPort::new(haptic_tx);
+    let outputs = Outputs {
+        haptics: Some(port.clone()),
+        internal: Some(internal_tx),
+        tap: Some(Tap::new(tap_tx)),
+        ..Default::default()
+    };
+
+    let motion = [
+        haptic(),
+        frame(OutputDevice::Axis),
+        OutputAction::Internal(InternalCommand::SetGamingMode { enabled: true, preview: false }),
+    ];
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        outputs.dispatch(&motion).await;
+        outputs.dispatch(&motion).await;
+    })
+    .await
+    .expect("dispatch waited for room in the haptic queue");
+
+    assert_eq!(port.dropped(), 2);
+    assert_eq!(drain(&mut tap_rx).len(), 6);
+    assert_eq!(internal_rx.try_recv(), Ok(true));
+    assert_eq!(internal_rx.try_recv(), Ok(true));
+    // Only the request that was already queued is there.
+    assert!(haptic_rx.try_recv().is_ok());
+    assert!(haptic_rx.try_recv().is_err());
+}
+
+/// With room in the queue the haptic is delivered as before.
+#[tokio::test]
+async fn a_haptic_with_room_is_delivered() {
+    let (haptic_tx, mut haptic_rx) = mpsc::channel(4);
+    let port = HapticPort::new(haptic_tx);
+    let outputs = Outputs { haptics: Some(port.clone()), ..Default::default() };
+
+    outputs.dispatch(&[haptic()]).await;
+
+    assert_eq!(port.dropped(), 0);
+    let got = haptic_rx.try_recv().expect("haptic not delivered");
+    assert_eq!(got.pad, deckery_controller::HapticPad::Right);
+}

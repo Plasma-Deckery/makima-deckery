@@ -48,8 +48,8 @@ pub struct Outputs {
     pub commands: Option<Environment>,
     /// Gaming Mode, back into the machine on its next step.
     pub internal: Option<mpsc::Sender<bool>>,
-    /// Feedback to the controller.
-    pub haptics: Option<mpsc::Sender<HapticRequest>>,
+    /// Feedback to the controller. Never waited on — see [`HapticPort`].
+    pub haptics: Option<HapticPort>,
     /// What the overlay says happened last. A port like the others: clip in the
     /// reader's own cell, or a test's, or nothing.
     pub last_action: Option<Arc<Mutex<Option<LastAction>>>>,
@@ -96,6 +96,43 @@ impl Tap {
         };
         if self.tx.try_send(emission).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The haptic port: offered, never awaited.
+///
+/// The player plays chains one after another, and a movement tick's chain can
+/// hold pauses, so a fast trackball spin queues haptics faster than they
+/// play. Waiting for room would play ticks long after the motion stopped and,
+/// worse, hold up the dispatch that carries the pointer motion itself. A tick
+/// that does not fit is therefore dropped: it would have arrived late anyway.
+#[derive(Clone)]
+pub struct HapticPort {
+    tx: mpsc::Sender<HapticRequest>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl HapticPort {
+    pub fn new(tx: mpsc::Sender<HapticRequest>) -> Self {
+        Self { tx, dropped: Arc::new(AtomicU64::new(0)) }
+    }
+
+    /// How many requests did not fit.
+    #[allow(dead_code)]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    fn offer(&self, request: HapticRequest) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(request) {
+            // Routine under a fast spin, so not worth a line in a release
+            // build's journal; makima has no log levels, and a debug build is
+            // its debug level.
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if cfg!(debug_assertions) {
+                eprintln!("deckery: haptics: queue full, dropped a request ({n} so far)");
+            }
         }
     }
 }
@@ -164,9 +201,11 @@ impl Outputs {
                     }
                 }
 
+                // Not awaited: a full queue must not hold up the motion
+                // dispatched alongside it.
                 OutputAction::Haptic { pad, chain } => {
-                    if let Some(tx) = &self.haptics {
-                        let _ = tx.send(HapticRequest { pad: *pad, chain: chain.clone() }).await;
+                    if let Some(port) = &self.haptics {
+                        port.offer(HapticRequest { pad: *pad, chain: chain.clone() });
                     }
                 }
 

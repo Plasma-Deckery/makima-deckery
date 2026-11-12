@@ -216,7 +216,7 @@ impl EventReader {
                 state:    Some(state_tx.clone()),
                 commands: Some(environment.clone()),
                 internal: Some(gaming_mode_tx.clone()),
-                haptics:  haptic_tx.clone(),
+                haptics:  haptic_tx.clone().map(crate::output::outputs::HapticPort::new),
                 last_action: Some(last_action.clone()),
                 publish:  Some(state_write_tx.clone()),
                 tap:      None,
