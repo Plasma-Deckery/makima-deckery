@@ -1,5 +1,5 @@
 Name:           makima-deckery
-Version:        0.5.0
+Version:        2.0.0~beta1
 Release:        1%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
@@ -91,6 +91,16 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Thu Nov 12 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-1
+- Auto-mute: a Steam game is muted while its window is not focused
+- Focus delay: a game counts as focused only after holding focus for focus_threshold_ms
+- Bindings can play haptic feedback when they fire
+- Opt-in trackball trackpad mode (mode = "trackball")
+- Analog input writes the state file only on real movement
+- Modifier hints count held modifiers; bindings carry a note exported to the HUD
+- A held modifier without a combo falls back to the button's base command
+- Fix: a paused double-click on the Gaming Mode trigger only announces it again
+
 * Sun Nov 08 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 0.5.0-1
 - Input path rebuilt around a pure decision core; every effect leaves through one port
 - Trackpads decide and dispatch the same way: haptics, publish requests and pad frames

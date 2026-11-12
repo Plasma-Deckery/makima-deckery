@@ -21,9 +21,12 @@
 # Result lands in outdir/. Requires rpmbuild + cargo wherever you run this.
 
 NAME    := makima-deckery
-VERSION := $(shell awk -F'"' '/^version/{print $$2; exit}' $(CURDIR)/Cargo.toml)
 outdir  ?= $(CURDIR)/outdir
 spec    ?= packaging/$(NAME).spec
+# The tarball names must match the spec's %{version}, which differs from
+# Cargo.toml for pre-releases (RPM 2.0.0~beta1 vs. Cargo 2.0.0-beta.1), so
+# read the version from the spec, not from Cargo.toml.
+VERSION := $(shell awk '/^Version:/{print $$2; exit}' $(spec))
 
 .PHONY: srpm vendor builddeps clean
 

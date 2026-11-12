@@ -386,10 +386,6 @@ mod tests {
         }
     }
 
-    // ── while_gaming ──────────────────────────────────────────────────────────
-
-    /// A remap with `while_gaming` in bindings.while_gaming must report
-    /// `while_gaming: true` in the resolved binding.
     #[test]
     fn fallback_command_while_modifier_held() {
         let btn_thumbl = key_event(Key::BTN_THUMBL);
@@ -438,6 +434,10 @@ mod tests {
         }
     }
 
+    // ── while_gaming ──────────────────────────────────────────────────────────
+
+    /// A remap with `while_gaming` in bindings.while_gaming must report
+    /// `while_gaming: true` in the resolved binding.
     #[test]
     fn while_gaming_remap_flagged() {
         let btn_south = key_event(Key::BTN_SOUTH);
