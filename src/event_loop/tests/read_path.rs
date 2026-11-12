@@ -68,13 +68,10 @@ async fn a_bound_stick_presses_once_and_releases_on_return() {
 
 /// On a Deck, ABS_HAT0X/Y is the left trackpad's position. The base config
 /// sets the left pad to `disabled`, and the hat-switch decoder in `read_events`
-/// only stands aside for a pad with a handler — so a pad coordinate of exactly
-/// ±1, and the 0 after it, is read as a D-pad direction. Nothing can bind that
-/// direction, so it falls through to passthrough and the raw ABS event leaks
-/// onto the virtual ABS device, which the comment on the HAT1 arm says must not
-/// happen.
+/// once stood aside only for a pad with a handler — so a pad coordinate of
+/// exactly ±1, and the 0 after it, was read as a D-pad direction and leaked
+/// onto the virtual ABS device. A Deck's pad axes now never reach the decoder.
 #[tokio::test]
-#[ignore = "bug: left-pad coordinates of exactly ±1 are decoded as a D-pad hat and forwarded when the left pad is disabled"]
 async fn the_left_pad_position_never_reaches_an_output() {
     let mut deck = Deck::new("left-pad");
     let touch = |x: i32| vec![

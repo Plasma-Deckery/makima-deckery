@@ -59,6 +59,10 @@ pub struct EventReader {
     /// Whether the connected device is a graphics tablet (BTN_TOOL_PEN).
     /// Queried once at open time and carried here to avoid re-querying on reconnect.
     is_tablet: bool,
+    /// Whether the device is a Steam Deck (`class = "hid-steam"`). On a Deck
+    /// ABS_HAT0X/Y and ABS_HAT1X/Y are the trackpad positions, not hat
+    /// switches, so the reader must never decode them as a D-pad.
+    is_deck: bool,
     /// Maximum absolute axis value across all axes, queried once at open time.
     max_abs_wheel: i32,
     /// Where the decided actions go. Built from the same handles as the fields
@@ -259,6 +263,8 @@ impl EventReader {
 
 
         let trackpad = base_config.trackpad.clone();
+        let is_deck = base_config.device.as_ref()
+            .is_some_and(|d| d.class == crate::config::DeviceClass::HidSteam);
         let gaming_mode_config = base_config.gaming_mode_config.clone();
 
         Self {
@@ -266,6 +272,7 @@ impl EventReader {
             base_name,
             event_rx: Mutex::new(event_rx),
             is_tablet,
+            is_deck,
             max_abs_wheel,
             outputs,
             lstick_position,

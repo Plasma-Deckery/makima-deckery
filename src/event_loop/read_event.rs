@@ -137,13 +137,12 @@ impl EventReader {
                 }
                 (EventType::ABSOLUTE, _, _, true) => pen_events.push(event),
                 (_, _, AbsoluteAxisType::ABS_HAT0X | AbsoluteAxisType::ABS_HAT0Y, _) => {
-                    // Trackpad position/touch now comes from hidraw (trackpad_router)
-                    // whenever a handler owns the pad (mt-trackpad, trackball).
-                    // This handler only remains for the D-pad hat-switch case on
-                    // non-Steam-Deck controllers — but on a Deck whose left pad has
-                    // no handler it is fed that pad's coordinates;
-                    // `decode::decode_hat` says what that means.
-                    if !self.trackpad.left.has_handler() {
+                    // On a Deck these are the left pad's position, which
+                    // trackpad_router reads from hidraw when a handler owns the
+                    // pad and which is dropped when the pad is disabled — never
+                    // a hat: the Deck's D-pad arrives as key edges. Only an
+                    // evdev-class controller with a real hat switch decodes it.
+                    if !self.is_deck {
                         let is_x = event.code() == AbsoluteAxisType::ABS_HAT0X.0;
                         let held = if is_x { dpad_values.0 } else { dpad_values.1 };
                         let (events, next) = crate::decode::decode_hat(is_x, event.value(), held);
