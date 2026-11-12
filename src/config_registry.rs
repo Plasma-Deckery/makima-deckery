@@ -416,23 +416,7 @@ impl ConfigRegistry {
         let mut watcher = RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    use notify::EventKind::*;
-                    match event.kind {
-                        Create(_) | Modify(_) | Remove(_) => {
-                            // preferences.toml is deliberately not watched. It is
-                            // written by this process on every IPC toggle, and the
-                            // resulting event would reload every config just to
-                            // re-read what we had just written. It only ever
-                            // changes through IPC, so there is nothing to observe.
-                            let is_toml = event.paths.iter().any(|p| {
-                                p.extension().and_then(|e| e.to_str()) == Some("toml")
-                                    && p.file_name().and_then(|n| n.to_str())
-                                        .is_some_and(|n| !crate::preferences::is_preferences_file(n))
-                            });
-                            if is_toml { let _ = change_tx.try_send(()); }
-                        }
-                        _ => {}
-                    }
+                    if Self::is_config_change(&event) { let _ = change_tx.try_send(()); }
                 }
             },
             notify::Config::default(),
@@ -458,6 +442,30 @@ impl ConfigRegistry {
         }
 
         watcher
+    }
+
+    /// Whether a file-system event is one that should reload the configs.
+    ///
+    /// Split out of `start_watcher` so the filter can be tested without
+    /// inotify: a missed `.toml` here means an edit that silently never takes
+    /// effect, and a false positive means a reload of everything for nothing.
+    pub(crate) fn is_config_change(event: &notify::Event) -> bool {
+        use notify::EventKind::*;
+        match event.kind {
+            Create(_) | Modify(_) | Remove(_) => {
+                // preferences.toml is deliberately not watched. It is
+                // written by this process on every IPC toggle, and the
+                // resulting event would reload every config just to
+                // re-read what we had just written. It only ever
+                // changes through IPC, so there is nothing to observe.
+                event.paths.iter().any(|p| {
+                    p.extension().and_then(|e| e.to_str()) == Some("toml")
+                        && p.file_name().and_then(|n| n.to_str())
+                            .is_some_and(|n| !crate::preferences::is_preferences_file(n))
+                })
+            }
+            _ => false,
+        }
     }
 
     /// Recursively collect the parent directories of every symlinked `.toml`

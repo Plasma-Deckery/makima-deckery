@@ -27,6 +27,28 @@ use crate::virtual_devices::VirtualDevices;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+/// Whether `setup` knows a trackpad mode. Anything else is warned about and
+/// then behaves like `disabled`, because no handler is spawned for it.
+fn is_known_trackpad_mode(mode: &str) -> bool {
+    ["disabled", "mt-trackpad", "trackball", "scroll"].contains(&mode)
+}
+
+/// The click-pressure thresholds to push to the firmware, if any.
+///
+/// `None` when neither pad configures one, so the firmware default stands and
+/// no HID feature report is sent. When only one side is configured, the other
+/// gets `0xFFFF` — which, per `ClickPressureConfig`, effectively disables
+/// physical clicks on that pad rather than leaving it at the firmware default.
+fn click_pressure_config(left: Option<u16>, right: Option<u16>) -> Option<ClickPressureConfig> {
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+    Some(ClickPressureConfig {
+        left:  left.unwrap_or(0xFFFF),
+        right: right.unwrap_or(0xFFFF),
+    })
+}
+
 pub struct TrackpadSession {
     pad_rx:      Option<mpsc::Receiver<PadFrame>>,
     left_tx:     Option<mpsc::Sender<SinglePadFrame>>,
@@ -79,7 +101,7 @@ impl TrackpadSession {
     ) -> Self {
         // Validate modes early so the warning appears before any device work.
         for (side, mode) in [("left", &trackpad.left.mode), ("right", &trackpad.right.mode)] {
-            if !["disabled", "mt-trackpad", "trackball", "scroll"].contains(&mode.as_str()) {
+            if !is_known_trackpad_mode(mode) {
                 eprintln!(
                     "[makima] Warning: unrecognised trackpad mode {:?} for {} pad, treating as disabled.",
                     mode, side
@@ -148,13 +170,11 @@ impl TrackpadSession {
         // if neither side is configured, the firmware default stands and we
         // avoid sending an unnecessary HID feature report.
         if let Some(ref handle) = click_pressure {
-            let left  = trackpad.left.click_pressure;
-            let right = trackpad.right.click_pressure;
-            if left.is_some() || right.is_some() {
-                handle.set(Some(ClickPressureConfig {
-                    left:  left.unwrap_or(0xFFFF),
-                    right: right.unwrap_or(0xFFFF),
-                }));
+            if let Some(config) = click_pressure_config(
+                trackpad.left.click_pressure,
+                trackpad.right.click_pressure,
+            ) {
+                handle.set(Some(config));
             }
         }
 
@@ -264,3 +284,7 @@ impl TrackpadSession {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "device_session_tests.rs"]
+mod tests;

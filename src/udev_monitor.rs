@@ -148,15 +148,9 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec
                 prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
             }
             Some(_) = config_rx.recv() => {
-                // Debounce: drain any queued events, then wait briefly for the
-                // editor to finish writing.
-                while config_rx.try_recv().is_ok() {}
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                settle_config_changes(&mut config_rx).await;
                 println!("---------------------\n\nConfig changed, reloading...\n");
-                let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
-                registry.reload();
-                let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(registry.snapshot()));
-                report_base_config_error(&registry, &state_tx);
+                reload_configs(&registry, &state_tx);
                 device_tasks::release_held_modifiers(&virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();
@@ -168,15 +162,36 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec
     }
 }
 
-/// Before restarting input tasks on reinit, release all held modifier output
-/// keys so the kernel (and thus XWayland/compositor) knows those keys are no
-/// longer pressed. Without this, a stuck-modifier state persists across the
-/// reinit — modifiers held at reinit time (e.g. Ctrl+Alt from a paddle+button
-/// combo) are never released, causing phantom combo activation until the user
-/// physically presses and releases those keys again.
+/// How long a config change is left to settle before it is read.
+const CONFIG_SETTLE: tokio::time::Duration = tokio::time::Duration::from_millis(200);
+
+/// Debounce a burst of config-change signals into one reload.
 ///
-/// The output device layer (`virt_dev`) is preserved across reinits, so the
-/// release events land on the same uinput nodes the compositor already knows.
+/// An editor save is several inotify events — write, rename, attribute
+/// change — and reading the file between them can catch it half written.
+/// Queued signals are dropped first, then the editor gets a moment to finish.
+/// A signal that arrives during that moment is left in the channel on
+/// purpose: it means the file changed again after the drain, so the loop
+/// must come round once more rather than keep the earlier content.
+async fn settle_config_changes(config_rx: &mut tokio::sync::mpsc::Receiver<()>) {
+    while config_rx.try_recv().is_ok() {}
+    tokio::time::sleep(CONFIG_SETTLE).await;
+}
+
+/// Re-read every config file and tell the state writer about it.
+///
+/// This is the half of a config reload that does not touch devices. It runs
+/// before `launch_tasks`, which reads `registry.base_configs()` afresh on
+/// every call — so what is reloaded here is what the new device tasks start
+/// with. The `base_config` error slot is re-evaluated as well, so fixing a
+/// broken file clears the red tray icon without a restart.
+fn reload_configs(registry: &ConfigRegistry, state_tx: &StateWriterHandle) {
+    let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
+    registry.reload();
+    let _ = state_tx.try_send(StateCommand::SetLoadedConfigs(registry.snapshot()));
+    report_base_config_error(registry, state_tx);
+}
+
 /// Check the registry for a broken base config and report it via the state
 /// writer: sends `SetError { id: "base_config" }` when broken, `ClearError`
 /// when healthy.  Called once at startup (main.rs) and after every config
@@ -201,14 +216,33 @@ pub fn is_mapped(udev_device: &tokio_udev::Device, registry: &Arc<ConfigRegistry
     // Only consider devices that have an actual evdev node (/dev/input/eventX).
     // udev fires multiple events per plug — one for the parent input device (no devnode)
     // and one per event node. Without this check, we'd reinit for every sub-event.
-    if udev_device.devnode().is_none() {
+    name_is_mapped(
+        udev_device.devnode().is_some(),
+        udev_device.property_value("NAME"),
+        registry,
+    )
+}
+
+/// The decision behind `is_mapped`, with the two things it reads from the udev
+/// device passed in — a `tokio_udev::Device` cannot be built without a real one.
+fn name_is_mapped(
+    has_devnode: bool,
+    name: Option<&std::ffi::OsStr>,
+    registry: &ConfigRegistry,
+) -> bool {
+    if !has_devnode {
         return false;
     }
-    if let Some(name) = udev_device.property_value("NAME") {
-        let name = name.to_string_lossy().replace("\"", "").replace("/", "");
-        return registry.any_device_matches(&name);
+    match name {
+        Some(name) => registry.any_device_matches(&normalize_udev_name(name)),
+        None => false,
     }
-    false
+}
+
+/// udev reports `NAME` in quotes (`"Steam Deck"`), evdev without. Slashes are
+/// dropped on both sides, matching what `launch_tasks` does to the evdev name.
+fn normalize_udev_name(name: &std::ffi::OsStr) -> String {
+    name.to_string_lossy().replace("\"", "").replace("/", "")
 }
 
 #[cfg(test)]

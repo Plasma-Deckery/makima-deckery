@@ -117,21 +117,141 @@ fn lizard_cfg_from_base(base: Option<crate::config::Config>) -> Option<LizardMod
     LizardModeSuppression::from_setting(&settings.suppress_lizard_mode)
 }
 
+/// Before restarting input tasks on reinit, release all held modifier output
+/// keys so the kernel (and thus XWayland/compositor) knows those keys are no
+/// longer pressed. Without this, a stuck-modifier state persists across the
+/// reinit — modifiers held at reinit time (e.g. Ctrl+Alt from a paddle+button
+/// combo) are never released, causing phantom combo activation until the user
+/// physically presses and releases those keys again.
+///
+/// The output device layer (`virt_dev`) is preserved across reinits, so the
+/// release events land on the same uinput nodes the compositor already knows.
 pub async fn release_held_modifiers(
     virt_dev: &Arc<Mutex<VirtualDevices>>,
     prev_modifiers: &Arc<Mutex<Vec<Event>>>,
 ) {
-    let held = prev_modifiers.lock().await.clone();
+    let held = keys_to_release(&prev_modifiers.lock().await);
     if held.is_empty() {
         return;
     }
     let mut vd = virt_dev.lock().await;
-    for modifier in &held {
-        if let Event::Key(key) = modifier {
-            let _ = vd.emit(crate::output::OutputDevice::Keys, &[
-                evdev::InputEvent::new_now(evdev::EventType::KEY, key.code(), 0),
-            ]);
+    for key in held {
+        let _ = vd.emit(crate::output::OutputDevice::Keys, &[
+            evdev::InputEvent::new_now(evdev::EventType::KEY, key.code(), 0),
+        ]);
+    }
+}
+
+/// The output keys a reinit has to release, in the order they were held.
+///
+/// Only keys can be stuck in the kernel: an axis or a hold has no pressed
+/// state on the uinput side, so there is nothing to release for them. Split
+/// out of `release_held_modifiers` so the choice can be tested without the
+/// uinput devices that the emitting half needs.
+fn keys_to_release(held: &[Event]) -> Vec<evdev::Key> {
+    held.iter()
+        .filter_map(|event| match event {
+            Event::Key(key) => Some(*key),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Which `groups` membership grants access to the evdev nodes.
+#[derive(Debug, PartialEq, Eq)]
+enum EvdevAccess {
+    InputGroup,
+    Root,
+    Missing,
+}
+
+/// Read the output of `groups` the way `launch_tasks` always has: a plain
+/// substring test, `input` checked before `root`.
+fn evdev_access(groups: &str) -> EvdevAccess {
+    if groups.contains("input") {
+        EvdevAccess::InputGroup
+    } else if groups.contains("root") {
+        EvdevAccess::Root
+    } else {
+        EvdevAccess::Missing
+    }
+}
+
+/// What claiming a controller's hidraw sibling came to.
+#[derive(Debug, PartialEq, Eq)]
+enum HidrawClaim {
+    /// First evdev node to reach this hidraw path in this scan — open it.
+    Claimed,
+    /// Another node already led to the same hidraw path — skip this one.
+    AlreadyClaimed,
+    /// The evdev node has no hidraw sibling at all — nothing to drive.
+    NoSibling,
+}
+
+/// The hidraw deduplication step of `launch_tasks`, without the device.
+///
+/// `seen` lives for one scan; a reinit starts with an empty set, which is
+/// what lets the same controller be claimed again after it reconnects.
+fn claim_hidraw(
+    seen: &mut std::collections::HashSet<PathBuf>,
+    hidraw: Option<&Path>,
+) -> HidrawClaim {
+    match hidraw {
+        None => HidrawClaim::NoSibling,
+        Some(path) if seen.insert(path.to_path_buf()) => HidrawClaim::Claimed,
+        Some(_) => HidrawClaim::AlreadyClaimed,
+    }
+}
+
+/// Whether the Steam detector should run, taken from the base configs.
+///
+/// The first base config decides; with none loaded yet detection stays on,
+/// which is the default a fresh install expects.
+fn auto_detect_steam(base_configs: &[crate::config::Config]) -> bool {
+    base_configs
+        .first()
+        .map(|c| c.gaming_mode_config.auto_detect_steam_games)
+        .unwrap_or(true)
+}
+
+/// Tell the state writer how the device scan ended.
+///
+/// The lifecycle always becomes `Ready` — the scan is over whatever it found.
+/// The `no_device` error slot is set when nothing was found and cleared when
+/// at least one device is running. The clear matters as much as the set: a
+/// reinit after a hidraw I/O error or a config reload runs through here
+/// again, and without it the tray would keep showing the red "no device" icon
+/// from an earlier scan while the controller works.
+fn report_scan_result(devices_found: usize, user_has_access: bool, state_tx: &StateWriterHandle) {
+    let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Ready));
+    if devices_found == 0 {
+        if !user_has_access {
+            println!("No matching devices found.\nNote: make sure that your user has access to event devices.\n");
+            let _ = state_tx.try_send(StateCommand::SetError {
+                id:       "no_device".to_string(),
+                message:  "No matching device found — user may lack event device access".to_string(),
+                severity: "error",
+            });
+        } else {
+            // The file name has nothing to do with this: a base config is
+            // matched to hardware through `[device] names`, which is a list of
+            // substrings tested against the evdev name. Saying otherwise sends
+            // people renaming files that were never the problem.
+            println!(
+                "No matching devices found.\n\
+                 Note: a base config finds its device through the `names` list in \
+                 its [device] section — each entry is matched as a substring of \
+                 the evdev device name reported by 'evtest'. The config's file \
+                 name plays no part in it.\n"
+            );
+            let _ = state_tx.try_send(StateCommand::SetError {
+                id:       "no_device".to_string(),
+                message:  "No matching device found — check that [device] names in the base config matches the evdev device name from 'evtest'".to_string(),
+                severity: "error",
+            });
         }
+    } else {
+        let _ = state_tx.try_send(StateCommand::ClearError { id: "no_device".to_string() });
     }
 }
 
@@ -150,10 +270,7 @@ pub async fn launch_tasks(
     // Steam detection task — spawned once per session, outside any EventReader.
     // auto_detect comes from the first base config found in the registry;
     // defaults to true (detect by default) when no base config is loaded yet.
-    let auto_detect = registry.base_configs()
-        .first()
-        .map(|c| c.gaming_mode_config.auto_detect_steam_games)
-        .unwrap_or(true);
+    let auto_detect = auto_detect_steam(&registry.base_configs());
     tokio::spawn(crate::steam_detector::steam_detection_task(
         game_focus.clone(),
         gaming_mode_tx.clone(),
@@ -167,24 +284,19 @@ pub async fn launch_tasks(
     let modifiers: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Default::default()));
     let modifier_was_activated: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
 
-    let user_has_access = match Command::new("groups").output() {
-        Ok(groups)
-            if std::str::from_utf8(&groups.stdout.as_slice())
-                .unwrap()
-                .contains("input") =>
-        {
+    let access = Command::new("groups").output().map(|groups| {
+        evdev_access(std::str::from_utf8(&groups.stdout.as_slice()).unwrap())
+    });
+    let user_has_access = match access {
+        Ok(EvdevAccess::InputGroup) => {
             println!("Evdev permissions available.\nScanning for event devices with a matching config file...\n");
             true
         }
-        Ok(groups)
-            if std::str::from_utf8(&groups.stdout.as_slice())
-                .unwrap()
-                .contains("root") =>
-        {
+        Ok(EvdevAccess::Root) => {
             println!("Root permissions available.\nScanning for event devices with a matching config file...\n");
             true
         }
-        Ok(_) => {
+        Ok(EvdevAccess::Missing) => {
             println!("Warning: user has no access to event devices, Makima might not be able to detect all connected devices.\n\
                     Note: Run Makima with 'sudo -E makima' or as a system service. Refer to the docs for more info. Continuing...\n");
             false
@@ -264,18 +376,17 @@ pub async fn launch_tasks(
 
         let (event_rx, pad_rx, haptic_tx, lizard_mode, click_pressure) = if is_hid_steam {
             let controller = SteamDeckController::from_evdev(Path::new(&event_device));
-            match &controller.hidraw_path {
-                Some(hidraw) => {
-                    if !seen_hidraw.insert(hidraw.clone()) {
-                        println!(
-                            "deckery: {:?} — hidraw {:?} already claimed, \
-                             skipping duplicate evdev node",
-                            event_device, hidraw
-                        );
-                        continue;
-                    }
+            match claim_hidraw(&mut seen_hidraw, controller.hidraw_path.as_deref()) {
+                HidrawClaim::Claimed => {}
+                HidrawClaim::AlreadyClaimed => {
+                    println!(
+                        "deckery: {:?} — hidraw {:?} already claimed, \
+                         skipping duplicate evdev node",
+                        event_device, controller.hidraw_path.as_ref().unwrap()
+                    );
+                    continue;
                 }
-                None => {
+                HidrawClaim::NoSibling => {
                     eprintln!("deckery: {:?}: no hidraw sibling found — skipping device", event_device);
                     continue;
                 }
@@ -332,36 +443,7 @@ pub async fn launch_tasks(
 
     // Lifecycle: scan complete — transition to "ready" regardless of result.
     // Error slot: set when no device found, clear when at least one is active.
-    let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Ready));
-    if devices_found == 0 {
-        if !user_has_access {
-            println!("No matching devices found.\nNote: make sure that your user has access to event devices.\n");
-            let _ = state_tx.try_send(StateCommand::SetError {
-                id:       "no_device".to_string(),
-                message:  "No matching device found — user may lack event device access".to_string(),
-                severity: "error",
-            });
-        } else {
-            // The file name has nothing to do with this: a base config is
-            // matched to hardware through `[device] names`, which is a list of
-            // substrings tested against the evdev name. Saying otherwise sends
-            // people renaming files that were never the problem.
-            println!(
-                "No matching devices found.\n\
-                 Note: a base config finds its device through the `names` list in \
-                 its [device] section — each entry is matched as a substring of \
-                 the evdev device name reported by 'evtest'. The config's file \
-                 name plays no part in it.\n"
-            );
-            let _ = state_tx.try_send(StateCommand::SetError {
-                id:       "no_device".to_string(),
-                message:  "No matching device found — check that [device] names in the base config matches the evdev device name from 'evtest'".to_string(),
-                severity: "error",
-            });
-        }
-    } else {
-        let _ = state_tx.try_send(StateCommand::ClearError { id: "no_device".to_string() });
-    }
+    report_scan_result(devices_found, user_has_access, state_tx);
 
     modifiers
 }

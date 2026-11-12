@@ -1807,3 +1807,85 @@ fn a_module_can_still_be_disabled() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Watcher filter ────────────────────────────────────────────────────────────
+//
+// The file watcher is the trigger of issue #42's item 5 — an edit that it
+// does not report is an edit that never takes effect, however correct the
+// reload behind it is.
+
+fn fs_event(kind: notify::EventKind, path: &str) -> notify::Event {
+    notify::Event::new(kind).add_path(PathBuf::from(path))
+}
+
+fn modify() -> notify::EventKind {
+    notify::EventKind::Modify(notify::event::ModifyKind::Any)
+}
+
+#[test]
+fn editing_a_toml_is_a_config_change() {
+    assert!(ConfigRegistry::is_config_change(&fs_event(modify(), "/etc/deckery/Steam Deck.toml")));
+}
+
+#[test]
+fn creating_or_removing_a_toml_is_a_config_change() {
+    // Dropping a module into apps/ or deleting one changes what is loaded
+    // just as much as editing it does.
+    use notify::event::{CreateKind, RemoveKind};
+    assert!(ConfigRegistry::is_config_change(&fs_event(
+        notify::EventKind::Create(CreateKind::File), "/home/u/.config/deckery/apps/game.toml")));
+    assert!(ConfigRegistry::is_config_change(&fs_event(
+        notify::EventKind::Remove(RemoveKind::File), "/home/u/.config/deckery/apps/game.toml")));
+}
+
+#[test]
+fn preferences_toml_is_not_a_config_change() {
+    // Written by makima itself on every tray toggle; reacting to it would
+    // reload everything to re-read what was just written.
+    assert!(!ConfigRegistry::is_config_change(&fs_event(modify(), "/home/u/.config/deckery/preferences.toml")));
+}
+
+#[test]
+fn other_files_are_not_a_config_change() {
+    // Editor swap files and backups land next to the configs all the time.
+    for path in ["/etc/deckery/README.md", "/etc/deckery/.Steam Deck.toml.swp",
+                 "/etc/deckery/Steam Deck.toml~", "/etc/deckery/apps"] {
+        assert!(!ConfigRegistry::is_config_change(&fs_event(modify(), path)), "{path}");
+    }
+}
+
+#[test]
+fn reading_a_toml_is_not_a_config_change() {
+    // Access events fire when makima itself loads the file on reload; treating
+    // them as changes would make every reload trigger the next one.
+    let access = notify::EventKind::Access(notify::event::AccessKind::Read);
+    assert!(!ConfigRegistry::is_config_change(&fs_event(access, "/etc/deckery/Steam Deck.toml")));
+}
+
+#[test]
+fn one_toml_among_several_paths_is_enough() {
+    // A rename event carries both the old and the new name.
+    let event = notify::Event::new(modify())
+        .add_path(PathBuf::from("/etc/deckery/.Steam Deck.toml.tmp"))
+        .add_path(PathBuf::from("/etc/deckery/Steam Deck.toml"));
+    assert!(ConfigRegistry::is_config_change(&event));
+}
+
+#[tokio::test]
+async fn writing_a_config_file_signals_the_watcher() {
+    // One test through real inotify, so the filter above is known to be wired
+    // to the watcher over the directories the registry actually reads.
+    let root = scratch_dir("deckery-watcher-signal");
+    let system = root.join("system");
+    std::fs::create_dir_all(system.join("apps")).unwrap();
+    let registry = ConfigRegistry::load(roots_at(&system));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let _watcher = registry.start_watcher(tx);
+
+    std::fs::write(system.join("apps").join("game.toml"), "[module]\n").unwrap();
+
+    let signalled = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+    assert!(matches!(signalled, Ok(Some(()))), "expected a change signal, got: {:?}", signalled);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
