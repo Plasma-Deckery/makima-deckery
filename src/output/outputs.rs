@@ -156,8 +156,10 @@ impl Outputs {
                 // Done above.
                 OutputAction::Frame { .. } | OutputAction::Forward { .. } => {}
 
-                OutputAction::Internal(InternalCommand::SetGamingMode { enabled, .. }) => {
-                    if let Some(tx) = &self.internal {
+                // A preview stops here: it says what the press would do, and
+                // the port on the other end can only switch the mode.
+                OutputAction::Internal(InternalCommand::SetGamingMode { enabled, preview }) => {
+                    if let (false, Some(tx)) = (preview, &self.internal) {
                         let _ = tx.send(*enabled).await;
                     }
                 }

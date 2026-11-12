@@ -76,7 +76,7 @@ async fn the_internal_port_carries_gaming_mode_back() {
 /// A preview toggle is a different action, and must not reach the port — that is
 /// what `preview` means: show what the press would do, do not do it.
 #[tokio::test]
-async fn a_preview_toggle_still_goes_out_as_an_action() {
+async fn a_preview_toggle_goes_out_as_an_action_but_not_to_the_port() {
     let (tx, mut rx) = mpsc::channel(4);
     let (tap_tx, mut tap_rx) = mpsc::channel(4);
     let outputs = Outputs {
@@ -91,10 +91,10 @@ async fn a_preview_toggle_still_goes_out_as_an_action() {
 
     // Visible to anything watching …
     assert_eq!(drain(&mut tap_rx).len(), 1);
-    // … and the owner is the one that decides what preview means, so the port
-    // still sees it. The distinction lives in the action, which is why `preview`
-    // is part of its identity.
-    assert_eq!(rx.try_recv().ok(), Some(true));
+    // … but not sent on: the port carries a bare bool into
+    // `set_gaming_mode(_, paused = false)`, so whatever reaches it switches the
+    // mode. A double-click on the trigger while paused used to do exactly that.
+    assert!(rx.try_recv().is_err());
 }
 
 /// A snapshot goes through the state port urgently or droppably, and the two are
