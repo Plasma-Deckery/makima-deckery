@@ -60,6 +60,37 @@ fn held_hint_modifier_stays_out_of_held_modifiers() {
     assert_eq!(state["context"]["held_modifiers"], serde_json::json!([]));
 }
 
+/// A held hint modifier is listed under the key it has in
+/// available_modifiers, so the HUD can draw it like a held real modifier.
+#[test]
+fn held_hint_modifier_is_listed_in_held_hint_modifiers() {
+    let config = config_with_ctrl_hints();
+    let state = build_state(
+        &config, &[], false, false,
+        &[key(Key::BTN_GRIPR2)],
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    assert_eq!(state["context"]["held_hint_modifiers"], serde_json::json!(["BTN_GRIPR2"]));
+}
+
+/// Nothing held — or only a real modifier held — lists nothing.
+#[test]
+fn held_hint_modifiers_is_empty_without_a_held_hint_modifier() {
+    let config = config_with_ctrl_hints();
+    for (modifiers, held) in [
+        (vec![], vec![]),
+        (vec![key(Key::BTN_TL)], vec![key(Key::BTN_TL)]),
+    ] {
+        let state = build_state(
+            &config, &modifiers, false, false, &held,
+            &None, &["test".to_string()], &GamingModeConfig::default(),
+        );
+        assert_eq!(state["context"]["held_hint_modifiers"], serde_json::json!([]),
+            "held: {held:?}");
+    }
+}
+
 /// Matching is exact. Adding a real modifier on top of the hint modifier must
 /// hide the hint — L1 opens an actual layer, so R5-only hints no longer apply.
 #[test]

@@ -44,12 +44,13 @@ use std::path::PathBuf;
 /// directions.
 ///
 /// L1 is a layer key — `L1 = []` plus `L1-X` — and Steam a modifier with no
-/// binding of its own, only `Steam-X`. Select and R5 have no binding at all.
+/// binding of its own, only `Steam-X`. R5 emits Ctrl and is a hint modifier
+/// through `[hints]`, never a real one. Select has no binding at all.
 pub(super) const BASE: &str = r#"
 [device]
 class = "hid-steam"
 names = ["Steam Deck"]
-aliases = { A = "BTN_SOUTH", B = "BTN_EAST", X = "BTN_WEST", Y = "BTN_NORTH", L1 = "BTN_TL", R1 = "BTN_TR", L2 = "BTN_TL2", R2 = "BTN_TR2", L3 = "BTN_THUMBL", R3 = "BTN_THUMBR", L4 = "BTN_GRIPL", R4 = "BTN_GRIPR", Down = "BTN_DPAD_DOWN", Start = "BTN_START", Steam = "BTN_MODE" }
+aliases = { A = "BTN_SOUTH", B = "BTN_EAST", X = "BTN_WEST", Y = "BTN_NORTH", L1 = "BTN_TL", R1 = "BTN_TR", L2 = "BTN_TL2", R2 = "BTN_TR2", L3 = "BTN_THUMBL", R3 = "BTN_THUMBR", L4 = "BTN_GRIPL", R4 = "BTN_GRIPR", Down = "BTN_DPAD_DOWN", Start = "BTN_START", Steam = "BTN_MODE", R5 = "BTN_GRIPR2" }
 
 [remap]
 L2 = { keys = ["BTN_RIGHT"], no_pause = true, silent = true }
@@ -63,6 +64,7 @@ Y     = { keys = ["KEY_SPACE"], while_gaming = true }
 L1 = []
 R1 = []
 L4 = ["KEY_LEFTSHIFT"]
+R5 = ["KEY_LEFTCTRL"]
 "-R4" = ["KEY_TAB"]
 LSTICK_UP = ["KEY_UP"]
 
@@ -70,6 +72,9 @@ L1-X     = { keys = ["KEY_LEFTCTRL", "KEY_C"], label = "Copy" }
 L4-A     = { keys = ["KEY_LEFTCTRL", "KEY_S"], label = "Save" }
 R1-Start = { keys = ["KEY_LEFTALT", "KEY_F4"], label = "Close" }
 Steam-X  = { keys = [], label = "(Steam Keyboard)" }
+
+[hints]
+KEY_LEFTCTRL-KEY_ENTER = "Send"
 
 [commands]
 L3 = { run = ["deckery-hud-toggle"], no_pause = true, silent = true, label = "Toggle HUD" }
@@ -386,6 +391,14 @@ pub(super) fn announced(actions: &[OutputAction]) -> Vec<Option<String>> {
             _ => None,
         })
         .collect()
+}
+
+/// The last state snapshot published among `actions`, if any.
+pub(super) fn last_published(actions: &[OutputAction]) -> Option<&serde_json::Value> {
+    actions.iter().rev().find_map(|a| match a {
+        OutputAction::State(StateAction::Publish { snapshot, .. }) => Some(&**snapshot),
+        _ => None,
+    })
 }
 
 pub(super) fn commands(actions: &[OutputAction]) -> Vec<Vec<String>> {

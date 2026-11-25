@@ -154,3 +154,19 @@ async fn pressing_steam_does_not_end_an_r2_drag() {
         "Steam released the held mouse button: {:?}", keys(&steam),
     );
 }
+
+/// R5 is Ctrl and a hint modifier, not a real one: holding it lists it in
+/// `held_hint_modifiers` of the published state, and letting go clears it.
+#[tokio::test]
+async fn a_held_hint_modifier_is_published_in_held_hint_modifiers() {
+    let mut deck = Deck::new("hintmod");
+
+    let r5 = deck.press(Key::BTN_GRIPR2).await;
+    let state = last_published(&r5).expect("the press publishes state");
+    assert_eq!(state["context"]["held_hint_modifiers"], serde_json::json!(["BTN_GRIPR2"]));
+    assert_eq!(state["context"]["held_modifiers"], serde_json::json!([]));
+
+    let r5_up = deck.release(Key::BTN_GRIPR2).await;
+    let state = last_published(&r5_up).expect("the release publishes state");
+    assert_eq!(state["context"]["held_hint_modifiers"], serde_json::json!([]));
+}

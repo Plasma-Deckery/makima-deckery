@@ -327,6 +327,15 @@ pub fn build_state(
     // Build modifier_active: combos reachable given the currently held modifiers.
     let active_input_mods = active_input_modifiers(config, modifiers);
     let hint_mods = hint_modifiers(config, &active_input_mods, held_keys);
+    // held_hint_modifiers: hint modifiers held right now that are not real
+    // input modifiers (those are in held_modifiers already). Same encoding as
+    // the keys of available_modifiers, so the HUD can match one against the
+    // other and draw a held R5 like a held L1.
+    let held_hint_modifiers: Vec<String> = hint_mods
+        .iter()
+        .filter(|m| !active_input_mods.contains(m))
+        .map(event_to_str)
+        .collect();
     let shown_under = |combo: &Vec<Event>, held: &[Event]| -> bool {
         combo_satisfied(combo, held)
     };
@@ -569,6 +578,7 @@ pub fn build_state(
             "active_buttons": active_buttons,
             "active_outputs": active_outputs,
             "available_modifiers": available_modifiers,
+            "held_hint_modifiers": held_hint_modifiers,
         },
         "last_action": last_action,
         "bindings": bindings,
