@@ -255,3 +255,18 @@ fn the_snapshot_is_build_state_with_the_analog_half_nulled() {
     expected["context"]["analog_state_export"] = serde_json::Value::Bool(false);
     assert_eq!(snapshot, expected);
 }
+
+// ── parse: the override session ─────────────────────────────────────────────
+
+/// Every line that starts with the word `override` is an override command, so
+/// the control socket answers it — a malformed one with the usage.
+#[test]
+fn override_lines_parse_as_override_commands() {
+    use crate::override_session::OverrideCommand;
+    assert_eq!(parse("override begin\n"), Some(IpcCommand::Override(OverrideCommand::Begin)));
+    assert_eq!(parse(r#"override set remap.A ["KEY_ENTER"]"#), Some(IpcCommand::Override(
+        OverrideCommand::Set { path: "remap.A".into(), value: r#"["KEY_ENTER"]"#.into() })));
+    assert!(matches!(parse("override"), Some(IpcCommand::Override(OverrideCommand::Malformed(_)))));
+    assert!(matches!(parse("override heartbeat"), Some(IpcCommand::Override(OverrideCommand::Malformed(_)))));
+    assert_eq!(parse("overrides begin"), None);
+}
