@@ -1,6 +1,6 @@
 Name:           makima-deckery
 Version:        2.0.0~beta1
-Release:        9%{?dist}
+Release:        10%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
 License:        GPL-3.0-only
@@ -91,6 +91,9 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Wed Nov 25 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-10
+- state.json lists held hint modifiers in context.held_hint_modifiers
+
 * Thu Nov 12 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-9
 - Sticks are as fast left/up as right/down (full deflection was -15 vs 17)
 - Pressing Steam no longer ends an R2 drag
