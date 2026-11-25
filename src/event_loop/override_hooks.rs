@@ -10,7 +10,8 @@
 //!   switched off while one is open — the tour runs on the desktop bindings;
 //! * watch the raw buttons for the emergency exit, which works whatever the
 //!   layer has cleared;
-//! * say in the state export that a session is open.
+//! * say in the state export that a session is open, and that the Gaming
+//!   Mode trigger is not there while it is.
 
 use super::*;
 use crate::config::DoubleclickTrigger;
@@ -88,9 +89,14 @@ impl EventReader {
         }
     }
 
-    /// `context.override_active` in a snapshot.
+    /// `context.override_active` in a snapshot — and, while a session is
+    /// open, no `gaming_mode_trigger`, since the trigger is off for the
+    /// session and the HUD must not label the button with it.
     pub(super) fn mark_override(&self, state: &mut serde_json::Value) {
-        state["context"]["override_active"] =
-            serde_json::Value::Bool(self.override_session.is_active());
+        let active = self.override_session.is_active();
+        state["context"]["override_active"] = serde_json::Value::Bool(active);
+        if active {
+            state["gaming_mode_trigger"] = serde_json::Value::Null;
+        }
     }
 }

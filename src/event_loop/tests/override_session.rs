@@ -276,13 +276,15 @@ async fn a_trackpad_mode_change_rebuilds_the_device_session() {
 }
 
 /// The state export says a session is open and shows the layer's bindings,
-/// so the HUD draws only what the tour unlocked.
+/// so the HUD draws only what the tour unlocked — and no Gaming Mode trigger,
+/// which is off for the session.
 #[tokio::test]
 async fn the_state_export_shows_the_session() {
     let mut deck = Deck::new("override-state");
     let (_, begun) = deck.override_cmd("override begin").await;
     let state = last_published(&begun).expect("begin publishes");
     assert_eq!(state["context"]["override_active"], serde_json::json!(true));
+    assert_eq!(state["gaming_mode_trigger"], serde_json::Value::Null);
     assert!(state["bindings"].get("BTN_EAST").is_some());
 
     let (_, cleared) = deck.override_cmd("override clear").await;
@@ -297,6 +299,7 @@ async fn the_state_export_shows_the_session() {
     let (_, ended) = deck.override_cmd("override end").await;
     let state = last_published(&ended).expect("end publishes");
     assert_eq!(state["context"]["override_active"], serde_json::json!(false));
+    assert_eq!(state["gaming_mode_trigger"]["key"], serde_json::json!("BTN_BASE"));
     assert!(state["bindings"].get("BTN_EAST").is_some());
 }
 
