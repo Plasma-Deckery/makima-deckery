@@ -3,6 +3,7 @@ mod analog;
 mod auto_mute;
 mod config;
 mod config_registry;
+mod control_socket;
 mod decode;
 mod device_session;
 mod device_tasks;
@@ -37,7 +38,6 @@ use crate::udev_monitor::start_monitoring_udev;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio;
-use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -117,46 +117,13 @@ async fn main() {
 
     // IPC socket — bound once here, broadcast to all active EventReaders.
     let (ipc_tx, _) = broadcast::channel::<String>(16);
-    {
-        let ipc_tx = ipc_tx.clone();
-        tokio::spawn(async move {
-            // Bind in $XDG_RUNTIME_DIR (= /run/user/<uid>), not /tmp.
-            //
-            // /tmp is mode 1777, so any local process can create the socket
-            // name before we bind it. This socket accepts "pause", i.e. it can
-            // switch off input remapping — not something to leave squattable.
-            // The runtime dir is mode 0700 and per-user, which additionally
-            // lets deckery-auth-daemon address each user's instance separately
-            // (it scans /run/user/*/makima-control.sock); a single /tmp path
-            // cannot express that. It is also why the daemon can reach us at
-            // all: it runs with PrivateTmp=yes and sees an empty /tmp.
-            //
-            // No /tmp fallback on purpose — it would silently downgrade to the
-            // squattable path in exactly the situation where something is
-            // already unusual.
-            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-                .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
-            let socket_path = format!("{runtime_dir}/makima-control.sock");
-            let _ = std::fs::remove_file(&socket_path);
-            let listener = match UnixListener::bind(&socket_path) {
-                Ok(l) => l,
-                Err(e) => { eprintln!("deckery: IPC socket bind failed: {}", e); return; }
-            };
-            loop {
-                let Ok((stream, _)) = listener.accept().await else { continue };
-                use tokio::io::AsyncBufReadExt;
-                let mut reader = tokio::io::BufReader::new(stream);
-                let mut line = String::new();
-                let read = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    reader.read_line(&mut line),
-                ).await;
-                if read.is_err() || read.unwrap().is_err() { continue; }
-                let cmd = line.trim().to_string();
-                if !cmd.is_empty() { let _ = ipc_tx.send(cmd); }
-            }
-        });
-    }
+    // The override session outlives every device generation, like the registry
+    // it lays its layer into. Held in memory only: a restart starts without one.
+    let (override_session, device_requests) =
+        override_session::OverrideSession::new(registry.clone());
+    tokio::spawn(control_socket::serve(ipc_tx.clone(), override_session.clone()));
 
-    start_monitoring_udev(registry, tasks, gaming_mode, state_tx, ipc_tx).await;
+    start_monitoring_udev(
+        registry, tasks, gaming_mode, state_tx, ipc_tx, override_session, device_requests,
+    ).await;
 }

@@ -6,8 +6,10 @@ use crate::virtual_devices::VirtualDevices;
 /// A session with nothing in it: no configs, no devices, no display server.
 /// Enough to drive launch_tasks, which is what these tests are about.
 fn empty_session(state_tx: StateWriterHandle) -> DeviceSession {
+    let registry = ConfigRegistry::empty();
     DeviceSession {
-        registry:            ConfigRegistry::empty(),
+        override_session:    crate::override_session::OverrideSession::new(registry.clone()).0,
+        registry,
         environment:         Environment {
             user: Ok("test".to_string()),
             sudo_user: Err(std::env::VarError::NotPresent),

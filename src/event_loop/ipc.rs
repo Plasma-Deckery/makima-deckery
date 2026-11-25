@@ -15,7 +15,7 @@ use super::*;
 
 /// One command the control socket understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum IpcCommand {
+pub(crate) enum IpcCommand {
     /// Suppress remaps and let go of every held output key.
     Pause,
     /// Undo `Pause`. Sends nothing.
@@ -29,6 +29,10 @@ pub(super) enum IpcCommand {
     ConfigGroup { enabling: bool, name: String },
     /// Enable or disable a single config by name.
     Config { enabling: bool, name: String },
+    /// One of the override session's commands. Answered by the control socket
+    /// itself, which is why it never reaches a reader — see
+    /// `crate::control_socket`.
+    Override(crate::override_session::OverrideCommand),
 }
 
 /// What a line from the control socket asks for, or `None` if nothing.
@@ -45,7 +49,11 @@ pub(super) enum IpcCommand {
 /// that costs. The group prefixes are tried before the config ones, though no
 /// line can match both: `config group enable …` does not start with
 /// `config enable `.
-pub(super) fn parse(cmd: &str) -> Option<IpcCommand> {
+///
+/// Every line starting with the word `override` is an override command, a
+/// malformed one included: that one is answered with an error, because the
+/// sender waits for a reply.
+pub(crate) fn parse(cmd: &str) -> Option<IpcCommand> {
     let cmd = cmd.trim();
     match cmd {
         "pause" => Some(IpcCommand::Pause),
@@ -73,6 +81,9 @@ pub(super) fn parse(cmd: &str) -> Option<IpcCommand> {
             };
             Some(IpcCommand::Config { enabling, name: name.to_string() })
         }
+        _ if cmd == "override" || cmd.starts_with("override ") => Some(IpcCommand::Override(
+            crate::override_session::command::parse(&cmd["override".len()..]),
+        )),
         _ => None,
     }
 }
@@ -148,10 +159,11 @@ impl EventReader {
                     let hk = match tokio::time::timeout(TIMEOUT, self.held_keys.lock()).await {
                         Ok(g) => g.clone(), Err(_) => continue,
                     };
-                    let event_state = pause_resume_snapshot(
+                    let mut event_state = pause_resume_snapshot(
                         &config, &mods, is_paused, is_gaming,
                         &hk, &la, &self.base_name, &self.gaming_mode_config,
                     );
+                    self.mark_override(&mut event_state);
                     // pause/resume is a discrete event — must not be dropped.
                     let _ = self.state_tx.send(StateCommand::SetEventState(Some(event_state))).await;
                 }
@@ -176,6 +188,9 @@ impl EventReader {
                         StateCommand::SetLoadedConfigs(self.registry.snapshot())
                     ).await;
                 }
+                // The control socket answers these before anything is
+                // broadcast; one arriving here was sent by nobody.
+                IpcCommand::Override(_) => {}
                 IpcCommand::Config { enabling, name } => {
                     // set_enabled and snapshot are synchronous (std::sync::Mutex) — no .await.
                     if !self.registry.set_enabled(&name, enabling) {

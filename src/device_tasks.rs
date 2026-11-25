@@ -52,6 +52,8 @@ pub struct DeviceSession {
     /// changes its mind: a flag that every rebuild — a config reload, a
     /// device change — reset to off stopped the export behind its back.
     pub analog_state_export: Arc<Mutex<bool>>,
+    /// The one override session, handed to every reader.
+    pub override_session:    Arc<crate::override_session::OverrideSession>,
 }
 
 /// Spawn a reconnecting evdev reader for a non-Steam-Deck device.
@@ -270,6 +272,7 @@ pub async fn launch_tasks(
         registry, environment, device_error_notify, active_client,
         window_changed, gaming_mode, state_tx, ipc_tx, virt_dev, game_focus,
         analog_state_export,
+        override_session,
     } = session;
     // Unified Gaming Mode channel: steam detection and IPC both send here.
     // The EventReader's gaming_mode_set_loop is the sole consumer.
@@ -444,6 +447,7 @@ pub async fn launch_tasks(
             gaming_mode_tx.clone(),
             state_tx.clone(),
             analog_state_export.clone(),
+            override_session.clone(),
         );
         tasks.push(tokio::spawn(start_reader(reader, gaming_rx, ipc_tx.subscribe(), session)));
         devices_found += 1;

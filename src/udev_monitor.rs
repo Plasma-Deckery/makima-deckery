@@ -4,12 +4,21 @@ use crate::device_tasks::{self, DeviceSession};
 use crate::session::{Client, Server};
 use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle};
 use crate::virtual_devices::VirtualDevices;
+use crate::override_session::{DeviceRequest, OverrideSession};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
-pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec<JoinHandle<()>>, gaming_mode: Arc<Mutex<bool>>, state_tx: StateWriterHandle, ipc_tx: broadcast::Sender<String>) {
+pub async fn start_monitoring_udev(
+    registry: Arc<ConfigRegistry>,
+    mut tasks: Vec<JoinHandle<()>>,
+    gaming_mode: Arc<Mutex<bool>>,
+    state_tx: StateWriterHandle,
+    ipc_tx: broadcast::Sender<String>,
+    override_session: Arc<OverrideSession>,
+    mut device_requests: tokio::sync::mpsc::UnboundedReceiver<DeviceRequest>,
+) {
     let environment = crate::session::set_environment();
     // Modules gated by `[module] requires_compositor` can only be judged once
     // the session environment is known, which is later than registry load time.
@@ -100,6 +109,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec
         virt_dev:            virt_dev.clone(),
         game_focus,
         analog_state_export: Arc::new(Mutex::new(false)),
+        override_session:    override_session.clone(),
     };
 
     let mut prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
@@ -150,8 +160,29 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec
             }
             Some(_) = config_rx.recv() => {
                 settle_config_changes(&mut config_rx).await;
+                // Held back while an override session is open. Its end reads
+                // the files again anyway, which applies this change then.
+                if override_session.defers_file_reload() {
+                    continue;
+                }
                 println!("---------------------\n\nConfig changed, reloading...\n");
                 reload_configs(&registry, &state_tx);
+                device_tasks::release_held_modifiers(&virt_dev, &prev_modifiers).await;
+                for task in &tasks {
+                    task.abort();
+                }
+                tasks.clear();
+                prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
+            }
+            Some(request) = device_requests.recv() => {
+                // The override session changed something a device session
+                // only reads at its start, or ended: rebuild the device tasks
+                // the way a config reload does, reading the files first when
+                // the session is over.
+                println!("---------------------\n\nOverride session: {request:?}, reinitializing...\n");
+                if request == DeviceRequest::Reload {
+                    reload_configs(&registry, &state_tx);
+                }
                 device_tasks::release_held_modifiers(&virt_dev, &prev_modifiers).await;
                 for task in &tasks {
                     task.abort();

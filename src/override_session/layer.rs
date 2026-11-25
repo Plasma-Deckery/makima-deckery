@@ -35,6 +35,7 @@ pub struct Layer {
 }
 
 impl Layer {
+    #[cfg(test)]
     pub fn is_cleared(&self) -> bool {
         self.cleared
     }

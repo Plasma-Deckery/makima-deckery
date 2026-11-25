@@ -8,6 +8,7 @@
 //! * `state` — gathering the snapshot the overlay reads
 //! * `ipc` — the control socket's commands
 //! * `sticks` — the four timer-driven motion loops
+//! * `override_hooks` — the reader's part in an override session
 //!
 //! What stays here is the struct, its construction, and the tasks that
 //! coordinate the rest: `start`, the Gaming Mode setter and its channel, the
@@ -18,6 +19,7 @@
 
 mod convert_event;
 mod ipc;
+mod override_hooks;
 mod read_event;
 mod state;
 mod sticks;
@@ -43,7 +45,9 @@ use std::{
 };
 use crate::settings::Settings;
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
+use crate::override_session::OverrideSession;
 
+pub(crate) use ipc::{parse as parse_ipc_line, IpcCommand};
 
 
 
@@ -139,6 +143,14 @@ pub struct EventReader {
     /// a state write now asks for one — including a detached task waiting on a
     /// spawned command, which holds a clone of the whole `Outputs`.
     state_write_rx: Mutex<Option<mpsc::Receiver<crate::output::action::Urgency>>>,
+    /// The override session, shared by every reader and the control socket.
+    /// While one is open the reader ends Gaming Mode and refuses it, and
+    /// watches for the emergency exit — see `override_hooks`.
+    override_session: Arc<OverrideSession>,
+    /// Which buttons of the emergency exit are down, and its change feed for
+    /// `emergency_exit_loop`.
+    emergency_combo: std::sync::Mutex<crate::override_session::emergency::ComboTracker>,
+    emergency_held: tokio::sync::watch::Sender<bool>,
 }
 
 /// The effect side of a reader: where its actions go, plus the two handles the
@@ -170,6 +182,7 @@ impl EventReader {
         gaming_mode_tx: mpsc::Sender<bool>,
         state_tx: StateWriterHandle,
         analog_state_export: Arc<Mutex<bool>>,
+        override_session: Arc<OverrideSession>,
     ) -> Self {
         // The production ports. `last_action` and the publish channel are made
         // here because the reader keeps the other end of each: it reads the
@@ -194,7 +207,7 @@ impl EventReader {
         Self::assemble(
             base_config, registry, base_name, event_rx, is_tablet, max_abs_wheel,
             lizard_mode, modifiers, modifier_was_activated, environment, active_client,
-            window_changed, gaming_mode, gaming_mode_tx, state_tx, analog_state_export, ports,
+            window_changed, gaming_mode, gaming_mode_tx, state_tx, analog_state_export, ports, override_session,
         )
     }
 
@@ -222,6 +235,7 @@ impl EventReader {
         state_tx: StateWriterHandle,
         analog_state_export: Arc<Mutex<bool>>,
         ports: Ports,
+        override_session: Arc<OverrideSession>,
     ) -> Self {
         let Ports { outputs, last_action, state_write_rx } = ports;
         let mut position_vector: Vec<i32> = Vec::new();
@@ -312,6 +326,9 @@ impl EventReader {
             gaming_mode_tx,
             state_tx,
             state_write_rx: Mutex::new(Some(state_write_rx)),
+            override_session,
+            emergency_combo: Default::default(),
+            emergency_held: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -333,6 +350,8 @@ impl EventReader {
             self.gaming_mode_set_loop(gaming_rx),
             self.state_write_loop(state_rx),
             self.ipc_command_loop(ipc_rx),
+            self.override_loop(),
+            self.emergency_exit_loop(),
             async {
                 // The trackpad session is a producer of its own — hidraw
                 // frames, not events — and still performs its own effects. It
@@ -420,6 +439,10 @@ impl EventReader {
     /// Returns when all senders are dropped (device disconnected / non-KDE).
     async fn gaming_mode_set_loop(&self, mut rx: mpsc::Receiver<bool>) {
         while let Some(new_state) = rx.recv().await {
+            if new_state && self.override_session.is_active() {
+                println!("deckery: Gaming Mode refused — an override session is open");
+                continue;
+            }
             if new_state != *self.gaming_mode.lock().await {
                 println!("deckery: Gaming Mode trigger — channel, new_state={}", new_state);
                 self.set_gaming_mode(new_state, false).await;

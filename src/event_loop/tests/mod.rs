@@ -36,6 +36,7 @@ use super::*;
 use crate::config_registry::ConfigRoots;
 use crate::output::action::{Emission, OutputAction, StateAction};
 use crate::output::outputs::Tap;
+use crate::override_session::DeviceRequest;
 use std::path::PathBuf;
 
 /// The shipped base config, cut down to what these tests press, plus the few
@@ -109,10 +110,11 @@ impl EventReader {
     ///
     /// Everything that is not a port is what `device_tasks` hands to `new` for
     /// a Steam Deck, except that nothing outside this reader shares it: the
-    /// modifier set and the Gaming Mode flag are its own, and the channels it
-    /// would send to elsewhere — Gaming Mode requests, state commands — have
-    /// their receivers dropped, so whatever is sent is refused at once instead
-    /// of piling up. The session is one with no display server unless the test
+    /// modifier set and the Gaming Mode flag are its own, and the state
+    /// commands it would send elsewhere have their receiver dropped, so
+    /// whatever is sent is refused at once instead of piling up. Gaming Mode
+    /// requests go to the caller, which is how a test sees the override
+    /// session end Gaming Mode. The session is one with no display server unless the test
     /// says KDE, where the focused window is whatever `active_client` holds.
     fn for_test(
         base_config: Config,
@@ -121,6 +123,8 @@ impl EventReader {
         environment: Environment,
         tap: Tap,
         analog_state_export: Arc<Mutex<bool>>,
+        gaming_mode_tx: mpsc::Sender<bool>,
+        override_session: Arc<OverrideSession>,
     ) -> Self {
         let base_name = base_config.name.clone();
         // The reader's own cell, written by the port as in production, so a
@@ -136,7 +140,6 @@ impl EventReader {
             last_action,
             state_write_rx,
         };
-        let (gaming_mode_tx, _) = mpsc::channel(1);
         let (state_tx, _) = mpsc::channel(1);
         Self::assemble(
             base_config, registry, base_name, event_rx, false, 0, None,
@@ -144,7 +147,7 @@ impl EventReader {
             // What `device_tasks` starts it at.
             Arc::new(Mutex::new(true)),
             environment, Arc::new(Mutex::new(Client::Default)), Arc::new(Notify::new()),
-            Arc::new(Mutex::new(false)), gaming_mode_tx, state_tx, analog_state_export, ports,
+            Arc::new(Mutex::new(false)), gaming_mode_tx, state_tx, analog_state_export, ports, override_session,
         )
     }
 }
@@ -156,13 +159,29 @@ pub(super) struct Deck {
     events: mpsc::Sender<ControllerEvent>,
     tap: mpsc::Receiver<Emission>,
     read_loop: tokio::task::JoinHandle<()>,
+    /// The reader's emergency-exit timer, which runs beside the read loop in
+    /// production too.
+    emergency_loop: tokio::task::JoinHandle<()>,
     dir: PathBuf,
+    server: Server,
+    /// The override session this reader shares with the control socket.
+    pub session: Arc<OverrideSession>,
+    /// What the session asked the device loop for, which the harness stands in
+    /// for — see `settle`.
+    device_requests: tokio::sync::mpsc::UnboundedReceiver<DeviceRequest>,
+    /// Every device request seen so far, oldest first.
+    pub device_log: Vec<DeviceRequest>,
+    /// Gaming Mode requests the reader sent, waiting for `settle`.
+    gaming_requests: mpsc::Receiver<bool>,
 }
 
 impl Drop for Deck {
     fn drop(&mut self) {
         self.read_loop.abort();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        self.emergency_loop.abort();
+        if !self.dir.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -194,8 +213,15 @@ impl Deck {
         std::fs::create_dir_all(system.join("apps")).unwrap();
         std::fs::write(system.join("Steam Deck.toml"), BASE).unwrap();
         std::fs::write(system.join("apps").join("firefox.toml"), FIREFOX).unwrap();
+        Self::from_dir(dir, server, analog_state_export)
+    }
 
-        let registry = ConfigRegistry::load(ConfigRoots { system, user: dir.join("user") });
+    /// A reader for the configs already in `dir`, as a freshly started makima
+    /// would load them.
+    fn from_dir(dir: PathBuf, server: Server, analog_state_export: Arc<Mutex<bool>>) -> Self {
+        let registry = ConfigRegistry::load(ConfigRoots { system: dir.join("system"), user: dir.join("user") });
+        let (session, device_requests) = OverrideSession::new(registry.clone());
+        let (gaming_mode_tx, gaming_requests) = mpsc::channel(8);
         // What `device_tasks` hands to `new`.
         let base_config = registry.base_configs().into_iter().next()
             .expect("the base config parses");
@@ -206,10 +232,11 @@ impl Deck {
         let environment = Environment {
             user: Err(std::env::VarError::NotPresent),
             sudo_user: Err(std::env::VarError::NotPresent),
-            server,
+            server: server.clone(),
         };
         let reader = Arc::new(EventReader::for_test(
             base_config, registry, event_rx, environment, Tap::new(tap_tx), analog_state_export,
+            gaming_mode_tx, session.clone(),
         ));
         // The production loop, running for the whole test: what it keeps
         // between events — which stick direction is held, which trigger is
@@ -218,7 +245,70 @@ impl Deck {
             let reader = reader.clone();
             async move { reader.read_events().await }
         });
-        Self { reader, events, tap, read_loop, dir }
+        let emergency_loop = tokio::spawn({
+            let reader = reader.clone();
+            async move { reader.emergency_exit_loop().await }
+        });
+        Self {
+            reader, events, tap, read_loop, emergency_loop, dir, server, session,
+            device_requests, device_log: Vec::new(), gaming_requests,
+        }
+    }
+
+    /// makima stopped and started again over the same config files.
+    pub fn restart(mut self) -> Self {
+        let dir = std::mem::take(&mut self.dir);
+        let server = self.server.clone();
+        drop(self);
+        // A new process: nothing of the old device session survives.
+        Self::from_dir(dir, server, Arc::new(Mutex::new(false)))
+    }
+
+    /// Replace the base config on disk. Nothing reads it until a reload.
+    pub fn write_base(&self, text: &str) {
+        std::fs::write(self.dir.join("system").join("Steam Deck.toml"), text).unwrap();
+    }
+
+    /// One override line through the control socket's own `answer`, then
+    /// everything the session asked for carried out. Returns the reply and
+    /// what the reader did meanwhile.
+    pub async fn override_cmd(&mut self, line: &str) -> (String, Vec<OutputAction>) {
+        let reply = crate::control_socket::answer(line, &self.session)
+            .expect("an override line is answered by the control socket");
+        self.settle().await;
+        (reply, self.take())
+    }
+
+    /// Stand in for the device loop and the reader's override loop: carry out
+    /// what the session asked the device loop for, let the reader apply the
+    /// change, and pass its Gaming Mode requests to the production setter.
+    ///
+    /// A reload is what the device loop does too. A rebuild of the device
+    /// tasks cannot be done here — there is no device — so it is only
+    /// recorded in `device_log`; the reader re-resolves either way.
+    pub async fn settle(&mut self) {
+        while let Ok(request) = self.device_requests.try_recv() {
+            if request == DeviceRequest::Reload {
+                self.reader.registry.reload();
+            }
+            self.device_log.push(request);
+        }
+        self.reader.apply_override_change().await;
+        while let Ok(on) = self.gaming_requests.try_recv() {
+            let (tx, rx) = mpsc::channel(1);
+            tx.send(on).await.unwrap();
+            drop(tx);
+            self.reader.gaming_mode_set_loop(rx).await;
+        }
+    }
+
+    /// The config files changed, as the watcher reports it to the device
+    /// loop: read them again unless the session holds the reload back.
+    pub async fn config_files_changed(&mut self) {
+        if !self.session.defers_file_reload() {
+            self.reader.registry.reload();
+        }
+        self.reader.update_config().await;
     }
 
     /// Send `events` through the read loop and return what it did.
@@ -298,7 +388,7 @@ impl Deck {
     }
 
     /// What the tap has seen since the last call.
-    fn take(&mut self) -> Vec<OutputAction> {
+    pub fn take(&mut self) -> Vec<OutputAction> {
         let mut out = Vec::new();
         while let Ok(emission) = self.tap.try_recv() {
             out.push(emission.action);

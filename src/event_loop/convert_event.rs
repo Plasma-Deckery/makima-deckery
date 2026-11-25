@@ -23,6 +23,10 @@ impl EventReader {
         value: i32,
         send_zero: bool,
     ) {
+        // Before anything else, and whatever the config: the emergency exit
+        // has to work with every binding cleared.
+        self.track_emergency_combo(event, value);
+
         let gaming_mode = *self.gaming_mode.lock().await;
 
         // Both of these are decided without the config and have to be applied
@@ -70,7 +74,7 @@ impl EventReader {
                 modifiers: &modifiers,
                 gaming_mode,
                 paused,
-                trigger: self.gaming_mode_config.trigger.as_ref(),
+                trigger: self.gaming_mode_trigger(),
                 trigger_ts,
                 now: std::time::Instant::now(),
             })

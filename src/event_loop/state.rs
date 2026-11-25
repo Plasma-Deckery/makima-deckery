@@ -241,6 +241,11 @@ impl EventReader {
         event_state["sticks"]    = sticks;
         event_state["imu"]       = imu;
         event_state["context"]["analog_state_export"] = serde_json::Value::Bool(analog_state_export);
+        // Laid over the cached part like the analog export, for the same
+        // reason: it is not an input of `build_state`, so it is no part of the
+        // cache key. What the session changes in the bindings arrives as a new
+        // config `Arc`, which the key does compare.
+        self.mark_override(&mut event_state);
         // Through the state port like everything else, carrying both the
         // snapshot and how urgently it is meant: an analog tick at 60 Hz is
         // dropped rather than allowed to hold up the event loop, a button or a
