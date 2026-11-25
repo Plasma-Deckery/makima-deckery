@@ -29,6 +29,7 @@ fn make_registry(entries: Vec<ConfigEntry>) -> Arc<ConfigRegistry> {
         preferences: Mutex::new(crate::preferences::Preferences::default()),
         resolved: Mutex::new(HashMap::new()),
         generation: std::sync::atomic::AtomicU64::new(0),
+        override_layer: Mutex::new(None),
     })
 }
 
@@ -104,6 +105,7 @@ fn registry_with_user_root(entries: Vec<ConfigEntry>, user: &Path) -> Arc<Config
         preferences: Mutex::new(Preferences::default()),
         resolved: Mutex::new(HashMap::new()),
         generation: std::sync::atomic::AtomicU64::new(0),
+        override_layer: Mutex::new(None),
     })
 }
 

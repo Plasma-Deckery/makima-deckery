@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::config::{Config, Event};
+use crate::override_session::Layer;
 use crate::preferences::Preferences;
 use crate::session::Client;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -291,6 +292,10 @@ pub struct ConfigRegistry {
     /// that window and a stale result would otherwise be written on top of the
     /// clean slate it just made.
     generation: AtomicU64,
+    /// The override session's layer, laid over every config this registry
+    /// hands out while a session is open — see `crate::override_session`.
+    /// Set and cleared by the session only.
+    override_layer: Mutex<Option<Layer>>,
 }
 
 /// What a resolved config depends on. The other two fields of `Client::Class`
@@ -324,6 +329,7 @@ impl ConfigRegistry {
             preferences: Mutex::new(preferences),
             resolved: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            override_layer: Mutex::new(None),
         })
     }
 
@@ -342,6 +348,7 @@ impl ConfigRegistry {
             preferences: Mutex::new(Preferences::default()),
             resolved: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            override_layer: Mutex::new(None),
         })
     }
 
@@ -356,6 +363,7 @@ impl ConfigRegistry {
             preferences: Mutex::new(Preferences::default()),
             resolved: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            override_layer: Mutex::new(None),
         })
     }
 
@@ -529,7 +537,21 @@ impl ConfigRegistry {
     /// All usable base configs (those with a `[device]` section), each already
     /// merged with every enabled plain module.
     /// `launch_tasks()` iterates these declared targets to find physical devices.
+    ///
+    /// With an override session open, its layer is on top of each: a device
+    /// session started now — a reinit, or the rebuild after a trackpad mode
+    /// change — reads the trackpads and settings the session set.
     pub fn base_configs(&self) -> Vec<Config> {
+        let bases = self.base_configs_without_override();
+        match self.override_layer.lock().unwrap().as_ref() {
+            Some(layer) => bases.into_iter().map(|base| with_override(layer, base)).collect(),
+            None => bases,
+        }
+    }
+
+    /// `base_configs` as the files on disk make them, without an override
+    /// session's layer. What a new layer is validated against.
+    pub fn base_configs_without_override(&self) -> Vec<Config> {
         let compositor = self.compositor();
         let entries = self.entries.lock().unwrap();
         entries.values()
@@ -537,6 +559,21 @@ impl ConfigRegistry {
             .filter(|c| c.device.is_some())
             .map(|c| with_modules(&entries, c, compositor.as_deref()))
             .collect()
+    }
+
+    /// Every command line any loaded config binds, enabled or not: the
+    /// allowlist for an override session's `[commands]`.
+    pub fn known_commands(&self) -> HashSet<Vec<String>> {
+        let entries = self.entries.lock().unwrap();
+        crate::override_session::allowlist::known_commands(
+            entries.values().filter_map(|e| e.config.as_ref()))
+    }
+
+    /// Put an override session's layer over everything resolved from now on,
+    /// or take it away with `None`.
+    pub fn set_override(&self, layer: Option<Layer>) {
+        *self.override_layer.lock().unwrap() = layer;
+        self.invalidate_resolved();
     }
 
     /// All usable modules that declare a `match_window_class`. `active_client`
@@ -651,7 +688,13 @@ impl ConfigRegistry {
         // remap table including module and app overrides. Warnings are dropped
         // on the hot path — they are reported once at load by `hint_warnings()`.
         let _ = resolved.resolve_hints();
-        Some(resolved)
+        drop(entries);
+        // The override layer goes on last, above the focused app's override,
+        // so switching windows cannot get out from under it.
+        match self.override_layer.lock().unwrap().as_ref() {
+            Some(layer) => Some(with_override(layer, resolved)),
+            None => Some(resolved),
+        }
     }
 
     /// Hint problems across all loaded configs, resolved against each base.
@@ -962,6 +1005,19 @@ impl ConfigRegistry {
 }
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
+
+/// `config` with an override layer on top. The layer was validated against
+/// every base config before it went live, so this cannot fail in practice; if
+/// it does, the config underneath is the safer answer than none.
+fn with_override(layer: &Layer, config: Config) -> Config {
+    match layer.apply(&config) {
+        Ok(overridden) => overridden,
+        Err(e) => {
+            eprintln!("deckery: override layer does not apply to {:?}: {e}", config.name);
+            config
+        }
+    }
+}
 
 /// Button aliases from every base config in either root. Modules and app
 /// overrides live in `apps/` or carry no `[device]` block, so they contribute
