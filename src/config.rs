@@ -93,6 +93,41 @@ impl Default for TrackpadConfig {
     }
 }
 
+impl TrackpadConfig {
+    /// Build the trackpad config from its `[trackpad]` table.
+    pub fn from_raw(raw: RawTrackpadConfig) -> Self {
+        TrackpadConfig {
+            left: parse_trackpad_side(raw.left.as_ref()),
+            right: parse_trackpad_side(raw.right.as_ref()),
+            combined_gesture_device: raw.combined_gesture_device.unwrap_or(false),
+            gesture_kde_config: raw.gestures.as_ref()
+                .and_then(|v| v.get("kde"))
+                .cloned()
+                .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
+            gesture_handler_config: raw.gestures
+                .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
+        }
+    }
+
+    /// The `[trackpad]` table this config reads back from, so a change can be
+    /// laid over it in source form and parsed again by `from_raw`.
+    ///
+    /// Each side's handler table already holds the whole side as written,
+    /// `mode`, `click_pressure` and `kde` included, and the gestures table holds
+    /// its `kde` part, so nothing is lost on the way round. A side that was
+    /// never written comes back as an empty table, which parses as `disabled`
+    /// exactly like the absent one did.
+    pub fn to_raw_value(&self) -> toml::Value {
+        let mut table = toml::value::Table::new();
+        table.insert("left".into(), self.left.handler_config.clone());
+        table.insert("right".into(), self.right.handler_config.clone());
+        table.insert("combined_gesture_device".into(),
+            toml::Value::Boolean(self.combined_gesture_device));
+        table.insert("gestures".into(), self.gesture_handler_config.clone());
+        toml::Value::Table(table)
+    }
+}
+
 // ── Raw deserialization types ─────────────────────────────────────────────────
 
 #[derive(serde::Deserialize, Default, Debug, Clone)]
@@ -711,7 +746,52 @@ impl Config {
             .map_err(|e| format!("Cannot read {:?}: {}", file, e))?;
         let raw: RawConfig = toml::from_str(&content)
             .map_err(|e| format!("TOML error in {:?}: {}", file_name, e))?;
-        Ok(Self::from_raw(raw, file_name, aliases))
+        // A file keeps what it can: every skipped binding has been logged by
+        // the parser already, and the rest of the file still applies.
+        Ok(Self::from_raw(raw, file_name, aliases, &mut Vec::new()))
+    }
+
+    /// Parse a config held as a TOML value rather than a file, through the
+    /// same deserialisation and the same `from_raw` a file goes through.
+    ///
+    /// Returns the config and what the parser had to skip — a binding naming
+    /// an unknown button, a movement that is no movement. A file shrugs those
+    /// off with a warning; a caller that must apply all or nothing (the
+    /// override session) treats them as errors.
+    pub fn from_toml_value(
+        value: toml::Value,
+        file_name: String,
+        aliases: &HashMap<String, String>,
+    ) -> Result<(Self, Vec<String>), String> {
+        let raw: RawConfig = value.try_into()
+            .map_err(|e: toml::de::Error| e.to_string())?;
+        let mut problems = Vec::new();
+        let config = Self::from_raw(raw, file_name, aliases, &mut problems);
+        Ok((config, problems))
+    }
+
+    /// This config with every binding taken out: what an override session's
+    /// `clear` starts from.
+    ///
+    /// Settings, trackpads, Gaming Mode and what the config *is* stay. The
+    /// custom modifiers go with the bindings that registered them, except the
+    /// ones the settings declare, which `parse_raw_config` would register
+    /// with no binding at all — so a cleared config holds exactly the
+    /// modifiers an empty file with the same settings would.
+    pub fn without_bindings(&self) -> Self {
+        let mut cleared = self.clone();
+        cleared.bindings = Bindings::default();
+        cleared.override_bindings = None;
+        let mut custom = settings_modifiers(&self.settings, &self.aliases);
+        custom.sort();
+        custom.dedup();
+        cleared.mapped_modifiers.custom = custom;
+        let mut all = cleared.mapped_modifiers.default.clone();
+        all.extend(cleared.mapped_modifiers.custom.clone());
+        all.sort();
+        all.dedup();
+        cleared.mapped_modifiers.all = all;
+        cleared
     }
 
     /// Read only the `[device] aliases` table from a config file. Used by the
@@ -743,23 +823,14 @@ impl Config {
         raw_config: RawConfig,
         file_name: String,
         aliases: &HashMap<String, String>,
+        problems: &mut Vec<String>,
     ) -> Self {
         let raw_trackpad    = raw_config.trackpad.clone();
         let raw_gaming_mode = raw_config.gaming_mode.clone();
         let raw_device      = raw_config.device.clone();
         let raw_module      = raw_config.module.clone();
-        let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config, aliases);
-        let trackpad = TrackpadConfig {
-            left: parse_trackpad_side(raw_trackpad.left.as_ref()),
-            right: parse_trackpad_side(raw_trackpad.right.as_ref()),
-            combined_gesture_device: raw_trackpad.combined_gesture_device.unwrap_or(false),
-            gesture_kde_config: raw_trackpad.gestures.as_ref()
-                .and_then(|v| v.get("kde"))
-                .cloned()
-                .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
-            gesture_handler_config: raw_trackpad.gestures
-                .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new())),
-        };
+        let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config, aliases, problems);
+        let trackpad = TrackpadConfig::from_raw(raw_trackpad);
         let gaming_mode_config = GamingModeConfig::from_raw(raw_gaming_mode, aliases);
         let device = raw_device.map(|d| DeviceDeclaration {
             class: if d.class == "hid-steam" { DeviceClass::HidSteam } else { DeviceClass::Evdev },
@@ -1169,9 +1240,12 @@ fn parse_binding_input(
     }
 }
 
+/// `problems` gets one line for every binding that had to be skipped. The
+/// parser still logs each one where it finds it, as it always has.
 fn parse_raw_config(
     raw_config: RawConfig,
     aliases: &HashMap<String, String>,
+    problems: &mut Vec<String>,
 ) -> (Bindings, HashMap<String, String>, MappedModifiers) {
     let remap: HashMap<String, RemapValue> = raw_config.remap;
     let commands: HashMap<String, CommandValue> = raw_config.commands;
@@ -1192,22 +1266,17 @@ fn parse_raw_config(
         custom: Vec::new(),
         all: Vec::new(),
     };
-    let custom_modifiers: Vec<Event> = parse_modifiers(&settings, "CUSTOM_MODIFIERS", aliases);
-    let lstick_activation_modifiers: Vec<Event> =
-        parse_modifiers(&settings, "LSTICK_ACTIVATION_MODIFIERS", aliases);
-    let rstick_activation_modifiers: Vec<Event> =
-        parse_modifiers(&settings, "RSTICK_ACTIVATION_MODIFIERS", aliases);
-
-    mapped_modifiers.custom.extend(custom_modifiers);
-    mapped_modifiers.custom.extend(lstick_activation_modifiers);
-    mapped_modifiers.custom.extend(rstick_activation_modifiers);
+    mapped_modifiers.custom.extend(settings_modifiers(&settings, aliases));
 
     for (input, value) in remap {
         let (output, np, wg, lbl, sl, hp, nt) = match value {
             RemapValue::Simple(keys) => (keys, false, false, None, false, None, None),
             RemapValue::WithAttrs { keys, no_pause, while_gaming, label, silent, haptic, note } => (keys, no_pause, while_gaming, label, silent, haptic, note),
         };
-        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else { continue; };
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else {
+            problems.push(format!("[remap] {input:?} names an unknown button"));
+            continue;
+        };
         if np { bindings.no_pause.insert((evt, modifiers.clone())); }
         if wg { bindings.while_gaming.insert((evt, modifiers.clone())); }
         if let Some(l) = lbl { bindings.labels.insert((evt, modifiers.clone()), l); }
@@ -1222,7 +1291,10 @@ fn parse_raw_config(
             CommandValue::Simple(cmds) => (cmds, false, false, None, false, None, None),
             CommandValue::WithAttrs { run, no_pause, while_gaming, label, silent, haptic, note } => (run, no_pause, while_gaming, label, silent, haptic, note),
         };
-        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else { continue; };
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else {
+            problems.push(format!("[commands] {input:?} names an unknown button"));
+            continue;
+        };
         if np { bindings.no_pause.insert((evt, modifiers.clone())); }
         if wg { bindings.while_gaming.insert((evt, modifiers.clone())); }
         if let Some(l) = lbl { bindings.labels.insert((evt, modifiers.clone()), l); }
@@ -1233,8 +1305,18 @@ fn parse_raw_config(
     }
 
     for (input, output) in movements {
-        let rel = Relative::from_str(output.as_str()).expect("Invalid movement in [movements].");
-        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else { continue; };
+        // Skipped and reported like an unknown button. This used to be an
+        // `expect`, which took the whole process down over one typo — and the
+        // override session parses text that arrives over a socket.
+        let Ok(rel) = Relative::from_str(output.as_str()) else {
+            eprintln!("[makima] WARNING: unknown movement {output:?} for {input:?} — skipping");
+            problems.push(format!("[movements] {input:?}: {output:?} is not a movement"));
+            continue;
+        };
+        let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else {
+            problems.push(format!("[movements] {input:?} names an unknown button"));
+            continue;
+        };
         bindings.movements.entry(evt).or_default().insert(modifiers, rel);
     }
 
@@ -1254,6 +1336,15 @@ fn parse_raw_config(
     mapped_modifiers.all.dedup();
 
     (bindings, settings, mapped_modifiers)
+}
+
+/// The custom modifiers the settings declare on their own, with no binding:
+/// `CUSTOM_MODIFIERS` and the two stick activation lists.
+fn settings_modifiers(settings: &HashMap<String, String>, aliases: &HashMap<String, String>) -> Vec<Event> {
+    ["CUSTOM_MODIFIERS", "LSTICK_ACTIVATION_MODIFIERS", "RSTICK_ACTIVATION_MODIFIERS"]
+        .iter()
+        .flat_map(|parameter| parse_modifiers(settings, parameter, aliases))
+        .collect()
 }
 
 pub fn parse_modifiers(
@@ -1279,3 +1370,7 @@ pub fn parse_modifiers(
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "config_value_tests.rs"]
+mod value_tests;

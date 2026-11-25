@@ -233,7 +233,7 @@ fn parse_raw_config_populates_while_gaming_for_remap() {
         device: None,
         module: Default::default(),
     };
-    let (bindings, _, _) = parse_raw_config(raw, &HashMap::new());
+    let (bindings, _, _) = parse_raw_config(raw, &HashMap::new(), &mut Vec::new());
     let btn_south = Event::Key(Key::BTN_SOUTH);
     let btn_east  = Event::Key(Key::BTN_EAST);
     assert!(
@@ -274,7 +274,7 @@ fn parse_raw_config_populates_while_gaming_for_command() {
         device: None,
         module: Default::default(),
     };
-    let (bindings, _, _) = parse_raw_config(raw, &HashMap::new());
+    let (bindings, _, _) = parse_raw_config(raw, &HashMap::new(), &mut Vec::new());
     let btn_mode = Event::Key(Key::BTN_MODE);
     assert!(
         bindings.while_gaming.contains(&(btn_mode, vec![])),
@@ -368,7 +368,7 @@ fn simple_remap(input: &str) -> HashMap<String, RemapValue> {
 #[test]
 fn aliases_resolve_in_trigger_and_modifier() {
     let (bindings, _, mods) =
-        parse_raw_config(raw_with_remap(simple_remap("L1-A")), &deck_aliases());
+        parse_raw_config(raw_with_remap(simple_remap("L1-A")), &deck_aliases(), &mut Vec::new());
 
     let combos = bindings.remap.get(&key(Key::BTN_SOUTH))
         .expect("alias A must resolve to BTN_SOUTH as the trigger");
@@ -384,7 +384,7 @@ fn aliases_resolve_in_trigger_and_modifier() {
 #[test]
 fn unaliased_names_pass_through() {
     let (bindings, _, _) =
-        parse_raw_config(raw_with_remap(simple_remap("BTN_TL-BTN_WEST")), &deck_aliases());
+        parse_raw_config(raw_with_remap(simple_remap("BTN_TL-BTN_WEST")), &deck_aliases(), &mut Vec::new());
 
     assert!(
         bindings.remap.get(&key(Key::BTN_WEST))
@@ -424,7 +424,7 @@ fn combo_with_unresolvable_modifier_is_dropped_entirely() {
         [("L1".to_string(), "BTN_TYPO".to_string())].into_iter().collect();
 
     let (bindings, _, _) =
-        parse_raw_config(raw_with_remap(simple_remap("L1-BTN_SOUTH")), &broken);
+        parse_raw_config(raw_with_remap(simple_remap("L1-BTN_SOUTH")), &broken, &mut Vec::new());
 
     assert!(
         bindings.remap.is_empty(),
@@ -437,7 +437,7 @@ fn combo_with_unresolvable_modifier_is_dropped_entirely() {
 #[test]
 fn combo_with_unresolvable_trigger_is_dropped() {
     let (bindings, _, _) =
-        parse_raw_config(raw_with_remap(simple_remap("L1-NOPE")), &deck_aliases());
+        parse_raw_config(raw_with_remap(simple_remap("L1-NOPE")), &deck_aliases(), &mut Vec::new());
     assert!(bindings.remap.is_empty());
 }
 
@@ -643,7 +643,7 @@ fn hints_never_register_a_modifier() {
         ..raw_with_remap(HashMap::new())
     };
 
-    let (_, _, mapped) = parse_raw_config(raw, &HashMap::new());
+    let (_, _, mapped) = parse_raw_config(raw, &HashMap::new(), &mut Vec::new());
 
     assert!(mapped.custom.is_empty(), "hints leaked into custom modifiers: {:?}", mapped.custom);
     assert!(!mapped.all.contains(&key(Key::BTN_GRIPR2)));
