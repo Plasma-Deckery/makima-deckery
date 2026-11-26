@@ -134,13 +134,7 @@ pub async fn start_monitoring_udev(
                 if let Some(Ok(event)) = event {
                     if is_mapped(&event.device(), &registry) {
                         println!("---------------------\n\nReinitializing...\n");
-                        let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
-                        device_tasks::release_held_modifiers(&virt_dev, &prev_modifiers).await;
-                        for task in &tasks {
-                            task.abort();
-                        }
-                        tasks.clear();
-                        prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
+                        rebuild(&session, &mut tasks, &mut prev_modifiers, None).await;
                     }
                 }
             }
@@ -149,14 +143,7 @@ pub async fn start_monitoring_udev(
                 // controller's reconnecting task). Restart input tasks — the output
                 // layer (virt_dev) is preserved across reinits.
                 println!("---------------------\n\nDevice error detected, reinitializing...\n");
-                let _ = state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
-                device_tasks::release_held_modifiers(&virt_dev, &prev_modifiers).await;
-                for task in &tasks {
-                    task.abort();
-                }
-                tasks.clear();
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
+                rebuild(&session, &mut tasks, &mut prev_modifiers, Some(DEVICE_ERROR_PAUSE)).await;
             }
             Some(_) = config_rx.recv() => {
                 settle_config_changes(&mut config_rx).await;
@@ -167,12 +154,7 @@ pub async fn start_monitoring_udev(
                 }
                 println!("---------------------\n\nConfig changed, reloading...\n");
                 reload_configs(&registry, &state_tx);
-                device_tasks::release_held_modifiers(&virt_dev, &prev_modifiers).await;
-                for task in &tasks {
-                    task.abort();
-                }
-                tasks.clear();
-                prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
+                rebuild(&session, &mut tasks, &mut prev_modifiers, None).await;
             }
             Some(request) = device_requests.recv() => {
                 // The override session changed something a device session
@@ -183,15 +165,39 @@ pub async fn start_monitoring_udev(
                 if request == DeviceRequest::Reload {
                     reload_configs(&registry, &state_tx);
                 }
-                device_tasks::release_held_modifiers(&virt_dev, &prev_modifiers).await;
-                for task in &tasks {
-                    task.abort();
-                }
-                tasks.clear();
-                prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
+                rebuild(&session, &mut tasks, &mut prev_modifiers, None).await;
             }
         }
     }
+}
+
+/// How long a device that just failed is left alone before it is opened again.
+const DEVICE_ERROR_PAUSE: tokio::time::Duration = tokio::time::Duration::from_millis(500);
+
+/// Tear the device tasks down and start them again from the registry as it
+/// stands: the one sequence behind every reinit — a udev event, a device
+/// error, a config reload, an override session's request.
+///
+/// The tray is told first, then every modifier output key still held is
+/// released on the virtual devices (they survive the rebuild, so the release
+/// lands where the press did), then the tasks go and new ones start. `pause`
+/// waits between the two, for a device that has just failed.
+async fn rebuild(
+    session: &DeviceSession,
+    tasks: &mut Vec<JoinHandle<()>>,
+    prev_modifiers: &mut Arc<Mutex<Vec<crate::config::Event>>>,
+    pause: Option<tokio::time::Duration>,
+) {
+    let _ = session.state_tx.try_send(StateCommand::SetLifecycle(AppLifecycle::Reinitializing));
+    device_tasks::release_held_modifiers(&session.virt_dev, prev_modifiers).await;
+    for task in tasks.iter() {
+        task.abort();
+    }
+    tasks.clear();
+    if let Some(pause) = pause {
+        tokio::time::sleep(pause).await;
+    }
+    *prev_modifiers = device_tasks::launch_tasks(session, tasks).await;
 }
 
 /// How long a config change is left to settle before it is read.
