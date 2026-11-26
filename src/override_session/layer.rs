@@ -16,7 +16,7 @@
 //!   replaces the one underneath wholesale, which would take the user's
 //!   `click_pressure` and KDE settings with it when the tour switches a mode.
 
-use super::{allowlist, path};
+use super::{allowlist, checks, path};
 use crate::config::{Config, RawTrackpadConfig, TrackpadConfig};
 use std::collections::{HashMap, HashSet};
 
@@ -109,8 +109,8 @@ impl Layer {
         DEVICE_SECTIONS.iter().any(|s| self.doc.get(*s) != other.doc.get(*s))
     }
 
-    /// The document as a config of its own, refusing anything a file would
-    /// only warn about — an override applies all of it or none.
+    /// The document as a config of its own, refusing a binding the parser
+    /// would skip. The rest of what a file only warns about is `validate`'s.
     pub fn parse(&self, aliases: &HashMap<String, String>) -> Result<Config, Refusal> {
         let (config, problems) = Config::from_toml_value(
             toml::Value::Table(self.doc.clone()), "override".to_string(), aliases)?;
@@ -156,35 +156,21 @@ impl Layer {
         Ok(effective)
     }
 
-    /// Whether this layer may go over `underlay`: it parses without a skipped
-    /// binding, binds only commands the user's configs already bind, lays
-    /// over the underlay, and every trackpad mode and setting it names is one
-    /// the device session understands.
+    /// Whether this layer may go over `underlay`, all of it as written.
     ///
-    /// Each of those is the check that already exists for a config file —
-    /// the parser, `is_known_trackpad_mode`, `Settings::from_config` — asked
-    /// to refuse what it would otherwise only warn about.
+    /// It parses without a skipped binding, binds only commands the user's
+    /// configs already bind, and lays over the underlay; then `checks` refuses
+    /// every fallback the device session, the hint resolver or the settings
+    /// would make for what the layer writes. Each of those is the check that
+    /// already exists for a config file, asked to refuse what it would
+    /// otherwise only warn about.
     pub fn validate(&self, underlay: &Config, known_commands: &HashSet<Vec<String>>) -> Result<(), Refusal> {
         let own = self.parse(&underlay.aliases)?;
         allowlist::check(&own, known_commands)?;
         let effective = self.apply(underlay)?;
-
-        let trackpad = self.doc.get("trackpad");
-        for (side, config) in [("left", &effective.trackpad.left), ("right", &effective.trackpad.right)] {
-            let names_mode = trackpad.and_then(|t| t.get(side)).and_then(|s| s.get("mode")).is_some();
-            if names_mode && !crate::device_session::is_known_trackpad_mode(&config.mode) {
-                return Err(Refusal::at(
-                    format!("trackpad.{side}.mode"), format!("{:?} is not a trackpad mode", config.mode)));
-            }
-        }
-
-        if let Some(toml::Value::Table(settings)) = self.doc.get("settings") {
-            let (_, problems) = crate::settings::Settings::from_config(&effective);
-            if let Some(problem) = problems.iter().find(|p| settings.contains_key(&p.key)) {
-                return Err(Refusal::at(
-                    format!("settings.{}", problem.key), format!("{:?} is not {}", problem.value, problem.expected)));
-            }
-        }
+        checks::trackpad(self.doc.get("trackpad"), underlay, &effective)?;
+        checks::hints(self.doc.get("hints"), &effective)?;
+        checks::settings(self.doc.get("settings"), &effective)?;
         Ok(())
     }
 }

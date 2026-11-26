@@ -16,6 +16,7 @@
 //! * `path` — a dotted path and a JSON value, as a change to the document
 //! * `layer` — the document, and laying it over a resolved config
 //! * `allowlist` — which `[commands]` an override may bind
+//! * `checks` — refusing the fallbacks a file would only warn about
 //! * `planner` — what a command does to the session; pure
 //! * `emergency` — the hard-wired combo that always ends a session
 //! * `session` — the shared handle that holds the state and carries out the
@@ -25,6 +26,7 @@
 //! the tour, which talks to the new process, finds no session open.
 
 pub mod allowlist;
+mod checks;
 pub mod command;
 pub mod emergency;
 pub mod layer;

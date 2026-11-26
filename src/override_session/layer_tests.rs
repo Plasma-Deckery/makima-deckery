@@ -164,3 +164,55 @@ fn a_mode_switch_leaves_no_unknown_keys_for_the_new_mode() {
     let (_, warnings) = crate::mt_trackpad::MtTrackpadConfig::parse(&effective.trackpad.right.handler_config);
     assert!(warnings.is_empty(), "{warnings:?}");
 }
+
+// ── No silent defaults ───────────────────────────────────────────────────────
+
+fn refusal(l: &Layer) -> String {
+    l.validate(&base(), &known()).unwrap_err().to_string()
+}
+
+/// A pad side that is not a table would parse as a disabled pad.
+#[test]
+fn a_pad_side_that_is_not_a_table_is_refused() {
+    assert_eq!(refusal(&layer(&[("trackpad.right", r#""x""#)])), "trackpad.right: must be a table");
+    // The parser already refuses a whole section that is no table.
+    assert!(layer(&[("trackpad", r#""x""#)]).validate(&base(), &known()).is_err());
+    assert_eq!(refusal(&layer(&[("trackpad.gestures", "3")])), "trackpad.gestures: must be a table");
+}
+
+/// A handler value that would fall back to its default is refused.
+#[test]
+fn a_handler_value_with_a_fallback_is_refused() {
+    let l = layer(&[("trackpad.right", r#"{ "mode": "trackball", "sensitivity": -1 }"#)]);
+    assert!(refusal(&l).starts_with("trackpad.right: sensitivity"), "{}", refusal(&l));
+    let l = layer(&[("trackpad.right.haptic", r#"{ "on_press": "buzz" }"#)]);
+    assert!(refusal(&l).starts_with("trackpad.right: "), "{}", refusal(&l));
+}
+
+/// What the user's own table already warns about is not the layer's doing.
+#[test]
+fn a_warning_already_underneath_is_not_refused() {
+    let mut underlay = base();
+    underlay.trackpad = config(r#"
+        [trackpad.right]
+        mode = "trackball"
+        friciton = 2
+    "#).trackpad;
+    let l = layer(&[("trackpad.right.sensitivity", "0.01")]);
+    assert_eq!(l.validate(&underlay, &known()), Ok(()));
+}
+
+#[test]
+fn a_kde_value_that_does_not_parse_is_refused() {
+    let l = layer(&[("trackpad.right.kde.tap_to_click", r#""yes""#)]);
+    assert!(refusal(&l).starts_with("trackpad.right.kde: "), "{}", refusal(&l));
+}
+
+/// A hint that can never be shown is refused; one that is shown is not.
+#[test]
+fn a_hint_that_is_never_shown_is_refused() {
+    let l = layer(&[("hints.KEY_F13", r#""Nothing""#)]);
+    assert!(refusal(&l).starts_with("hints.KEY_F13: "), "{}", refusal(&l));
+    let l = layer(&[("hints.KEY_ENTER", r#""Go""#)]);
+    assert_eq!(l.validate(&base(), &known()), Ok(()));
+}
