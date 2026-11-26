@@ -739,6 +739,55 @@ fn written_label_wins_over_a_modifier_less_hint() {
     assert!(config.bindings.hints_resolved.is_empty());
 }
 
+/// An app config removes an inherited hint by giving it an empty label. The
+/// merge replaces the base label with `""`, and resolution skips it, so the
+/// key ends up with no hint at all — while the base's other hints stay.
+#[test]
+fn empty_app_hint_removes_the_inherited_one() {
+    let mut base = config_with_hints(vec![
+        ("KEY_LEFTCTRL-KEY_UP",   "Jump to Top"),
+        ("KEY_LEFTCTRL-KEY_DOWN", "Jump to Bottom"),
+    ]);
+    base.resolve_hints();
+
+    let mut app_bindings = Bindings::default();
+    app_bindings.hints = [("KEY_LEFTCTRL-KEY_UP".to_string(), String::new())]
+        .into_iter().collect();
+    let mut app = config_with("Konsole", app_bindings);
+    app.merge_base(&base);
+    let warnings = app.resolve_hints();
+
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert_eq!(hint_label(&app, key(Key::BTN_DPAD_UP), vec![key(Key::BTN_GRIPR2)]), None);
+    assert_eq!(
+        hint_label(&app, key(Key::BTN_DPAD_DOWN), vec![key(Key::BTN_GRIPR2)]),
+        Some("Jump to Bottom"),
+        "the base hint the app did not touch must survive",
+    );
+}
+
+/// An empty modifier-less hint must not relabel its button with an empty
+/// string — it produces no entry, so the button keeps its normal label.
+#[test]
+fn empty_modifier_less_hint_does_not_blank_the_button() {
+    let mut config = config_with_hints(vec![("KEY_UP", "")]);
+    let warnings = config.resolve_hints();
+
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert!(config.bindings.hints_resolved.is_empty());
+}
+
+/// Removing a hint is not a broken hint: an empty label on a key no button
+/// emits stays silent instead of warning that it can never be shown.
+#[test]
+fn empty_hint_never_warns() {
+    let mut config = config_with_hints(vec![("KEY_LEFTCTRL-KEY_C", "")]);
+    let warnings = config.resolve_hints();
+
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert!(config.bindings.hints_resolved.is_empty());
+}
+
 // ── haptic = { … } on a binding ──────────────────────────────────────────────
 
 /// Pull the haptic out of a parsed `[remap]` value, or fail the test.

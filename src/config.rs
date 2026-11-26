@@ -937,6 +937,9 @@ impl Config {
     /// combination. Both forms share `hints_resolved`; `state_export` routes
     /// the empty-combo ones into `bindings` and the rest into `modifier_active`.
     ///
+    /// An empty label (`KEY_X = ""`) resolves to nothing. That is how an app
+    /// config removes a hint it would otherwise inherit from the base config.
+    ///
     /// Known limit: a combination is only hintable when every part of it sends a
     /// key. `L1-…` cannot be hinted — no application would recognise it anyway;
     /// that case wants a real binding.
@@ -998,6 +1001,13 @@ impl Config {
 
         for raw in raw_keys {
             let label = &self.bindings.hints[raw];
+            // An empty label means "no hint here". It exists to remove a hint
+            // inherited from the base config: the merge already replaced the
+            // base label with this one, so skipping it drops both. Skipped
+            // before resolving, so it neither warns nor blanks a button label.
+            if label.is_empty() {
+                continue;
+            }
             // No separator means no modifier side: the hint relabels a plain
             // button. That is a deliberate second use of the same syntax —
             // "label without a binding" — not a malformed combo.

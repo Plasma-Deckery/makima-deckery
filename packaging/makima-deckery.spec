@@ -1,6 +1,6 @@
 Name:           makima-deckery
 Version:        2.0.0~beta1
-Release:        10%{?dist}
+Release:        11%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
 License:        GPL-3.0-only
@@ -91,6 +91,9 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Thu Nov 26 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-11
+- [hints]: an empty label removes a hint inherited from the base config
+
 * Wed Nov 25 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-10
 - state.json lists held hint modifiers in context.held_hint_modifiers
 

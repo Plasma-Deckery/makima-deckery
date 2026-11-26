@@ -88,6 +88,25 @@ hints syntax instead of as its own attribute.
 Both forms share `hints_resolved`. The empty combo is what routes an entry into
 `bindings` instead of `modifier_active`.
 
+### Removing an inherited hint
+
+Hints from the base config and the app config merge into one map, key by key,
+so an app can override a label but has no other way to drop one. An **empty
+label** means "no hint here":
+
+```toml
+[hints]
+KEY_LEFTCTRL-KEY_BACKSPACE = ""   # base hint does not apply in this app
+```
+
+The app's `""` replaces the base label in the merged map, and `resolve_hints`
+skips empty labels before resolving anything. No `hints_resolved` entry is
+produced, so nothing is exported — and a modifier-less `KEY_X = ""` does not
+blank out the button's label either; the button simply shows what it would
+without any hint. An empty hint never warns, even if no button emits the key.
+The removal lives in the app config only: under every other app the base hint
+is back.
+
 ### Separator and namespace *(changed during implementation)*
 
 The separator is `-`, the same as every other section. There is no second

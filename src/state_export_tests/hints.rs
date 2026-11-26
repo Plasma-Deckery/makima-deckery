@@ -147,6 +147,37 @@ fn virtual_modifier_reports_whether_its_hints_are_app_specific() {
     assert_eq!(avail_of(&app), true);
 }
 
+/// An app config can remove a base hint with an empty label. While that app
+/// is active the hint is not exported; under any other app it is back, because
+/// the removal lives in the app config, not in the base.
+#[test]
+fn empty_app_hint_hides_a_base_hint_only_while_that_app_is_active() {
+    let base = config_with_ctrl_hints();
+    let held_r5 = |config: &Config| build_state(
+        config, &[], false, false, &[key(Key::BTN_GRIPR2)],
+        &None, &["test".to_string()], &GamingModeConfig::default(),
+    );
+
+    let mut konsole = make_config(vec![], vec![], vec![]);
+    konsole.name = "Konsole".to_string();
+    konsole.bindings.hints = [("KEY_LEFTCTRL-KEY_UP".to_string(), String::new())]
+        .into_iter().collect();
+    let mut konsole = konsole.merged_with_base(&base);
+    konsole.resolve_hints();
+
+    let state = held_r5(&konsole);
+    assert!(state["modifier_active"].get("BTN_DPAD_UP").is_none(),
+        "removed hint was exported: {}", state["modifier_active"]);
+    assert_eq!(state["modifier_active"]["BTN_DPAD_DOWN"]["label"], "Jump to Bottom");
+
+    let mut other = make_config(vec![], vec![], vec![]);
+    other.name = "Firefox".to_string();
+    let mut other = other.merged_with_base(&base);
+    other.resolve_hints();
+
+    assert_eq!(held_r5(&other)["modifier_active"]["BTN_DPAD_UP"]["label"], "Jump to Top");
+}
+
 /// Once held, the hint modifier is no longer "available" — it is in use.
 #[test]
 fn hint_modifier_leaves_available_modifiers_once_held() {
