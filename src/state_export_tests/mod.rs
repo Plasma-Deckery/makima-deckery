@@ -41,6 +41,7 @@ fn make_config(
             ..Default::default()
         },
         override_bindings: None,
+        layer_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: MappedModifiers {
             default: vec![],

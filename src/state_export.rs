@@ -15,6 +15,7 @@ use crate::config::Config;
 use evdev::Key;
 use serde::Serialize;
 use serde_json;
+use std::collections::HashMap;
 
 // ── Structs ───────────────────────────────────────────────────────────────────
 
@@ -174,6 +175,27 @@ pub fn config_stack(base_name: &str, active_name: &str) -> Vec<String> {
 
 // ── Pure state builder ────────────────────────────────────────────────────────
 
+/// The `origin` of a binding an override session's layer set. The layer has
+/// no file, so it gets a name of its own, which the HUD shows as the source.
+pub const LAYER_ORIGIN: &str = "Override";
+
+/// Whether a binding table holds `trigger` under `combo`.
+fn holds<V>(map: &HashMap<Event, HashMap<Vec<Event>, V>>, trigger: &Event, combo: &Vec<Event>) -> bool {
+    map.get(trigger).is_some_and(|m| m.contains_key(combo))
+}
+
+/// Whether the app override `app` binds a combo `qualifies` accepts that the
+/// override session's `layer` does not set itself.
+fn app_combo<V, W>(
+    app: &HashMap<Event, HashMap<Vec<Event>, V>>,
+    layer: Option<&HashMap<Event, HashMap<Vec<Event>, W>>>,
+    qualifies: &dyn Fn(&Vec<Event>) -> bool,
+) -> bool {
+    app.iter().any(|(trigger, combos)| combos.keys().any(|combo| {
+        qualifies(combo) && !layer.is_some_and(|l| holds(l, trigger, combo))
+    }))
+}
+
 /// Build the full state snapshot as a JSON value.
 ///
 /// Pure and side-effect-free — no I/O. Extracted from write_state so it can
@@ -193,12 +215,17 @@ pub fn build_state(
     gaming_mode_config: &GamingModeConfig,
 ) -> serde_json::Value {
     // Determine the origin name for a given trigger+combo.
+    // An override session's layer is asked first: it lies above the app
+    // override, and what it set is its own, whatever binding it shadows.
     // If this config has override_bindings (i.e. it's an app-specific config
     // that was merged with a base), check whether the binding existed in the
     // original override. If yes → came from this config; if no → inherited
     // from base (config_stack[0]).
     let base_name = config_stack.first().map(|s| s.as_str()).unwrap_or(&config.name);
     let origin_remap = |trigger: &Event, combo: &Vec<Event>| -> &str {
+        if config.layer_bindings.as_ref().is_some_and(|l| holds(&l.remap, trigger, combo)) {
+            return LAYER_ORIGIN;
+        }
         match &config.override_bindings {
             Some(ov) => {
                 if ov.remap.get(trigger).and_then(|m| m.get(combo)).is_some() {
@@ -211,6 +238,9 @@ pub fn build_state(
         }
     };
     let origin_cmd = |trigger: &Event, combo: &Vec<Event>| -> &str {
+        if config.layer_bindings.as_ref().is_some_and(|l| holds(&l.commands, trigger, combo)) {
+            return LAYER_ORIGIN;
+        }
         match &config.override_bindings {
             Some(ov) => {
                 if ov.commands.get(trigger).and_then(|m| m.get(combo)).is_some() {
@@ -223,6 +253,9 @@ pub fn build_state(
         }
     };
     let origin_mov = |trigger: &Event, combo: &Vec<Event>| -> &str {
+        if config.layer_bindings.as_ref().is_some_and(|l| holds(&l.movements, trigger, combo)) {
+            return LAYER_ORIGIN;
+        }
         match &config.override_bindings {
             Some(ov) => {
                 if ov.movements.get(trigger).and_then(|m| m.get(combo)).is_some() {
@@ -293,7 +326,9 @@ pub fn build_state(
     // itself is the only record of where its line was written — the active
     // config's name would report a base hint as app-specific in every app.
     let origin_hint = |hint: &Hint| -> &str {
-        if hint.from_override { &config.name } else { base_name }
+        if hint.from_layer { LAYER_ORIGIN }
+        else if hint.from_override { &config.name }
+        else { base_name }
     };
 
     // Modifier-less hints relabel a plain button, so they belong here and not in
@@ -498,13 +533,16 @@ pub fn build_state(
     let qualifies = |m: &Event, combo: &Vec<Event>| -> bool {
         combo.contains(m) && hint_mods.iter().all(|held| combo.contains(held))
     };
+    // A combo the override session's layer set is the layer's, not the
+    // app's, even where the app binds the same one underneath.
+    let layer = config.layer_bindings.as_ref();
     let has_app_combos = |m: &Event| -> bool {
         match &config.override_bindings {
             None => false,
             Some(ov) => {
-                ov.remap.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
-                    || ov.commands.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
-                    || ov.movements.values().flat_map(|map| map.keys()).any(|c| qualifies(m, c))
+                app_combo(&ov.remap, layer.map(|l| &l.remap), &|c| qualifies(m, c))
+                    || app_combo(&ov.commands, layer.map(|l| &l.commands), &|c| qualifies(m, c))
+                    || app_combo(&ov.movements, layer.map(|l| &l.movements), &|c| qualifies(m, c))
             }
         }
     };
@@ -544,7 +582,7 @@ pub fn build_state(
                 continue;
             }
             unlocks_any = true;
-            unlocks_app |= hint.from_override;
+            unlocks_app |= hint.from_override && !hint.from_layer;
         }
         if unlocks_any {
             available_modifiers.insert(key, serde_json::json!({

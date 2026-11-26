@@ -514,6 +514,9 @@ pub struct Hint {
     /// left — and without it a base-config hint would report the active app as
     /// its origin and render as an app-specific override everywhere.
     pub from_override: bool,
+    /// True when the source line was set by an override session's layer. Same
+    /// reason as `from_override`, one layer further up; it wins over it.
+    pub from_layer: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -714,6 +717,11 @@ pub struct Config {
     /// Some(overrides) for app-specific configs — used by state_export
     /// to distinguish "came from override" vs "inherited from base".
     pub override_bindings: Option<Bindings>,
+    /// The bindings an override session's layer set, as the layer wrote them.
+    /// Some only on a config the layer lies over — see
+    /// `override_session::Layer::apply` — and read by `state_export`, which
+    /// reports these with their own origin instead of the file's they shadow.
+    pub layer_bindings: Option<Bindings>,
     pub settings: HashMap<String, String>,
     pub mapped_modifiers: MappedModifiers,
     /// Trackpad configuration parsed from `[trackpad.left]` / `[trackpad.right]`.
@@ -845,6 +853,7 @@ impl Config {
             name: file_name,
             bindings,
             override_bindings: None,
+            layer_bindings: None,
             settings,
             mapped_modifiers,
             trackpad,
@@ -860,6 +869,7 @@ impl Config {
             name: file_name,
             bindings: Default::default(),
             override_bindings: None,
+            layer_bindings: None,
             settings: Default::default(),
             mapped_modifiers: Default::default(),
             trackpad: Default::default(),
@@ -1084,6 +1094,7 @@ impl Config {
             // "label without a binding" — not a malformed combo.
             let (mods_str, trigger_str) = raw.rsplit_once('-').unwrap_or(("", raw.as_str()));
             let from_override = override_hints.map_or(false, |h| h.contains_key(raw));
+            let from_layer = self.layer_bindings.as_ref().is_some_and(|l| l.hints.contains_key(raw));
 
             // Modifier side: build every combination the segments can stand for.
             // Several buttons emitting the same key multiply the combinations.
@@ -1169,7 +1180,7 @@ impl Config {
                     claimed_by.insert(resolved_key.clone(), raw);
                     self.bindings.hints_resolved.insert(
                         resolved_key,
-                        Hint { label: label.clone(), from_override },
+                        Hint { label: label.clone(), from_override, from_layer },
                     );
                 }
             }

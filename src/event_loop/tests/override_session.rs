@@ -317,3 +317,27 @@ async fn a_restart_ends_the_session() {
         vec![(Key::KEY_ENTER, 1), (Key::KEY_ENTER, 0)]);
     assert_eq!(deck.override_cmd("override end").await.0, "error no session is open");
 }
+
+/// What the layer set carries the origin `Override` in the state export —
+/// as a binding, as a combo under a held modifier and as a hint — even where
+/// it shadows the focused app's own binding. What it left alone keeps the
+/// file's name.
+#[tokio::test]
+async fn the_layer_is_the_origin_of_what_it_set() {
+    let mut deck = Deck::on_kde("override-origin");
+    *deck.reader.active_client.lock().await =
+        Client::Class("firefox".to_string(), String::new(), None);
+    deck.override_cmd("override begin").await;
+    deck.override_cmd(r#"override set remap.A ["KEY_ENTER"]"#).await;
+    deck.override_cmd(r#"override set remap.L1-B ["KEY_LEFTCTRL", "KEY_Z"]"#).await;
+    let (_, set) = deck.override_cmd(r#"override set hints.KEY_ESC "Back""#).await;
+    let state = last_published(&set).expect("set publishes");
+    assert_eq!(state["bindings"]["BTN_SOUTH"]["origin"], serde_json::json!("Override"));
+    assert_eq!(state["bindings"]["BTN_EAST"]["origin"], serde_json::json!("Override"), "the hint");
+    assert_eq!(state["bindings"]["BTN_START"]["origin"], serde_json::json!("Steam Deck"));
+
+    let held = deck.press(Key::BTN_TL).await;
+    let state = last_published(&held).expect("a modifier press publishes");
+    assert_eq!(state["modifier_active"]["BTN_EAST"]["origin"], serde_json::json!("Override"));
+    assert_eq!(state["modifier_active"]["BTN_WEST"]["origin"], serde_json::json!("Steam Deck"));
+}

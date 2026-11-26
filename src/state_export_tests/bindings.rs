@@ -128,6 +128,7 @@ fn override_remap_hides_base_command() {
                 ..Default::default()
             },
             override_bindings: None,
+            layer_bindings: None,
             settings: HashMap::new(),
             mapped_modifiers: crate::config::MappedModifiers {
                 default: vec![],
@@ -154,6 +155,7 @@ fn override_remap_hides_base_command() {
                 ..Default::default()
             },
             override_bindings: None,
+            layer_bindings: None,
             settings: HashMap::new(),
             mapped_modifiers: Default::default(),
             trackpad: Default::default(),
@@ -206,6 +208,7 @@ fn override_clears_base_label() {
         name: "Steam Deck".to_string(),
         bindings: base_bindings,
         override_bindings: None,
+        layer_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: crate::config::MappedModifiers {
             custom: vec![btn_tl], all: vec![btn_tl], default: vec![],
@@ -225,6 +228,7 @@ fn override_clears_base_label() {
         name: "firefox".to_string(),
         bindings: crate::config::Bindings { remap: app_remap, ..Default::default() },
         override_bindings: None,
+        layer_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: Default::default(),
         trackpad: Default::default(),
@@ -268,6 +272,7 @@ fn override_label_replaces_base_label() {
         name: "Steam Deck".to_string(),
         bindings: base_bindings,
         override_bindings: None,
+        layer_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: crate::config::MappedModifiers {
             custom: vec![btn_tl], all: vec![btn_tl], default: vec![],
@@ -289,6 +294,7 @@ fn override_label_replaces_base_label() {
         name: "firefox".to_string(),
         bindings: app_bindings,
         override_bindings: None,
+        layer_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: Default::default(),
         trackpad: Default::default(),
@@ -351,6 +357,7 @@ fn origin_override_vs_base() {
             silent: HashSet::new(),
             ..Default::default()
         },
+        layer_bindings: None,
         override_bindings: Some(Bindings {
             remap: override_remap,
             commands: HashMap::new(),

@@ -44,6 +44,7 @@ fn make_config(remap: Vec<(Event, Vec<Event>, Vec<Key>)>, custom_modifiers: Vec<
             ..Default::default()
         },
         override_bindings: None,
+        layer_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: MappedModifiers { default: vec![], custom: custom_modifiers, all },
         trackpad: Default::default(),

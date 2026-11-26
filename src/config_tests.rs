@@ -24,6 +24,7 @@ fn config_with(name: &str, bindings: Bindings) -> Config {
         name: name.to_string(),
         bindings,
         override_bindings: None,
+        layer_bindings: None,
         settings: HashMap::new(),
         mapped_modifiers: Default::default(),
         trackpad: Default::default(),

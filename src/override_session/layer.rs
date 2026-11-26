@@ -103,8 +103,11 @@ impl Layer {
         effective.aliases = base.aliases.clone();
         effective.gaming_mode_config = base.gaming_mode_config.clone();
         // Which bindings the focused app brought, for the state export's
-        // origins. The layer's own count as the base's: it has no file.
+        // origins.
         effective.override_bindings = base.override_bindings.clone();
+        // What the layer itself set, so the state export can name it as the
+        // origin rather than the file whose binding it shadows.
+        effective.layer_bindings = Some(own.bindings.clone());
         let _ = effective.resolve_hints();
         Ok(effective)
     }
