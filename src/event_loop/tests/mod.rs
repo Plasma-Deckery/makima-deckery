@@ -295,6 +295,11 @@ impl Deck {
             self.device_log.push(request);
         }
         self.reader.apply_override_change().await;
+        self.run_gaming_requests().await;
+    }
+
+    /// Pass the Gaming Mode requests the reader sent to the production setter.
+    pub async fn run_gaming_requests(&mut self) {
         while let Ok(on) = self.gaming_requests.try_recv() {
             let (tx, rx) = mpsc::channel(1);
             tx.send(on).await.unwrap();

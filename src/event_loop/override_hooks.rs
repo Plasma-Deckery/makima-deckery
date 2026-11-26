@@ -19,8 +19,14 @@ use crate::override_session::emergency::EMERGENCY_EXIT_HOLD;
 
 impl EventReader {
     /// Apply every change to the live layer as it comes.
+    ///
+    /// A session may have opened while no reader was running — during a
+    /// reinit, or with no controller connected — and the Gaming Mode flag is
+    /// shared across reader generations. So a reader starting under an open
+    /// session ends Gaming Mode first, before any change arrives.
     pub(super) async fn override_loop(&self) {
         let mut changes = self.override_session.subscribe();
+        self.end_gaming_mode_for_session().await;
         while changes.changed().await.is_ok() {
             self.apply_override_change().await;
         }
@@ -28,16 +34,20 @@ impl EventReader {
 
     /// One change to the live layer: end Gaming Mode if a session is open,
     /// then re-resolve, which publishes.
-    ///
-    /// Gaming Mode goes off through its channel, so the one setter switches it
-    /// with its haptic and its announcement, however many readers see the
-    /// change.
     pub(super) async fn apply_override_change(&self) {
+        self.end_gaming_mode_for_session().await;
+        self.update_config().await;
+    }
+
+    /// Ask for Gaming Mode off if a session is open and it is on.
+    ///
+    /// Through its channel, so the one setter switches it with its haptic and
+    /// its announcement, however many readers ask.
+    pub(super) async fn end_gaming_mode_for_session(&self) {
         if self.override_session.is_active() && *self.gaming_mode.lock().await {
             println!("deckery: override session open — ending Gaming Mode");
             let _ = self.gaming_mode_tx.try_send(false);
         }
-        self.update_config().await;
     }
 
     /// The Gaming Mode double-click trigger, unless a session is open. With
@@ -52,6 +62,12 @@ impl EventReader {
     }
 
     /// Record one key edge for the emergency exit.
+    ///
+    /// The tracker belongs to this reader and starts empty with it. A rebuild
+    /// of the device tasks — a reinit, a trackpad mode change — therefore
+    /// forgets a combo held across it, and the hold has to start again. That
+    /// is left so on purpose: a rebuild is rare, short, and announced by the
+    /// pads resetting, and the next press of either button rearms it.
     pub(super) fn track_emergency_combo(&self, event: Event, value: i32) {
         let Event::Key(key) = event else { return };
         let changed = self.emergency_combo.lock().unwrap().update(key, value);

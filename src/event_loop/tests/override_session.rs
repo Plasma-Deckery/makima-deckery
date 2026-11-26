@@ -347,3 +347,23 @@ async fn the_layer_is_the_origin_of_what_it_set() {
     assert_eq!(state["modifier_active"]["BTN_EAST"]["origin"], serde_json::json!("Override"));
     assert_eq!(state["modifier_active"]["BTN_WEST"]["origin"], serde_json::json!("Steam Deck"));
 }
+
+/// A session opened while no reader saw it — a reinit, no controller — still
+/// ends Gaming Mode: the reader that starts under it does so first thing.
+#[tokio::test]
+async fn a_reader_starting_under_a_session_ends_gaming_mode() {
+    let mut deck = Deck::new("override-gaming-start");
+    deck.set_gaming_mode(true).await;
+    // Straight to the session: no reader is told.
+    assert_eq!(deck.session.handle(&crate::override_session::OverrideCommand::Begin).to_string(), "ok 1");
+    assert!(*deck.reader.gaming_mode.lock().await);
+
+    let reader = deck.reader.clone();
+    let override_loop = tokio::spawn(async move { reader.override_loop().await });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    deck.run_gaming_requests().await;
+    override_loop.abort();
+    assert!(!*deck.reader.gaming_mode.lock().await, "the new reader left Gaming Mode on");
+}
