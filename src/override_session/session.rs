@@ -19,6 +19,7 @@ use super::planner::{self, Effect, Input, Reply, State};
 use super::{Layer, OverrideCommand};
 use crate::config::Config;
 use crate::config_registry::ConfigRegistry;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
@@ -43,6 +44,11 @@ struct Inner {
 pub struct OverrideSession {
     registry: Arc<ConfigRegistry>,
     inner: Mutex<Inner>,
+    /// Whether `inner.state` is open, readable without its lock. The readers
+    /// ask on every button press, and `run` holds the lock while it validates
+    /// a layer against every base config; a press must not wait for that.
+    /// Written under the lock, after the state, so it never runs ahead of it.
+    active: AtomicBool,
     /// Bumped on every change to the live layer, including its end.
     changed: watch::Sender<u64>,
     devices: mpsc::UnboundedSender<DeviceRequest>,
@@ -57,6 +63,7 @@ impl OverrideSession {
         let session = Arc::new(Self {
             registry,
             inner: Mutex::new(Inner { state: State::Closed, next_id: 1 }),
+            active: AtomicBool::new(false),
             changed,
             devices,
         });
@@ -77,7 +84,7 @@ impl OverrideSession {
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self.inner.lock().unwrap().state, State::Open { .. })
+        self.active.load(Ordering::Acquire)
     }
 
     /// Changes to the live layer. The value is a counter and means nothing on
@@ -110,6 +117,7 @@ impl OverrideSession {
                 inner.next_id = inner.next_id.max(id + 1);
             }
             inner.state = next;
+            self.active.store(matches!(inner.state, State::Open { .. }), Ordering::Release);
         }
         // Applied under the lock, so two commands cannot reach the registry
         // in the other order than they were decided in.
