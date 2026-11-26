@@ -19,6 +19,7 @@ mod ledger;
 mod machine;
 mod mt_trackpad;
 mod output;
+mod pad_keys;
 mod override_session;
 mod preferences;
 mod resolver;

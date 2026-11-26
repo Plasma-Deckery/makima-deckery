@@ -687,13 +687,6 @@ fn the_raster_carries_on_across_the_lift() {
     assert!((gap - cell).abs() <= 200.0, "drag tick at {}, first roll tick at {}", at[0], at[1]);
 }
 
-#[test]
-fn the_pixel_interval_key_is_gone() {
-    let (_, w) = parse("pixel_interval = 3000");
-    assert_eq!(w.len(), 1, "{w:?}");
-    assert!(w[0].contains("pixel_interval"));
-}
-
 // ── The handler loop ─────────────────────────────────────────────────────────
 
 /// The loop around `step`: with time paused, a fling must keep moving the
@@ -873,5 +866,16 @@ fn a_haptic_value_that_is_not_a_table_warns() {
 fn a_config_that_is_not_a_table_is_all_defaults() {
     let (c, w) = TrackballConfig::parse(&toml::Value::Integer(3));
     assert_eq!(w.len(), 1);
+    assert_eq!(c, TrackballConfig::default());
+}
+
+/// An mt-trackpad key left in the table after a mode switch is inactive here,
+/// not unknown. `pixel_interval` used to be refused here as the trackball's
+/// old spacing key (now `grid`); it is the mt-trackpad's, so a table switched
+/// between the two modes holds it legitimately.
+#[test]
+fn another_modes_key_is_no_warning() {
+    let (c, w) = parse("pixel_interval = 3000");
+    assert!(w.is_empty(), "{w:?}");
     assert_eq!(c, TrackballConfig::default());
 }

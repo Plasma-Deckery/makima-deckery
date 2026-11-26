@@ -100,7 +100,8 @@
 //!
 //! Every key is optional and parsed on its own: a bad value logs a warning and
 //! falls back to that key's default, leaving the others as written. So does
-//! an unknown key, which is far more likely a typo than anything else.
+//! an unknown key, which is far more likely a typo than anything else — but
+//! not one another pad mode reads, which is just inactive (`pad_keys`).
 
 use crate::config::{default_tick, parse_pad_haptic};
 use crate::mt_trackpad::chain;
@@ -201,10 +202,9 @@ impl Default for TrackballConfig {
     }
 }
 
-/// Keys of `[trackpad.<side>]` that Core reads, or that hold sub-tables.
-const CORE_KEYS: &[&str] = &["mode", "click_pressure", "kde", "haptic"];
-const PHYSICS_KEYS: &[&str] = &["sensitivity", "friction", "min_fling_speed", "stop_speed", "grid"];
-const HAPTIC_KEYS: &[&str] = &["on_press", "on_release", "on_movement", "on_roll"];
+/// The keys of a pad table only this mode reads, besides Core's.
+pub(crate) const OWN_KEYS: &[&str] = &["sensitivity", "friction", "min_fling_speed", "stop_speed", "grid"];
+pub(crate) const HAPTIC_KEYS: &[&str] = &["on_press", "on_release", "on_movement", "on_roll"];
 
 impl TrackballConfig {
     /// Parses `value` (a `[trackpad.left]`/`[trackpad.right]` table) and logs
@@ -229,8 +229,10 @@ impl TrackballConfig {
             return (c, warnings);
         };
 
+        // A key another mode reads is inactive here, not a typo — see
+        // `pad_keys`.
         for key in table.keys() {
-            if !CORE_KEYS.contains(&key.as_str()) && !PHYSICS_KEYS.contains(&key.as_str()) {
+            if !crate::pad_keys::is_pad_key(key) {
                 warnings.push(format!("unknown key {:?} ignored", key));
             }
         }
@@ -283,7 +285,7 @@ impl TrackballConfig {
             None => {}
             Some(toml::Value::Table(h)) => {
                 for key in h.keys() {
-                    if !HAPTIC_KEYS.contains(&key.as_str()) {
+                    if !crate::pad_keys::is_haptic_key(key) {
                         warnings.push(format!("unknown key haptic.{:?} ignored", key));
                     }
                 }

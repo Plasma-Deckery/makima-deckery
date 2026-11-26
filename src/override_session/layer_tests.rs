@@ -145,3 +145,22 @@ fn a_valid_layer_passes() {
     ]).cleared().with_value("remap.B", json(r#"["KEY_ESC"]"#)).unwrap();
     assert_eq!(l.validate(&base(), &known()), Ok(()));
 }
+
+/// Switching a trackball pad to mt-trackpad keeps the trackball's keys in the
+/// table, and the mt-trackpad parser takes them as another mode's, not as
+/// unknown — the same as a user switching `mode` in their own file.
+#[test]
+fn a_mode_switch_leaves_no_unknown_keys_for_the_new_mode() {
+    let mut underlay = base();
+    underlay.trackpad = config(r#"
+        [trackpad.right]
+        mode = "trackball"
+        sensitivity = 0.01
+        [trackpad.right.haptic]
+        on_roll = false
+    "#).trackpad;
+    let effective = layer(&[("trackpad.right.mode", r#""mt-trackpad""#)]).apply(&underlay).unwrap();
+    assert_eq!(effective.trackpad.right.mode, "mt-trackpad");
+    let (_, warnings) = crate::mt_trackpad::MtTrackpadConfig::parse(&effective.trackpad.right.handler_config);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}

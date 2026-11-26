@@ -104,7 +104,9 @@ pub(crate) fn parse_pixel_interval(table: &toml::value::Table, default: u32, war
     }
 }
 
-const HAPTIC_KEYS: &[&str] = &["on_press", "on_release", "on_movement"];
+/// The keys of a pad table only this mode reads, besides Core's.
+pub(crate) const OWN_KEYS: &[&str] = &["pixel_interval"];
+pub(crate) const HAPTIC_KEYS: &[&str] = &["on_press", "on_release", "on_movement"];
 
 impl MtTrackpadConfig {
     /// Parses `value` (a `[trackpad.left]`/`[trackpad.right]` TOML table) and
@@ -130,8 +132,10 @@ impl MtTrackpadConfig {
         match table.get("haptic") {
             None => {}
             Some(toml::Value::Table(h)) => {
+                // A key another mode reads is inactive here, not a typo —
+                // see `pad_keys`.
                 for key in h.keys() {
-                    if !HAPTIC_KEYS.contains(&key.as_str()) {
+                    if !crate::pad_keys::is_haptic_key(key) {
                         warnings.push(format!("unknown key haptic.{:?} ignored", key));
                     }
                 }

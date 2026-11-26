@@ -234,3 +234,13 @@ fn a_silenced_press_is_not_felt() {
     );
     assert!(actions.is_empty());
 }
+
+/// A trackball key left in the table after a mode switch is inactive here,
+/// not unknown; a key no mode reads still warns.
+#[test]
+fn another_modes_haptic_key_is_no_warning_but_a_typo_is() {
+    let (_, w) = parse("[haptic]\non_roll = false");
+    assert!(w.is_empty(), "{w:?}");
+    let (_, w) = parse("[haptic]\non_rol = false");
+    assert_eq!(w.len(), 1, "{w:?}");
+}
