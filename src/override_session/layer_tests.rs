@@ -99,7 +99,7 @@ fn a_trackpad_mode_is_merged_into_the_pad_table() {
 
 #[test]
 fn an_unknown_button_is_refused() {
-    let err = layer(&[("remap.BTN_NOPE", r#"["KEY_ENTER"]"#)]).validate(&base(), &known()).unwrap_err();
+    let err = layer(&[("remap.BTN_NOPE", r#"["KEY_ENTER"]"#)]).validate(&base(), &known()).unwrap_err().to_string();
     assert!(err.contains("BTN_NOPE"), "{err}");
 }
 
@@ -115,7 +115,7 @@ fn a_section_that_is_not_a_table_is_refused() {
 
 #[test]
 fn an_unknown_trackpad_mode_is_refused() {
-    let err = layer(&[("trackpad.right.mode", r#""marble""#)]).validate(&base(), &known()).unwrap_err();
+    let err = layer(&[("trackpad.right.mode", r#""marble""#)]).validate(&base(), &known()).unwrap_err().to_string();
     assert!(err.contains("marble"), "{err}");
 }
 
@@ -126,7 +126,7 @@ fn an_unknown_trackpad_key_is_refused() {
 
 #[test]
 fn a_setting_its_parser_refuses_is_refused() {
-    let err = layer(&[("settings.LSTICK_DEADZONE", r#""lots""#)]).validate(&base(), &known()).unwrap_err();
+    let err = layer(&[("settings.LSTICK_DEADZONE", r#""lots""#)]).validate(&base(), &known()).unwrap_err().to_string();
     assert!(err.contains("LSTICK_DEADZONE"), "{err}");
 }
 

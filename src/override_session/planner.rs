@@ -11,6 +11,7 @@
 //! replaces the live one, never after — and what an error does: nothing,
 //! except being answered.
 
+use super::layer::Refusal;
 use super::{Layer, OverrideCommand};
 
 /// The session as the planner sees it.
@@ -88,12 +89,13 @@ impl Decision {
 /// Decide what `input` does to `state`.
 ///
 /// `next_id` is the id a `begin` would hand out. `validate` is asked about a
-/// changed layer before it is accepted, and its error is the reply.
+/// changed layer before it is accepted, and its refusal is the reply, under
+/// the path unless it names its own spot.
 pub fn decide(
     state: &State,
     input: Input<'_>,
     next_id: u64,
-    validate: impl FnOnce(&Layer) -> Result<(), String>,
+    validate: impl FnOnce(&Layer) -> Result<(), Refusal>,
 ) -> Decision {
     let open = match state {
         State::Open { id, layer } => Some((*id, layer)),
@@ -138,8 +140,8 @@ pub fn decide(
                 Ok(next) => next,
                 Err(e) => return Decision::refuse(format!("{path}: {e}")),
             };
-            if let Err(e) = validate(&next) {
-                return Decision::refuse(format!("{path}: {e}"));
+            if let Err(refusal) = validate(&next) {
+                return Decision::refuse(refusal.for_path(path));
             }
             changed(id, layer, next)
         }

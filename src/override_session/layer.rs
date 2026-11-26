@@ -27,6 +27,49 @@ const BINDING_SECTIONS: &[&str] = &["remap", "commands", "movements", "hints"];
 /// either only takes effect when the session is rebuilt; see `planner`.
 const DEVICE_SECTIONS: &[&str] = &["trackpad", "settings"];
 
+/// Why a layer was refused.
+///
+/// The reply to a refused `set` names where the problem is exactly once. A
+/// check that knows the spot — a binding, a trackpad mode, a setting — says
+/// so itself, and its message stands as it is; anything else, a parser error
+/// about the document as a whole, is put under the path that was set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refusal {
+    message: String,
+    located: bool,
+}
+
+impl Refusal {
+    /// A refusal at a known spot in the document, in path form.
+    pub fn at(location: impl std::fmt::Display, why: impl std::fmt::Display) -> Self {
+        Self { message: format!("{location}: {why}"), located: true }
+    }
+
+    /// The text of the reply to a `set` of `path`.
+    pub fn for_path(&self, path: &str) -> String {
+        if self.located { self.message.clone() } else { format!("{path}: {}", self.message) }
+    }
+}
+
+/// A refusal that does not say where; the path it came from will.
+impl From<String> for Refusal {
+    fn from(message: String) -> Self {
+        Self { message, located: false }
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// The document and whether the bindings underneath are cleared.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Layer {
@@ -68,13 +111,14 @@ impl Layer {
 
     /// The document as a config of its own, refusing anything a file would
     /// only warn about — an override applies all of it or none.
-    pub fn parse(&self, aliases: &HashMap<String, String>) -> Result<Config, String> {
+    pub fn parse(&self, aliases: &HashMap<String, String>) -> Result<Config, Refusal> {
         let (config, problems) = Config::from_toml_value(
             toml::Value::Table(self.doc.clone()), "override".to_string(), aliases)?;
         if problems.is_empty() {
             Ok(config)
         } else {
-            Err(problems.join("; "))
+            // Each problem leads with where it is written.
+            Err(Refusal { message: problems.join("; "), located: true })
         }
     }
 
@@ -84,7 +128,7 @@ impl Layer {
     /// stays the underlay's, so the state export still names the base and the
     /// focused app, and nothing about which device it drives changes.
     pub fn apply(&self, underlay: &Config) -> Result<Config, String> {
-        let own = self.parse(&underlay.aliases)?;
+        let own = self.parse(&underlay.aliases).map_err(|r| r.to_string())?;
         let base = if self.cleared { underlay.without_bindings() } else { underlay.clone() };
         let mut effective = own.merged_with_base(&base);
         effective.trackpad = match self.doc.get("trackpad") {
@@ -120,7 +164,7 @@ impl Layer {
     /// Each of those is the check that already exists for a config file —
     /// the parser, `is_known_trackpad_mode`, `Settings::from_config` — asked
     /// to refuse what it would otherwise only warn about.
-    pub fn validate(&self, underlay: &Config, known_commands: &HashSet<Vec<String>>) -> Result<(), String> {
+    pub fn validate(&self, underlay: &Config, known_commands: &HashSet<Vec<String>>) -> Result<(), Refusal> {
         let own = self.parse(&underlay.aliases)?;
         allowlist::check(&own, known_commands)?;
         let effective = self.apply(underlay)?;
@@ -129,14 +173,16 @@ impl Layer {
         for (side, config) in [("left", &effective.trackpad.left), ("right", &effective.trackpad.right)] {
             let names_mode = trackpad.and_then(|t| t.get(side)).and_then(|s| s.get("mode")).is_some();
             if names_mode && !crate::device_session::is_known_trackpad_mode(&config.mode) {
-                return Err(format!("trackpad.{side}.mode: {:?} is not a trackpad mode", config.mode));
+                return Err(Refusal::at(
+                    format!("trackpad.{side}.mode"), format!("{:?} is not a trackpad mode", config.mode)));
             }
         }
 
         if let Some(toml::Value::Table(settings)) = self.doc.get("settings") {
             let (_, problems) = crate::settings::Settings::from_config(&effective);
             if let Some(problem) = problems.iter().find(|p| settings.contains_key(&p.key)) {
-                return Err(format!("[settings] {} = {:?} is not {}", problem.key, problem.value, problem.expected));
+                return Err(Refusal::at(
+                    format!("settings.{}", problem.key), format!("{:?} is not {}", problem.value, problem.expected)));
             }
         }
         Ok(())

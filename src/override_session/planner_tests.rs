@@ -1,6 +1,6 @@
 use super::*;
 
-fn ok(_: &Layer) -> Result<(), String> {
+fn ok(_: &Layer) -> Result<(), Refusal> {
     Ok(())
 }
 
@@ -134,4 +134,14 @@ fn a_reply_is_one_line() {
     assert_eq!(Reply::Ok.to_string(), "ok");
     assert_eq!(Reply::Began(3).to_string(), "ok 3");
     assert_eq!(Reply::Error("TOML error\n  at line 1\n".into()).to_string(), "error TOML error at line 1");
+}
+
+/// A refusal that names its own spot is the reply as it is; the path is not
+/// put in front of it a second time.
+#[test]
+fn a_located_refusal_is_not_prefixed_with_the_path() {
+    let command = set("trackpad.right.mode", r#""marble""#);
+    let d = decide(&open_state(), Input::Command(&command), 1,
+        |_| Err(Refusal::at("trackpad.right.mode", "\"marble\" is not a trackpad mode")));
+    assert_eq!(d.reply.to_string(), r#"error trackpad.right.mode: "marble" is not a trackpad mode"#);
 }

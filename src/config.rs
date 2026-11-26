@@ -1251,8 +1251,10 @@ fn parse_binding_input(
     }
 }
 
-/// `problems` gets one line for every binding that had to be skipped. The
-/// parser still logs each one where it finds it, as it always has.
+/// `problems` gets one line for every binding that had to be skipped, led by
+/// where it is written in the dotted form an override path uses
+/// (`remap.L1-X: …`). The parser still logs each one where it finds it, as it
+/// always has.
 fn parse_raw_config(
     raw_config: RawConfig,
     aliases: &HashMap<String, String>,
@@ -1285,7 +1287,7 @@ fn parse_raw_config(
             RemapValue::WithAttrs { keys, no_pause, while_gaming, label, silent, haptic, note } => (keys, no_pause, while_gaming, label, silent, haptic, note),
         };
         let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else {
-            problems.push(format!("[remap] {input:?} names an unknown button"));
+            problems.push(format!("remap.{input}: names an unknown button"));
             continue;
         };
         if np { bindings.no_pause.insert((evt, modifiers.clone())); }
@@ -1303,7 +1305,7 @@ fn parse_raw_config(
             CommandValue::WithAttrs { run, no_pause, while_gaming, label, silent, haptic, note } => (run, no_pause, while_gaming, label, silent, haptic, note),
         };
         let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else {
-            problems.push(format!("[commands] {input:?} names an unknown button"));
+            problems.push(format!("commands.{input}: names an unknown button"));
             continue;
         };
         if np { bindings.no_pause.insert((evt, modifiers.clone())); }
@@ -1321,11 +1323,11 @@ fn parse_raw_config(
         // override session parses text that arrives over a socket.
         let Ok(rel) = Relative::from_str(output.as_str()) else {
             eprintln!("[makima] WARNING: unknown movement {output:?} for {input:?} — skipping");
-            problems.push(format!("[movements] {input:?}: {output:?} is not a movement"));
+            problems.push(format!("movements.{input}: {output:?} is not a movement"));
             continue;
         };
         let (Some(evt), modifiers) = parse_binding_input(&input, &mut mapped_modifiers, aliases) else {
-            problems.push(format!("[movements] {input:?} names an unknown button"));
+            problems.push(format!("movements.{input}: names an unknown button"));
             continue;
         };
         bindings.movements.entry(evt).or_default().insert(modifiers, rel);

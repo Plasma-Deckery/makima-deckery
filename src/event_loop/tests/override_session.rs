@@ -98,6 +98,12 @@ async fn an_invalid_set_is_rejected_and_changes_nothing() {
         vec![(Key::KEY_ENTER, 1), (Key::KEY_ENTER, 0)]);
     assert!(keyboard_keys(&tap(&mut deck, Key::BTN_EAST).await).is_empty());
     assert!(deck.device_log.is_empty(), "a rejected set rebuilt the devices");
+
+    // Each error says where once — the path, or the spot the check found.
+    let (reply, _) = deck.override_cmd(r#"override set trackpad.right.mode "marble""#).await;
+    assert_eq!(reply, r#"error trackpad.right.mode: "marble" is not a trackpad mode"#);
+    let (reply, _) = deck.override_cmd(r#"override set remap.BTN_NOPE ["KEY_ESC"]"#).await;
+    assert_eq!(reply, "error remap.BTN_NOPE: names an unknown button");
 }
 
 /// Only one session at a time.

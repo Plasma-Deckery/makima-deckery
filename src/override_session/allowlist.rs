@@ -27,7 +27,7 @@ pub fn check(own: &Config, known: &HashSet<Vec<String>>) -> Result<(), String> {
     commands.sort();
     match commands.into_iter().find(|argv| !known.contains(*argv)) {
         Some(argv) => Err(format!(
-            "[commands] {argv:?} is not bound in any loaded config — an override may only \
+            "{argv:?} is not bound in any loaded config — an override may only \
              bind commands the configs already bind")),
         None => Ok(()),
     }

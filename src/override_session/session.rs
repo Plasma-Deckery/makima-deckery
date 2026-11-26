@@ -137,7 +137,7 @@ impl OverrideSession {
     /// has, as loaded from disk, with the commands those configs bind as the
     /// allowlist. With no base config loaded there is nothing to lay it over,
     /// and it only has to parse on its own.
-    fn validate(&self, layer: &Layer) -> Result<(), String> {
+    fn validate(&self, layer: &Layer) -> Result<(), super::layer::Refusal> {
         let known = self.registry.known_commands();
         let bases = self.registry.base_configs_without_override();
         if bases.is_empty() {
