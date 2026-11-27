@@ -47,3 +47,37 @@ async fn the_export_survives_a_rebuild() {
     assert!(analog_rpad_x(&move_rpad(&mut after, 0).await).is_empty());
     assert!(!*flag.lock().await, "off is the session's too");
 }
+
+/// The onboarding tour: the HUD switched the export on before the session,
+/// then every stage `set`s pad keys, each a rebuild, and the end reloads the
+/// files and rebuilds once more. The pads keep reaching the state throughout,
+/// whatever the pad's mode or click switch says.
+#[tokio::test]
+async fn the_export_survives_an_override_session() {
+    let flag = Arc::new(Mutex::new(false));
+    let mut deck = Deck::in_session("analog-override", flag);
+    deck.ipc("analog-state-export on").await;
+
+    let mut rebuilds = 0;
+    for line in [
+        "override begin",
+        "override clear",
+        r#"override set trackpad.right.mode "mt-trackpad""#,
+        "override set trackpad.right.click false",
+        "override set trackpad.gestures.click false",
+        r#"override set trackpad.right.mode "trackball""#,
+        "override end",
+    ] {
+        let (reply, _) = deck.override_cmd(line).await;
+        assert!(reply.starts_with("ok"), "{line}: {reply}");
+        if !deck.device_log.is_empty() {
+            deck.device_log.clear();
+            deck = deck.rebuilt();
+            rebuilds += 1;
+        }
+        let xs = analog_rpad_x(&move_rpad(&mut deck, 8192).await);
+        let xs2 = analog_rpad_x(&move_rpad(&mut deck, -8192).await);
+        assert_eq!((xs.len(), xs2.len()), (1, 1), "after {line}: the pad's position stopped reaching the state");
+    }
+    assert!(rebuilds >= 5, "every pad set and the end rebuild: {rebuilds}");
+}
