@@ -794,4 +794,44 @@ mod tests {
             "while the session runs, the right handler hears nothing else");
         assert!(matches!(comb_rx.try_recv().unwrap(), GestureEvent::Start(_)));
     }
+
+    /// The HUD draws the pads from the positions the router keeps and the
+    /// analog writes it asks for. A two-finger session routes the frames to
+    /// the gesture device instead of the pads' handlers, but what the overlay
+    /// reads must not stop: every frame's positions land, and moving at frame
+    /// rate keeps asking for analog writes.
+    #[tokio::test]
+    async fn a_gesture_session_keeps_the_pads_in_the_state() {
+        let (combined_tx, mut comb_rx) = mpsc::channel::<GestureEvent>(64);
+        let (pad_tx, pad_rx)           = mpsc::channel::<PadFrame>(64);
+        let (outputs, mut emissions)   = watched_outputs();
+        let lpad = PadState::new(true);
+        let rpad = PadState::new(false);
+        let gesture_session = Arc::new(Mutex::new(false));
+
+        let frames = async move {
+            for step in 0..6 {
+                pad_tx.send(PadFrame {
+                    lx: -1000 * step, ly: 0, ltouch: true,
+                    rx: 1000 * step, ry: 500, rtouch: true,
+                    ..PadFrame::default()
+                }).await.unwrap();
+                // The router's gate runs on the wall clock, not tokio's.
+                tokio::time::sleep(Duration::from_millis(17)).await;
+            }
+        };
+        let router = run(
+            pad_rx, &lpad, &rpad, &gesture_session, &outputs,
+            None, None, Some(combined_tx), Arc::new(Mutex::new(false)),
+        );
+        tokio::join!(router, frames);
+
+        assert!(matches!(comb_rx.try_recv().unwrap(), GestureEvent::Start(_)), "it was a gesture session");
+        assert_eq!(*lpad.position.lock().await, (-5000, 0));
+        assert_eq!(*rpad.position.lock().await, (5000, 500));
+        let analog = decisions(&mut emissions).iter()
+            .filter(|a| **a == OutputAction::State(StateAction::Request { urgency: Urgency::Analog }))
+            .count();
+        assert_eq!(analog, 5, "one analog write per move, each past the 16 ms gate");
+    }
 }
