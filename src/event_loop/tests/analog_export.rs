@@ -109,3 +109,33 @@ async fn the_export_survives_the_tour_with_on_sent_mid_rebuild() {
     assert!(on_sent);
     assert!(flag.is_on());
 }
+
+/// The HUD's `off` and the `on` right behind it, around and inside a rebuild:
+/// the switch ends up as the last line said. The socket takes one connection
+/// at a time and carries the switch out before it accepts the next, and no
+/// reader is involved, so their order is the order they take effect in.
+#[tokio::test]
+async fn off_then_on_ends_on_whatever_the_rebuild_timing() {
+    let flag = crate::analog_export::AnalogExport::default();
+    let mut deck = Deck::in_session("analog-off-on", flag.clone());
+    let send = |deck: &Deck, line: &str| {
+        crate::control_socket::handle(line, &deck.session, &flag, "test")
+    };
+    send(&deck, "analog-state-export on");
+    deck.override_cmd("override begin").await;
+
+    for (i, set) in [r#""trackball""#, r#""mt-trackpad""#, r#""trackball""#].iter().enumerate() {
+        deck.override_cmd(&format!("override set trackpad.right.mode {set}")).await;
+        deck.device_log.clear();
+        match i {
+            // Both before the rebuild.
+            0 => { send(&deck, "analog-state-export off"); send(&deck, "analog-state-export on"); deck = deck.rebuilt(); }
+            // Split by it.
+            1 => { send(&deck, "analog-state-export off"); deck = deck.rebuilt(); send(&deck, "analog-state-export on"); }
+            // Both after it.
+            _ => { deck = deck.rebuilt(); send(&deck, "analog-state-export off"); send(&deck, "analog-state-export on"); }
+        }
+        assert!(flag.is_on(), "round {i}: off then on did not end on");
+        assert_eq!(analog_rpad_x(&move_rpad(&mut deck, 4096).await).len(), 1, "round {i}");
+    }
+}
