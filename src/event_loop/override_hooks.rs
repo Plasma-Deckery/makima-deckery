@@ -15,7 +15,7 @@
 
 use super::*;
 use crate::config::DoubleclickTrigger;
-use crate::override_session::emergency::EMERGENCY_EXIT_HOLD;
+use crate::override_session::emergency::{EMERGENCY_EXIT_COMBO, EMERGENCY_EXIT_HOLD};
 
 impl EventReader {
     /// Apply every change to the live layer as it comes.
@@ -26,6 +26,13 @@ impl EventReader {
     /// session ends Gaming Mode first, before any change arrives.
     pub(super) async fn override_loop(&self) {
         let mut changes = self.override_session.subscribe();
+        if self.override_session.is_active() {
+            // The new reader's combo tracker is empty, and the controller
+            // reports a button already held only once it is let go — see
+            // `track_emergency_combo`. Said so the journal shows it.
+            println!("deckery: override: reader started under an open session — \
+                      the emergency combo has to be pressed anew");
+        }
         self.end_gaming_mode_for_session().await;
         while changes.changed().await.is_ok() {
             self.apply_override_change().await;
@@ -68,9 +75,22 @@ impl EventReader {
     /// forgets a combo held across it, and the hold has to start again. That
     /// is left so on purpose: a rebuild is rare, short, and announced by the
     /// pads resetting, and the next press of either button rearms it.
+    ///
+    /// While a session is open every edge of the combo's buttons is logged,
+    /// with what the tracker holds afterwards. A press costs one line, and
+    /// only during the tour; it is what tells, from the journal alone, whether
+    /// the buttons reached the reader at all.
     pub(super) fn track_emergency_combo(&self, event: Event, value: i32) {
         let Event::Key(key) = event else { return };
-        let changed = self.emergency_combo.lock().unwrap().update(key, value);
+        let (changed, held) = {
+            let mut tracker = self.emergency_combo.lock().unwrap();
+            let changed = tracker.update(key, value);
+            (changed, tracker.held_keys())
+        };
+        if self.override_session.is_active() && EMERGENCY_EXIT_COMBO.contains(&key) && value != 2 {
+            println!("deckery: override: emergency combo: {key:?} {} (held: {held:?})",
+                if value == 1 { "down" } else { "up" });
+        }
         if let Some(held) = changed {
             self.emergency_held.send_replace(held);
         }
@@ -88,6 +108,12 @@ impl EventReader {
             while !*held.borrow_and_update() {
                 if held.changed().await.is_err() { return; }
             }
+            let since = tokio::time::Instant::now();
+            let session = self.override_session.is_active();
+            if session {
+                println!("deckery: override: emergency exit armed — hold for {} s",
+                    EMERGENCY_EXIT_HOLD.as_secs());
+            }
             tokio::select! {
                 _ = tokio::time::sleep(EMERGENCY_EXIT_HOLD) => {
                     if *held.borrow() {
@@ -100,6 +126,10 @@ impl EventReader {
                 }
                 changed = held.changed() => {
                     if changed.is_err() { return; }
+                    if session {
+                        println!("deckery: override: emergency exit released after {} ms — not triggered",
+                            since.elapsed().as_millis());
+                    }
                 }
             }
         }

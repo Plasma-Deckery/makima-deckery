@@ -78,7 +78,8 @@ impl OverrideSession {
     /// The emergency combo was held: end the session if one is open.
     pub fn emergency_exit(&self) {
         if self.is_active() {
-            eprintln!("deckery: override: emergency exit held — ending the session");
+            eprintln!("deckery: override: emergency exit triggered — combo held {} s, ending the session",
+                super::emergency::EMERGENCY_EXIT_HOLD.as_secs());
         }
         self.run(Input::EmergencyExit, "emergency exit");
     }

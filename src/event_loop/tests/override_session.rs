@@ -367,3 +367,19 @@ async fn a_reader_starting_under_a_session_ends_gaming_mode() {
     override_loop.abort();
     assert!(!*deck.reader.gaming_mode.lock().await, "the new reader left Gaming Mode on");
 }
+
+/// The Deck reports both buttons of a chord in one hidraw report when they go
+/// down together: two key edges before one SYN_REPORT. That counts as well.
+#[tokio::test(start_paused = true)]
+async fn the_emergency_exit_works_with_both_buttons_in_one_report() {
+    let mut deck = Deck::new("override-emergency-chord");
+    begin_and_clear(&mut deck).await;
+    let [steam, qam] = EMERGENCY_EXIT_COMBO;
+    deck.feed(vec![
+        InputEvent::new(EventType::KEY, steam.code(), 1),
+        InputEvent::new(EventType::KEY, qam.code(), 1),
+        syn(),
+    ]).await;
+    tokio::time::sleep(EMERGENCY_EXIT_HOLD + std::time::Duration::from_millis(50)).await;
+    assert!(!deck.session.is_active());
+}

@@ -45,6 +45,11 @@ impl ComboTracker {
     pub fn all_held(&self) -> bool {
         self.held.iter().all(|h| *h)
     }
+
+    /// The combo's buttons that are down, for the journal.
+    pub fn held_keys(&self) -> Vec<Key> {
+        EMERGENCY_EXIT_COMBO.iter().zip(self.held).filter(|(_, h)| *h).map(|(k, _)| *k).collect()
+    }
 }
 
 #[cfg(test)]
