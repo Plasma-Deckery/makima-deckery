@@ -8,14 +8,14 @@
 //!   bindings before the next button is pressed;
 //! * end Gaming Mode when a session opens, and keep its double-click trigger
 //!   switched off while one is open — the tour runs on the desktop bindings;
-//! * watch the raw buttons for the emergency exit, which works whatever the
-//!   layer has cleared;
+//! * pass QAM presses to the session for the emergency exit, which works
+//!   whatever the layer has cleared;
 //! * say in the state export that a session is open, and that the Gaming
 //!   Mode trigger is not there while it is.
 
 use super::*;
 use crate::config::DoubleclickTrigger;
-use crate::override_session::emergency::{EMERGENCY_EXIT_COMBO, EMERGENCY_EXIT_HOLD};
+use crate::override_session::emergency::EMERGENCY_EXIT_KEY;
 
 impl EventReader {
     /// Apply every change to the live layer as it comes.
@@ -26,13 +26,6 @@ impl EventReader {
     /// session ends Gaming Mode first, before any change arrives.
     pub(super) async fn override_loop(&self) {
         let mut changes = self.override_session.subscribe();
-        if self.override_session.is_active() {
-            // The new reader's combo tracker is empty, and the controller
-            // reports a button already held only once it is let go — see
-            // `track_emergency_combo`. Said so the journal shows it.
-            println!("deckery: override: reader started under an open session — \
-                      the emergency combo has to be pressed anew");
-        }
         self.end_gaming_mode_for_session().await;
         while changes.changed().await.is_ok() {
             self.apply_override_change().await;
@@ -68,71 +61,19 @@ impl EventReader {
         }
     }
 
-    /// Record one key edge for the emergency exit.
+    /// A press of the emergency exit's button, for the session to count.
     ///
-    /// The tracker belongs to this reader and starts empty with it. A rebuild
-    /// of the device tasks — a reinit, a trackpad mode change — therefore
-    /// forgets a combo held across it, and the hold has to start again. That
-    /// is left so on purpose: a rebuild is rare, short, and announced by the
-    /// pads resetting, and the next press of either button rearms it.
-    ///
-    /// While a session is open every edge of the combo's buttons is logged,
-    /// with what the tracker holds afterwards. A press costs one line, and
-    /// only during the tour; it is what tells, from the journal alone, whether
-    /// the buttons reached the reader at all.
-    pub(super) fn track_emergency_combo(&self, event: Event, value: i32) {
-        let Event::Key(key) = event else { return };
-        let (changed, held) = {
-            let mut tracker = self.emergency_combo.lock().unwrap();
-            let changed = tracker.update(key, value);
-            (changed, tracker.held_keys())
-        };
-        if self.override_session.is_active() && EMERGENCY_EXIT_COMBO.contains(&key) && value != 2 {
-            println!("deckery: override: emergency combo: {key:?} {} (held: {held:?})",
-                if value == 1 { "down" } else { "up" });
+    /// Every press is passed on, session or not; the session ignores them
+    /// when it is closed. The window is the Gaming Mode trigger's, or its
+    /// default when the trigger is switched off in the config.
+    pub(super) fn note_emergency_press(&self, event: Event, value: i32) {
+        if event != Event::Key(EMERGENCY_EXIT_KEY) || value != 1 {
+            return;
         }
-        if let Some(held) = changed {
-            self.emergency_held.send_replace(held);
-        }
-    }
-
-    /// End the session once the emergency combo has been held for
-    /// `EMERGENCY_EXIT_HOLD`.
-    ///
-    /// A timer rather than a check on the next edge: the point of holding is
-    /// that nothing else is pressed. Letting go of either button before the
-    /// time is up starts over.
-    pub(super) async fn emergency_exit_loop(&self) {
-        let mut held = self.emergency_held.subscribe();
-        loop {
-            while !*held.borrow_and_update() {
-                if held.changed().await.is_err() { return; }
-            }
-            let since = tokio::time::Instant::now();
-            let session = self.override_session.is_active();
-            if session {
-                println!("deckery: override: emergency exit armed — hold for {} s",
-                    EMERGENCY_EXIT_HOLD.as_secs());
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(EMERGENCY_EXIT_HOLD) => {
-                    if *held.borrow() {
-                        self.override_session.emergency_exit();
-                    }
-                    // One exit per hold: the next one needs a release first.
-                    while *held.borrow_and_update() {
-                        if held.changed().await.is_err() { return; }
-                    }
-                }
-                changed = held.changed() => {
-                    if changed.is_err() { return; }
-                    if session {
-                        println!("deckery: override: emergency exit released after {} ms — not triggered",
-                            since.elapsed().as_millis());
-                    }
-                }
-            }
-        }
+        let window_ms = self.gaming_mode_config.trigger.as_ref()
+            .map_or(crate::config::DEFAULT_DOUBLE_CLICK_MS, |t| t.ms);
+        self.override_session.emergency_press(
+            tokio::time::Instant::now(), std::time::Duration::from_millis(window_ms));
     }
 
     /// `context.override_active` in a snapshot — and, while a session is

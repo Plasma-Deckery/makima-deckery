@@ -1,54 +1,43 @@
-//! The emergency exit: a combo that always ends an override session.
+//! The emergency exit: a double-click on QAM (···) ends an override session.
 //!
 //! The tour can clear every binding, and it can crash or hang while they are
-//! cleared. So there is one way out that no config can take away: holding
-//! Steam and QAM (···) together for three seconds ends the session, however
-//! the layer looks. It is decided on the raw buttons, before any binding is
-//! looked at, and only does anything while a session is open.
+//! cleared. So there is one way out that no layer can take away. It is decided
+//! on the raw button, before any binding is looked at, works while paused, and
+//! only does anything while a session is open — when none is, the same
+//! double-click is the Gaming Mode trigger, which is switched off for the
+//! duration of a session, so exactly one of the two ever acts.
 //!
-//! The combo and the hold are here and nowhere else.
+//! It used to be Steam + QAM held for three seconds. On the Deck, QAM reaches
+//! makima only as a pulse of ~150–180 ms however long it is held (measured on
+//! the first hardware test), so a hold with it can never be seen.
+//!
+//! The double-click window is the Gaming Mode trigger's, from the config, so
+//! the button feels the same in both roles. The last press is kept in the
+//! session rather than in the reader: the tour rebuilds the device tasks at
+//! every stage change, and a reader's state would not survive that.
 
 use evdev::Key;
 use std::time::Duration;
+use tokio::time::Instant;
 
-/// The buttons that make up the emergency exit: Steam and QAM (···).
-pub const EMERGENCY_EXIT_COMBO: [Key; 2] = [Key::BTN_MODE, Key::BTN_BASE];
+/// The button whose double-click ends a session: QAM (···).
+pub const EMERGENCY_EXIT_KEY: Key = Key::BTN_BASE;
 
-/// How long the combo has to be held.
-pub const EMERGENCY_EXIT_HOLD: Duration = Duration::from_secs(3);
-
-/// Which buttons of the combo are down.
+/// The press edges of `EMERGENCY_EXIT_KEY` while a session is open.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ComboTracker {
-    held: [bool; EMERGENCY_EXIT_COMBO.len()],
+pub struct DoubleClick {
+    last_press: Option<Instant>,
 }
 
-impl ComboTracker {
-    /// Record one key edge. Returns whether the whole combo is held now if
-    /// that changed with this edge, `None` if it did not.
-    ///
-    /// A repeat (value 2) is no edge, and a key outside the combo changes
-    /// nothing: holding the combo while pressing something else still counts.
-    pub fn update(&mut self, key: Key, value: i32) -> Option<bool> {
-        let index = EMERGENCY_EXIT_COMBO.iter().position(|k| *k == key)?;
-        let down = match value {
-            0 => false,
-            1 => true,
-            _ => return None,
-        };
-        let before = self.all_held();
-        self.held[index] = down;
-        let after = self.all_held();
-        (before != after).then_some(after)
-    }
-
-    pub fn all_held(&self) -> bool {
-        self.held.iter().all(|h| *h)
-    }
-
-    /// The combo's buttons that are down, for the journal.
-    pub fn held_keys(&self) -> Vec<Key> {
-        EMERGENCY_EXIT_COMBO.iter().zip(self.held).filter(|(_, h)| *h).map(|(k, _)| *k).collect()
+impl DoubleClick {
+    /// One press at `now`. True when it is the second of two presses at most
+    /// `window` apart — the same test the Gaming Mode trigger makes. A
+    /// double-click is used up by the press that completes it, so a third
+    /// press starts a new one.
+    pub fn press(&mut self, now: Instant, window: Duration) -> bool {
+        let double = self.last_press.is_some_and(|prev| now.duration_since(prev) <= window);
+        self.last_press = if double { None } else { Some(now) };
+        double
     }
 }
 

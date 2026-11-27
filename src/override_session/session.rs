@@ -35,6 +35,9 @@ pub enum DeviceRequest {
 
 struct Inner {
     state: State,
+    /// QAM presses towards the emergency exit. Here rather than in a reader,
+    /// so a rebuild of the device tasks between two presses loses nothing.
+    clicks: super::emergency::DoubleClick,
     /// The id the next `begin` hands out. Starts at 1 with every process, so
     /// an id says nothing across a restart — and there is no session to name
     /// across one either.
@@ -62,7 +65,7 @@ impl OverrideSession {
         let (changed, _) = watch::channel(0);
         let session = Arc::new(Self {
             registry,
-            inner: Mutex::new(Inner { state: State::Closed, next_id: 1 }),
+            inner: Mutex::new(Inner { state: State::Closed, clicks: Default::default(), next_id: 1 }),
             active: AtomicBool::new(false),
             changed,
             devices,
@@ -75,13 +78,17 @@ impl OverrideSession {
         self.run(Input::Command(command), command_name(command))
     }
 
-    /// The emergency combo was held: end the session if one is open.
-    pub fn emergency_exit(&self) {
-        if self.is_active() {
-            eprintln!("deckery: override: emergency exit triggered — combo held {} s, ending the session",
-                super::emergency::EMERGENCY_EXIT_HOLD.as_secs());
+    /// A press of the emergency exit's button at `now`. The second one within
+    /// `window` ends the session; without a session it is not even counted.
+    pub fn emergency_press(&self, now: tokio::time::Instant, window: std::time::Duration) {
+        let double = {
+            let mut inner = self.inner.lock().unwrap();
+            matches!(inner.state, State::Open { .. }) && inner.clicks.press(now, window)
+        };
+        if double {
+            eprintln!("deckery: override: emergency exit: double-click — ending the session");
+            self.run(Input::EmergencyExit, "emergency exit");
         }
-        self.run(Input::EmergencyExit, "emergency exit");
     }
 
     pub fn is_active(&self) -> bool {
@@ -117,7 +124,15 @@ impl OverrideSession {
             if let State::Open { id, .. } = next {
                 inner.next_id = inner.next_id.max(id + 1);
             }
+            let was_open = matches!(inner.state, State::Open { .. });
             inner.state = next;
+            let open = matches!(inner.state, State::Open { .. });
+            // A session starts and ends with no click counted towards an exit.
+            // A `set` in between keeps them: the tour may change a stage
+            // between the two clicks.
+            if open != was_open {
+                inner.clicks = Default::default();
+            }
             self.active.store(matches!(inner.state, State::Open { .. }), Ordering::Release);
         }
         // Applied under the lock, so two commands cannot reach the registry

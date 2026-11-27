@@ -18,7 +18,7 @@
 //! * `allowlist` — which `[commands]` an override may bind
 //! * `checks` — refusing the fallbacks a file would only warn about
 //! * `planner` — what a command does to the session; pure
-//! * `emergency` — the hard-wired combo that always ends a session
+//! * `emergency` — the hard-wired QAM double-click that always ends a session
 //! * `session` — the shared handle that holds the state and carries out the
 //!   planner's decisions
 //!

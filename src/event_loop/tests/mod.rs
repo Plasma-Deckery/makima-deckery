@@ -161,9 +161,6 @@ pub(super) struct Deck {
     events: mpsc::Sender<ControllerEvent>,
     tap: mpsc::Receiver<Emission>,
     read_loop: tokio::task::JoinHandle<()>,
-    /// The reader's emergency-exit timer, which runs beside the read loop in
-    /// production too.
-    emergency_loop: tokio::task::JoinHandle<()>,
     dir: PathBuf,
     server: Server,
     /// The override session this reader shares with the control socket.
@@ -175,12 +172,13 @@ pub(super) struct Deck {
     pub device_log: Vec<DeviceRequest>,
     /// Gaming Mode requests the reader sent, waiting for `settle`.
     gaming_requests: mpsc::Receiver<bool>,
+    /// The device session's analog export flag, which a rebuild hands on.
+    analog_state_export: Arc<Mutex<bool>>,
 }
 
 impl Drop for Deck {
     fn drop(&mut self) {
         self.read_loop.abort();
-        self.emergency_loop.abort();
         if !self.dir.as_os_str().is_empty() {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -237,7 +235,7 @@ impl Deck {
             server: server.clone(),
         };
         let reader = Arc::new(EventReader::for_test(
-            base_config, registry, event_rx, environment, Tap::new(tap_tx), analog_state_export,
+            base_config, registry, event_rx, environment, Tap::new(tap_tx), analog_state_export.clone(),
             gaming_mode_tx, session.clone(),
         ));
         // The production loop, running for the whole test: what it keeps
@@ -247,14 +245,40 @@ impl Deck {
             let reader = reader.clone();
             async move { reader.read_events().await }
         });
-        let emergency_loop = tokio::spawn({
-            let reader = reader.clone();
-            async move { reader.emergency_exit_loop().await }
-        });
         Self {
-            reader, events, tap, read_loop, emergency_loop, dir, server, session,
-            device_requests, device_log: Vec::new(), gaming_requests,
+            reader, events, tap, read_loop, dir, server, session,
+            device_requests, device_log: Vec::new(), gaming_requests, analog_state_export,
         }
+    }
+
+    /// The device tasks rebuilt, as the device loop does on a Relaunch: a new
+    /// reader over the same registry and the same session.
+    pub fn rebuilt(mut self) -> Self {
+        let registry = self.reader.registry.clone();
+        let session = self.session.clone();
+        let base_config = registry.base_configs().into_iter().next().expect("the base config parses");
+        let (events, event_rx) = mpsc::channel(1);
+        let (tap_tx, tap) = mpsc::channel(4096);
+        let (gaming_mode_tx, gaming_requests) = mpsc::channel(8);
+        let environment = Environment {
+            user: Err(std::env::VarError::NotPresent),
+            sudo_user: Err(std::env::VarError::NotPresent),
+            server: self.server.clone(),
+        };
+        let reader = Arc::new(EventReader::for_test(
+            base_config, registry, event_rx, environment, Tap::new(tap_tx),
+            self.analog_state_export.clone(), gaming_mode_tx, session,
+        ));
+        self.read_loop.abort();
+        self.read_loop = tokio::spawn({
+            let reader = reader.clone();
+            async move { reader.read_events().await }
+        });
+        self.reader = reader;
+        self.events = events;
+        self.tap = tap;
+        self.gaming_requests = gaming_requests;
+        self
     }
 
     /// makima stopped and started again over the same config files.

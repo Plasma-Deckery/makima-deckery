@@ -26,7 +26,7 @@ pub enum State {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input<'a> {
     Command(&'a OverrideCommand),
-    /// The hard-wired combo was held long enough; see `emergency`.
+    /// The hard-wired QAM double-click; see `emergency`.
     EmergencyExit,
 }
 

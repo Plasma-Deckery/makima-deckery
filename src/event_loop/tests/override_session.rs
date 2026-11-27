@@ -7,7 +7,7 @@
 //! of the device tasks, which needs a device.
 
 use super::*;
-use crate::override_session::emergency::{EMERGENCY_EXIT_COMBO, EMERGENCY_EXIT_HOLD};
+use crate::override_session::emergency::EMERGENCY_EXIT_KEY;
 
 /// A press and its release, and what both did.
 async fn tap(deck: &mut Deck, key: Key) -> Vec<OutputAction> {
@@ -136,20 +136,30 @@ async fn end_brings_the_disk_config_back() {
         vec![(Key::KEY_ENTER, 1), (Key::KEY_ENTER, 0)]);
 }
 
-/// Holding Steam and QAM for the full time ends the session with every
-/// binding cleared, and the configs on disk are back.
+/// Time between two QAM presses, as a test spells it.
+fn ms(n: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(n)
+}
+
+/// A QAM double-click — two presses `gap` apart, each released at once, the
+/// way the Deck reports QAM — and what the reader did meanwhile.
+async fn double_click_qam(deck: &mut Deck, gap: std::time::Duration) -> Vec<OutputAction> {
+    let first = tap(deck, EMERGENCY_EXIT_KEY).await;
+    tokio::time::advance(gap).await;
+    [first, tap(deck, EMERGENCY_EXIT_KEY).await].concat()
+}
+
+/// A double-click on QAM ends the session with every binding cleared, and the
+/// configs on disk are back. It toggles nothing: the Gaming Mode trigger on
+/// the same button is off for the session.
 #[tokio::test(start_paused = true)]
-async fn the_emergency_exit_restores_the_disk_config() {
+async fn a_qam_double_click_ends_the_session_and_restores_the_disk_config() {
     let mut deck = Deck::new("override-emergency");
     begin_and_clear(&mut deck).await;
 
-    let [steam, qam] = EMERGENCY_EXIT_COMBO;
-    let held = [deck.press(steam).await, deck.press(qam).await].concat();
-    assert!(keyboard_keys(&held).is_empty());
-    tokio::time::sleep(EMERGENCY_EXIT_HOLD + std::time::Duration::from_millis(50)).await;
-    assert!(!deck.session.is_active(), "holding the combo did not end the session");
-    deck.release(qam).await;
-    deck.release(steam).await;
+    let clicked = double_click_qam(&mut deck, ms(200)).await;
+    assert!(!deck.session.is_active(), "the double-click did not end the session");
+    assert!(!clicked.iter().any(|a| matches!(a, OutputAction::Internal(_))), "it toggled Gaming Mode too");
 
     deck.settle().await;
     assert_eq!(deck.device_log, vec![DeviceRequest::Reload]);
@@ -157,35 +167,71 @@ async fn the_emergency_exit_restores_the_disk_config() {
         vec![(Key::KEY_ENTER, 1), (Key::KEY_ENTER, 0)]);
 }
 
-/// Letting go of either button before the time is up is no exit, and the
-/// next hold starts the count from the beginning.
+/// The window is the Gaming Mode trigger's (400 ms in the test config),
+/// inclusive, measured press to press.
 #[tokio::test(start_paused = true)]
-async fn a_short_hold_is_no_emergency_exit() {
-    let mut deck = Deck::new("override-short");
+async fn the_window_is_the_gaming_mode_triggers() {
+    let mut deck = Deck::new("override-window-edge");
     begin_and_clear(&mut deck).await;
-    let [steam, qam] = EMERGENCY_EXIT_COMBO;
-    let almost = EMERGENCY_EXIT_HOLD - std::time::Duration::from_millis(500);
-
-    deck.press(steam).await;
-    deck.press(qam).await;
-    tokio::time::sleep(almost).await;
-    deck.release(qam).await;
-    deck.press(qam).await;
-    tokio::time::sleep(almost).await;
-    assert!(deck.session.is_active(), "two short holds added up to an exit");
-
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    double_click_qam(&mut deck, ms(400)).await;
     assert!(!deck.session.is_active());
 }
 
-/// Without a session the combo is just two buttons.
+/// One click is QAM, nothing more; two too far apart are two single clicks.
 #[tokio::test(start_paused = true)]
-async fn the_combo_does_nothing_without_a_session() {
-    let mut deck = Deck::new("override-combo-idle");
-    let [steam, qam] = EMERGENCY_EXIT_COMBO;
-    deck.press(steam).await;
-    deck.press(qam).await;
-    tokio::time::sleep(EMERGENCY_EXIT_HOLD * 2).await;
+async fn a_single_or_slow_click_is_no_emergency_exit() {
+    let mut deck = Deck::new("override-slow");
+    begin_and_clear(&mut deck).await;
+    tap(&mut deck, EMERGENCY_EXIT_KEY).await;
+    tokio::time::advance(ms(2000)).await;
+    assert!(deck.session.is_active(), "a single click ended the session");
+
+    tap(&mut deck, EMERGENCY_EXIT_KEY).await;
+    tokio::time::advance(ms(401)).await;
+    tap(&mut deck, EMERGENCY_EXIT_KEY).await;
+    assert!(deck.session.is_active(), "two slow clicks ended the session");
+
+    // The late click was the first of a new double-click.
+    tokio::time::advance(ms(100)).await;
+    tap(&mut deck, EMERGENCY_EXIT_KEY).await;
+    assert!(!deck.session.is_active());
+}
+
+/// While paused — the HUD open over the tour — the exit works all the same.
+#[tokio::test(start_paused = true)]
+async fn the_emergency_exit_works_while_paused() {
+    let mut deck = Deck::new("override-emergency-paused");
+    begin_and_clear(&mut deck).await;
+    deck.pause().await;
+    double_click_qam(&mut deck, ms(150)).await;
+    assert!(!deck.session.is_active());
+}
+
+/// The clicks are counted by the session, not the reader: a `set` between
+/// them — the tour changing stage, which rebuilds the device tasks — does
+/// not lose the first one.
+#[tokio::test(start_paused = true)]
+async fn a_stage_change_between_the_clicks_keeps_the_first() {
+    let mut deck = Deck::new("override-emergency-stage");
+    begin_and_clear(&mut deck).await;
+    tap(&mut deck, EMERGENCY_EXIT_KEY).await;
+    deck.override_cmd(r#"override set trackpad.right.mode "trackball""#).await;
+    assert_eq!(deck.device_log, vec![DeviceRequest::Relaunch]);
+    let mut deck = deck.rebuilt();
+    tokio::time::advance(ms(150)).await;
+    tap(&mut deck, EMERGENCY_EXIT_KEY).await;
+    assert!(!deck.session.is_active());
+}
+
+/// Without a session the double-click is the Gaming Mode trigger, as before,
+/// and ends nothing.
+#[tokio::test(start_paused = true)]
+async fn without_a_session_the_double_click_is_the_gaming_mode_trigger() {
+    let mut deck = Deck::new("override-emergency-idle");
+    let clicked = double_click_qam(&mut deck, ms(200)).await;
+    assert!(clicked.contains(&OutputAction::Internal(
+        crate::output::action::InternalCommand::SetGamingMode { enabled: true, preview: false },
+    )));
     deck.settle().await;
     assert!(deck.device_log.is_empty());
 }
@@ -207,8 +253,8 @@ async fn a_file_change_waits_for_the_end_of_the_session() {
 }
 
 /// Opening a session ends Gaming Mode, and while it is open nothing turns it
-/// back on — neither a request nor the double-click, which is an ordinary
-/// press of QAM for as long as the session lasts.
+/// back on — neither a request nor the double-click, which ends the session
+/// instead of toggling.
 #[tokio::test]
 async fn gaming_mode_is_refused_during_a_session() {
     let mut deck = Deck::new("override-gaming");
@@ -221,8 +267,8 @@ async fn gaming_mode_is_refused_during_a_session() {
 
     let clicks = [tap(&mut deck, Key::BTN_BASE).await, tap(&mut deck, Key::BTN_BASE).await].concat();
     assert!(!clicks.iter().any(|a| matches!(a, OutputAction::Internal(_))), "the double-click toggled");
+    assert!(!deck.session.is_active(), "the double-click is the emergency exit");
 
-    deck.override_cmd("override end").await;
     deck.set_gaming_mode(true).await;
     assert!(*deck.reader.gaming_mode.lock().await, "Gaming Mode stayed blocked after the end");
 }
@@ -366,20 +412,4 @@ async fn a_reader_starting_under_a_session_ends_gaming_mode() {
     deck.run_gaming_requests().await;
     override_loop.abort();
     assert!(!*deck.reader.gaming_mode.lock().await, "the new reader left Gaming Mode on");
-}
-
-/// The Deck reports both buttons of a chord in one hidraw report when they go
-/// down together: two key edges before one SYN_REPORT. That counts as well.
-#[tokio::test(start_paused = true)]
-async fn the_emergency_exit_works_with_both_buttons_in_one_report() {
-    let mut deck = Deck::new("override-emergency-chord");
-    begin_and_clear(&mut deck).await;
-    let [steam, qam] = EMERGENCY_EXIT_COMBO;
-    deck.feed(vec![
-        InputEvent::new(EventType::KEY, steam.code(), 1),
-        InputEvent::new(EventType::KEY, qam.code(), 1),
-        syn(),
-    ]).await;
-    tokio::time::sleep(EMERGENCY_EXIT_HOLD + std::time::Duration::from_millis(50)).await;
-    assert!(!deck.session.is_active());
 }

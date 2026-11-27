@@ -145,12 +145,8 @@ pub struct EventReader {
     state_write_rx: Mutex<Option<mpsc::Receiver<crate::output::action::Urgency>>>,
     /// The override session, shared by every reader and the control socket.
     /// While one is open the reader ends Gaming Mode and refuses it, and
-    /// watches for the emergency exit — see `override_hooks`.
+    /// passes it the presses of the emergency exit — see `override_hooks`.
     override_session: Arc<OverrideSession>,
-    /// Which buttons of the emergency exit are down, and its change feed for
-    /// `emergency_exit_loop`.
-    emergency_combo: std::sync::Mutex<crate::override_session::emergency::ComboTracker>,
-    emergency_held: tokio::sync::watch::Sender<bool>,
 }
 
 /// The effect side of a reader: where its actions go, plus the two handles the
@@ -327,8 +323,6 @@ impl EventReader {
             state_tx,
             state_write_rx: Mutex::new(Some(state_write_rx)),
             override_session,
-            emergency_combo: Default::default(),
-            emergency_held: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -351,7 +345,6 @@ impl EventReader {
             self.state_write_loop(state_rx),
             self.ipc_command_loop(ipc_rx),
             self.override_loop(),
-            self.emergency_exit_loop(),
             async {
                 // The trackpad session is a producer of its own — hidraw
                 // frames, not events — and still performs its own effects. It

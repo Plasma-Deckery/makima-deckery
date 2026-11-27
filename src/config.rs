@@ -565,6 +565,11 @@ pub struct RawDoubleclickTrigger {
     pub ms: Option<u64>,
 }
 
+/// How far apart two presses may be to count as a double-click, when the
+/// `[gaming_mode] trigger` does not say. The override session's emergency
+/// exit uses the same window.
+pub const DEFAULT_DOUBLE_CLICK_MS: u64 = 400;
+
 /// Parsed double-click trigger, ready for use at runtime.
 #[derive(Debug, Clone)]
 pub struct DoubleclickTrigger {
@@ -637,7 +642,7 @@ impl Default for GamingModeConfig {
             },
         ]);
         GamingModeConfig {
-            trigger: Some(DoubleclickTrigger { key: Key::BTN_BASE, ms: 400 }),
+            trigger: Some(DoubleclickTrigger { key: Key::BTN_BASE, ms: DEFAULT_DOUBLE_CLICK_MS }),
             haptic_on:  default_chain.clone(),
             haptic_off: default_chain,
             auto_detect_steam_games: true,
@@ -656,7 +661,7 @@ impl GamingModeConfig {
             None => Self::default().trigger,
             Some(ref t) if t.key == "disabled" => None,
             Some(ref t) => match Key::from_str(resolve_alias(&t.key, aliases)) {
-                Ok(key) => Some(DoubleclickTrigger { key, ms: t.ms.unwrap_or(400) }),
+                Ok(key) => Some(DoubleclickTrigger { key, ms: t.ms.unwrap_or(DEFAULT_DOUBLE_CLICK_MS) }),
                 Err(_) => {
                     eprintln!(
                         "[makima] WARNING: unknown gaming_mode trigger key {:?} — trigger disabled",
