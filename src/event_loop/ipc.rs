@@ -23,7 +23,8 @@ pub(crate) enum IpcCommand {
     /// Ask for Gaming Mode on or off. The bool is exactly what is sent into the
     /// Gaming Mode channel; whoever reads it applies the change.
     GamingMode(bool),
-    /// Switch the 60 Hz analog part of the state export on or off.
+    /// Switch the 60 Hz analog part of the state export on or off. Carried
+    /// out by the control socket itself, like `Override`.
     AnalogStateExport(bool),
     /// Enable or disable a config group by name.
     ConfigGroup { enabling: bool, name: String },
@@ -91,7 +92,8 @@ pub(crate) fn parse(cmd: &str) -> Option<IpcCommand> {
 /// The snapshot written straight after a pause or resume.
 ///
 /// The regular snapshot without its analog half: trackpads, sticks and IMU are
-/// `null` and the analog export reads as off, whatever it really is. A pause is
+/// `null` and the analog export reads as off — the IPC loop lays the real
+/// switch over that before the snapshot goes out. A pause is
 /// a discrete event, and what the overlay needs from it is `paused` and the
 /// held keys — which a pause keeps (issue #62), so the HUD still shows what the
 /// user is holding.
@@ -164,6 +166,11 @@ impl EventReader {
                         &hk, &la, &self.base_name, &self.gaming_mode_config,
                     );
                     self.mark_override(&mut event_state);
+                    // The analog half is left out, but the switch is reported
+                    // as it is: a snapshot saying "off" while it is on read as
+                    // a lost `analog-state-export on` in every diagnosis.
+                    event_state["context"]["analog_state_export"] =
+                        serde_json::Value::Bool(self.analog_state_export.is_on());
                     // pause/resume is a discrete event — must not be dropped.
                     let _ = self.state_tx.send(StateCommand::SetEventState(Some(event_state))).await;
                 }
@@ -174,9 +181,9 @@ impl EventReader {
                     println!("deckery: Gaming Mode trigger — IPC command: {}", cmd.trim());
                     let _ = self.gaming_mode_tx.send(new_state).await;
                 }
-                IpcCommand::AnalogStateExport(on) => {
-                    *self.analog_state_export.lock().await = on;
-                }
+                // Set by the control socket, which does not broadcast it —
+                // see `crate::analog_export`.
+                IpcCommand::AnalogStateExport(_) => {}
                 IpcCommand::ConfigGroup { enabling, name: group } => {
                     if !self.registry.set_group_enabled(&group, enabling) {
                         eprintln!("deckery: IPC config group enable/disable: no group named {:?}", group);

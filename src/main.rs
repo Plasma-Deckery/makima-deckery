@@ -1,5 +1,6 @@
 mod active_client;
 mod analog;
+mod analog_export;
 mod auto_mute;
 mod config;
 mod config_registry;
@@ -122,9 +123,13 @@ async fn main() {
     // it lays its layer into. Held in memory only: a restart starts without one.
     let (override_session, device_requests) =
         override_session::OverrideSession::new(registry.clone());
-    tokio::spawn(control_socket::serve(ipc_tx.clone(), override_session.clone()));
+    // Outlives every device generation, and is switched by the control socket
+    // itself — see `analog_export`.
+    let analog_export = analog_export::AnalogExport::default();
+    tokio::spawn(control_socket::serve(ipc_tx.clone(), override_session.clone(), analog_export.clone()));
 
     start_monitoring_udev(
         registry, tasks, gaming_mode, state_tx, ipc_tx, override_session, device_requests,
+        analog_export,
     ).await;
 }

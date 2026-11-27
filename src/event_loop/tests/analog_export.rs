@@ -31,9 +31,9 @@ async fn move_rpad(deck: &mut Deck, x: i32) -> Vec<OutputAction> {
 
 #[tokio::test]
 async fn the_export_survives_a_rebuild() {
-    let flag = Arc::new(Mutex::new(false));
+    let flag = crate::analog_export::AnalogExport::default();
     let mut before = Deck::in_session("analog-before", flag.clone());
-    before.ipc("analog-state-export on").await;
+    before.control("analog-state-export on").await;
     assert_eq!(analog_rpad_x(&move_rpad(&mut before, 16384).await).len(), 1);
     drop(before);
 
@@ -43,41 +43,69 @@ async fn the_export_survives_a_rebuild() {
     assert_eq!(xs.len(), 1, "the pad's position must keep reaching the state");
     assert!(xs[0] < 0.0, "{xs:?}");
 
-    after.ipc("analog-state-export off").await;
+    after.control("analog-state-export off").await;
     assert!(analog_rpad_x(&move_rpad(&mut after, 0).await).is_empty());
-    assert!(!*flag.lock().await, "off is the session's too");
+    assert!(!flag.is_on(), "off is the session's too");
 }
 
-/// The onboarding tour: the HUD switched the export on before the session,
-/// then every stage `set`s pad keys, each a rebuild, and the end reloads the
-/// files and rebuilds once more. The pads keep reaching the state throughout,
-/// whatever the pad's mode or click switch says.
+/// The analog switch is the control socket's, not a reader's: it is never
+/// broadcast, so it cannot be lost when no reader is listening.
 #[tokio::test]
-async fn the_export_survives_an_override_session() {
-    let flag = Arc::new(Mutex::new(false));
-    let mut deck = Deck::in_session("analog-override", flag);
-    deck.ipc("analog-state-export on").await;
+async fn the_switch_is_not_broadcast_to_the_readers() {
+    let flag = crate::analog_export::AnalogExport::default();
+    let deck = Deck::in_session("analog-socket", flag.clone());
+    let handled = crate::control_socket::handle("analog-state-export on", &deck.session, &flag, "test");
+    assert_eq!(handled, crate::control_socket::Handled::Done);
+    assert!(flag.is_on());
+}
 
-    let mut rebuilds = 0;
-    for line in [
-        "override begin",
-        "override clear",
-        r#"override set trackpad.right.mode "mt-trackpad""#,
-        "override set trackpad.right.click false",
-        "override set trackpad.gestures.click false",
-        r#"override set trackpad.right.mode "trackball""#,
-        "override end",
-    ] {
+/// The tour as it ran on the Deck: one combined `set trackpad {…}` per stage,
+/// the gesture device switched off and on, a step back and forward again,
+/// bursts of sets that each rebuild, and the HUD's `on` arriving while a
+/// rebuild is under way — the old readers gone, the new one not started.
+/// After every step the switch is on and the pad's position reaches the state.
+#[tokio::test]
+async fn the_export_survives_the_tour_with_on_sent_mid_rebuild() {
+    let flag = crate::analog_export::AnalogExport::default();
+    let mut deck = Deck::in_session("analog-tour", flag.clone());
+
+    let stage = |mode: &str, gestures: bool, click: bool| format!(
+        r#"override set trackpad {{ "combined_gesture_device": {gestures}, "right": {{ "mode": "{mode}", "click": {click} }}, "gestures": {{ "click": {click} }} }}"#);
+    let stage2 = stage("trackball", false, true);
+    let stage3 = stage("mt-trackpad", true, false);
+    let stage4 = stage("mt-trackpad", true, true);
+    let mut lines: Vec<String> = vec!["override begin".into(), "override clear".into()];
+    lines.extend([stage2.clone(), stage3.clone(), stage2.clone(), stage3.clone()]);  // 2 → 3 → back → 3
+    for _ in 0..4 {
+        lines.extend([stage4.clone(), stage3.clone()]);                              // a burst
+    }
+    lines.push("override end".into());
+
+    let mut on_sent = false;
+    for line in &lines {
         let (reply, _) = deck.override_cmd(line).await;
         assert!(reply.starts_with("ok"), "{line}: {reply}");
         if !deck.device_log.is_empty() {
             deck.device_log.clear();
+            if !on_sent {
+                // In the middle of the rebuild no reader is listening: a
+                // line broadcast now would reach nobody. It has to be
+                // carried out by the socket itself.
+                let handled = crate::control_socket::handle(
+                    "analog-state-export on", &deck.session, &flag, "test");
+                assert_ne!(handled, crate::control_socket::Handled::Broadcast);
+                on_sent = true;
+            }
             deck = deck.rebuilt();
-            rebuilds += 1;
         }
-        let xs = analog_rpad_x(&move_rpad(&mut deck, 8192).await);
-        let xs2 = analog_rpad_x(&move_rpad(&mut deck, -8192).await);
-        assert_eq!((xs.len(), xs2.len()), (1, 1), "after {line}: the pad's position stopped reaching the state");
+        if on_sent {
+            assert!(flag.is_on(), "after {line}: the switch went off");
+            let actions = move_rpad(&mut deck, 8192).await;
+            assert_eq!(analog_rpad_x(&actions).len(), 1, "after {line}: the pad's position stopped reaching the state");
+            assert_eq!(last_published(&actions).unwrap()["context"]["analog_state_export"],
+                serde_json::json!(true), "after {line}");
+        }
     }
-    assert!(rebuilds >= 5, "every pad set and the end rebuild: {rebuilds}");
+    assert!(on_sent);
+    assert!(flag.is_on());
 }

@@ -51,7 +51,7 @@ pub struct DeviceSession {
     /// rather than in each reader because the HUD sends it only when it
     /// changes its mind: a flag that every rebuild — a config reload, a
     /// device change — reset to off stopped the export behind its back.
-    pub analog_state_export: Arc<Mutex<bool>>,
+    pub analog_state_export: crate::analog_export::AnalogExport,
     /// The one override session, handed to every reader.
     pub override_session:    Arc<crate::override_session::OverrideSession>,
 }

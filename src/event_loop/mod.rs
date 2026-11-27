@@ -89,12 +89,10 @@ pub struct EventReader {
     state_cache: Arc<Mutex<Option<state::StateCache>>>,
     /// Raw IMU values (ABS_HAT2X, ABS_HAT2Y) — gyroscope/accelerometer, range 0..32767.
     imu_raw: Arc<Mutex<(i32, i32)>>,
-    /// When false, write_state_analog() is a no-op — no 60 Hz analog writes to state.json.
-    /// The UI sends "analog on"/"analog off" via the IPC socket to control this.
-    /// Owned by the device session, not by the reader: the HUD sends the
-    /// command only when it changes its mind, so a reader that started at
-    /// false after a rebuild stopped the export until the HUD toggled again.
-    analog_state_export: Arc<Mutex<bool>>,
+    /// When off, write_state_analog() is a no-op — no 60 Hz analog writes to
+    /// state.json. One switch per process, set by the control socket — see
+    /// `crate::analog_export`.
+    analog_state_export: crate::analog_export::AnalogExport,
     cursor_movement: Arc<Mutex<(i32, i32)>>,
     scroll_movement: Arc<Mutex<(i32, i32)>>,
     modifiers: Arc<Mutex<Vec<Event>>>,
@@ -177,7 +175,7 @@ impl EventReader {
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
         state_tx: StateWriterHandle,
-        analog_state_export: Arc<Mutex<bool>>,
+        analog_state_export: crate::analog_export::AnalogExport,
         override_session: Arc<OverrideSession>,
     ) -> Self {
         // The production ports. `last_action` and the publish channel are made
@@ -229,7 +227,7 @@ impl EventReader {
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
         state_tx: StateWriterHandle,
-        analog_state_export: Arc<Mutex<bool>>,
+        analog_state_export: crate::analog_export::AnalogExport,
         ports: Ports,
         override_session: Arc<OverrideSession>,
     ) -> Self {

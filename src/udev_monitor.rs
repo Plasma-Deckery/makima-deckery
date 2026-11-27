@@ -18,6 +18,7 @@ pub async fn start_monitoring_udev(
     ipc_tx: broadcast::Sender<String>,
     override_session: Arc<OverrideSession>,
     mut device_requests: tokio::sync::mpsc::UnboundedReceiver<DeviceRequest>,
+    analog_export: crate::analog_export::AnalogExport,
 ) {
     let environment = crate::session::set_environment();
     // Modules gated by `[module] requires_compositor` can only be judged once
@@ -108,7 +109,7 @@ pub async fn start_monitoring_udev(
         ipc_tx,
         virt_dev:            virt_dev.clone(),
         game_focus,
-        analog_state_export: Arc::new(Mutex::new(false)),
+        analog_state_export: analog_export,
         override_session:    override_session.clone(),
     };
 

@@ -124,7 +124,7 @@ impl EventReader {
         event_rx: mpsc::Receiver<ControllerEvent>,
         environment: Environment,
         tap: Tap,
-        analog_state_export: Arc<Mutex<bool>>,
+        analog_state_export: crate::analog_export::AnalogExport,
         gaming_mode_tx: mpsc::Sender<bool>,
         override_session: Arc<OverrideSession>,
     ) -> Self {
@@ -173,7 +173,7 @@ pub(super) struct Deck {
     /// Gaming Mode requests the reader sent, waiting for `settle`.
     gaming_requests: mpsc::Receiver<bool>,
     /// The device session's analog export flag, which a rebuild hands on.
-    analog_state_export: Arc<Mutex<bool>>,
+    analog_state_export: crate::analog_export::AnalogExport,
 }
 
 impl Drop for Deck {
@@ -188,22 +188,22 @@ impl Drop for Deck {
 impl Deck {
     /// A reader for `BASE` in a session with no display server.
     pub fn new(name: &str) -> Self {
-        Self::with(name, Server::Unsupported, Arc::new(Mutex::new(false)))
+        Self::with(name, Server::Unsupported, Default::default())
     }
 
     /// A reader as a rebuild starts it: with the analog export flag of the
     /// device session it belongs to, which outlives every reader.
-    pub fn in_session(name: &str, analog_state_export: Arc<Mutex<bool>>) -> Self {
+    pub fn in_session(name: &str, analog_state_export: crate::analog_export::AnalogExport) -> Self {
         Self::with(name, Server::Unsupported, analog_state_export)
     }
 
     /// A reader on KDE, where the focused window is whatever `active_client`
     /// says — which is how a test switches apps without a compositor.
     pub fn on_kde(name: &str) -> Self {
-        Self::with(name, Server::Connected("KDE".to_string()), Arc::new(Mutex::new(false)))
+        Self::with(name, Server::Connected("KDE".to_string()), Default::default())
     }
 
-    fn with(name: &str, server: Server, analog_state_export: Arc<Mutex<bool>>) -> Self {
+    fn with(name: &str, server: Server, analog_state_export: crate::analog_export::AnalogExport) -> Self {
         // Unique per test and per run: the tests run in parallel, and a
         // directory left behind by a crashed run must not leak into this one.
         let dir = std::env::temp_dir()
@@ -218,7 +218,7 @@ impl Deck {
 
     /// A reader for the configs already in `dir`, as a freshly started makima
     /// would load them.
-    fn from_dir(dir: PathBuf, server: Server, analog_state_export: Arc<Mutex<bool>>) -> Self {
+    fn from_dir(dir: PathBuf, server: Server, analog_state_export: crate::analog_export::AnalogExport) -> Self {
         let registry = ConfigRegistry::load(ConfigRoots { system: dir.join("system"), user: dir.join("user") });
         let (session, device_requests) = OverrideSession::new(registry.clone());
         let (gaming_mode_tx, gaming_requests) = mpsc::channel(8);
@@ -287,7 +287,7 @@ impl Deck {
         let server = self.server.clone();
         drop(self);
         // A new process: nothing of the old device session survives.
-        Self::from_dir(dir, server, Arc::new(Mutex::new(false)))
+        Self::from_dir(dir, server, Default::default())
     }
 
     /// Replace the base config on disk. Nothing reads it until a reload.
@@ -365,6 +365,16 @@ impl Deck {
 
     pub async fn release(&mut self, key: Key) -> Vec<OutputAction> {
         self.feed(report(key, 0)).await
+    }
+
+    /// One line through the control socket's own `handle`, as a client
+    /// sends it: carried out there if it belongs there, else broadcast to
+    /// this reader's production IPC loop.
+    pub async fn control(&mut self, line: &str) -> Vec<OutputAction> {
+        match crate::control_socket::handle(line, &self.session, &self.analog_state_export, "test") {
+            crate::control_socket::Handled::Broadcast => self.ipc(line).await,
+            _ => self.take(),
+        }
     }
 
     /// One line on the control socket, through the production IPC loop.
