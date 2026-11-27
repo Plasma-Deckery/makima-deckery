@@ -136,7 +136,7 @@ async fn the_tour_switches_the_click_off_and_on_again() {
     assert_eq!(deck.device_log, vec![DeviceRequest::Relaunch; 6]);
 
     let (reply, _) = deck.override_cmd("override set trackpad.right.click 0").await;
-    assert_eq!(reply, "error trackpad.right.click: must be true or false");
+    assert_eq!(reply, "error trackpad.right.click: 0 is not true or false");
     let (reply, _) = deck.override_cmd(r#"override set trackpad.gestures.click "no""#).await;
     assert!(reply.starts_with("error trackpad.gestures: click"), "{reply}");
 }

@@ -921,7 +921,7 @@ impl ConfigRegistry {
 
         // Aliases are declared on the base config's [device] block but apply to
         // every file, so they must be known before the first file is parsed:
-        // parse_event_name resolves names the moment a binding is read.
+        // parse_binding_input resolves names the moment a binding is read.
         let aliases = collect_aliases(roots);
 
         for (scan_dir, from_user) in dirs_to_scan {

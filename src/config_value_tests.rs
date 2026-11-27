@@ -116,7 +116,7 @@ fn the_trackpad_table_round_trips() {
         "o".into(), &HashMap::new(),
     ).unwrap();
     let raw: RawTrackpadConfig = config.trackpad.to_raw_value().try_into().unwrap();
-    let back = TrackpadConfig::from_raw(raw);
+    let back = TrackpadConfig::from_raw(raw, &mut Vec::new());
     assert_eq!(back.right.mode, "mt-trackpad");
     assert_eq!(back.right.click_pressure, Some(30000));
     assert_eq!(back.right.kde_config, config.trackpad.right.kde_config);

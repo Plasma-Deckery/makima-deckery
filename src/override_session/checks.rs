@@ -51,11 +51,6 @@ fn pad_side(side: &str, written: &toml::Value, under: &TrackpadSideConfig, eff: 
     let Some(written) = written.as_table() else {
         return Err(Refusal::at(format!("trackpad.{side}"), "must be a table"));
     };
-    // Core reads `click` itself and keeps the click on for anything that is
-    // not a bool; refused here rather than left on.
-    if written.get("click").is_some_and(|v| !v.is_bool()) {
-        return Err(Refusal::at(format!("trackpad.{side}.click"), "must be true or false"));
-    }
     if written.contains_key("mode") && !crate::device_session::is_known_trackpad_mode(&eff.mode) {
         return Err(Refusal::at(
             format!("trackpad.{side}.mode"), format!("{:?} is not a trackpad mode", eff.mode)));

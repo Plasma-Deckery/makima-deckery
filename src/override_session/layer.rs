@@ -137,7 +137,8 @@ impl Layer {
                 path::deep_merge(&mut raw, over);
                 let raw: RawTrackpadConfig = raw.try_into()
                     .map_err(|e: toml::de::Error| format!("[trackpad]: {e}"))?;
-                TrackpadConfig::from_raw(raw)
+                // Its problems are the document's, and `parse` refused those.
+                TrackpadConfig::from_raw(raw, &mut Vec::new())
             }
             None => base.trackpad.clone(),
         };

@@ -101,11 +101,13 @@ impl Default for TrackpadConfig {
 }
 
 impl TrackpadConfig {
-    /// Build the trackpad config from its `[trackpad]` table.
-    pub fn from_raw(raw: RawTrackpadConfig) -> Self {
+    /// Build the trackpad config from its `[trackpad]` table. A value Core
+    /// cannot use is reported in `problems`, not logged — see
+    /// `parse_raw_config`.
+    pub fn from_raw(raw: RawTrackpadConfig, problems: &mut Vec<String>) -> Self {
         TrackpadConfig {
-            left: parse_trackpad_side(raw.left.as_ref()),
-            right: parse_trackpad_side(raw.right.as_ref()),
+            left: parse_trackpad_side("left", raw.left.as_ref(), problems),
+            right: parse_trackpad_side("right", raw.right.as_ref(), problems),
             combined_gesture_device: raw.combined_gesture_device.unwrap_or(false),
             gesture_kde_config: raw.gestures.as_ref()
                 .and_then(|v| v.get("kde"))
@@ -147,19 +149,19 @@ pub struct RawTrackpadConfig {
 }
 
 /// A pad table's `click` switch: absent is on, `true`/`false` as written,
-/// anything else warned about and left on.
-pub(crate) fn parse_click(value: Option<&toml::Value>, section: &str) -> bool {
+/// anything else reported and left on.
+fn parse_click(side: &str, value: Option<&toml::Value>, problems: &mut Vec<String>) -> bool {
     match value {
         None => true,
         Some(toml::Value::Boolean(on)) => *on,
         Some(other) => {
-            eprintln!("[makima] Warning: {section}: click = {other} is not true or false; the click stays on");
+            problems.push(format!("trackpad.{side}.click: {other} is not true or false"));
             true
         }
     }
 }
 
-fn parse_trackpad_side(raw: Option<&toml::Value>) -> TrackpadSideConfig {
+fn parse_trackpad_side(side: &str, raw: Option<&toml::Value>, problems: &mut Vec<String>) -> TrackpadSideConfig {
     if let Some(toml::Value::Table(t)) = raw {
         let mode = t.get("mode")
             .and_then(|v| v.as_str())
@@ -176,7 +178,7 @@ fn parse_trackpad_side(raw: Option<&toml::Value>) -> TrackpadSideConfig {
             click_pressure,
             handler_config: toml::Value::Table(t.clone()),
             kde_config,
-            click: parse_click(t.get("click"), "trackpad pad"),
+            click: parse_click(side, t.get("click"), problems),
         }
     } else {
         TrackpadSideConfig::default()
@@ -775,9 +777,14 @@ impl Config {
             .map_err(|e| format!("Cannot read {:?}: {}", file, e))?;
         let raw: RawConfig = toml::from_str(&content)
             .map_err(|e| format!("TOML error in {:?}: {}", file_name, e))?;
-        // A file keeps what it can: every skipped binding has been logged by
-        // the parser already, and the rest of the file still applies.
-        Ok(Self::from_raw(raw, file_name, aliases, &mut Vec::new()))
+        // A file keeps what it can: every problem is logged here, and the
+        // rest of the file still applies.
+        let mut problems = Vec::new();
+        let config = Self::from_raw(raw, file_name, aliases, &mut problems);
+        for problem in &problems {
+            eprintln!("[makima] WARNING: config {:?}: {problem} — ignored", config.name);
+        }
+        Ok(config)
     }
 
     /// Parse a config held as a TOML value rather than a file, through the
@@ -811,7 +818,8 @@ impl Config {
         let mut cleared = self.clone();
         cleared.bindings = Bindings::default();
         cleared.override_bindings = None;
-        let mut custom = settings_modifiers(&self.settings, &self.aliases);
+        // Already reported when this config was parsed.
+        let mut custom = settings_modifiers(&self.settings, &self.aliases, &mut Vec::new());
         custom.sort();
         custom.dedup();
         cleared.mapped_modifiers.custom = custom;
@@ -859,7 +867,7 @@ impl Config {
         let raw_device      = raw_config.device.clone();
         let raw_module      = raw_config.module.clone();
         let (bindings, settings, mapped_modifiers) = parse_raw_config(raw_config, aliases, problems);
-        let trackpad = TrackpadConfig::from_raw(raw_trackpad);
+        let trackpad = TrackpadConfig::from_raw(raw_trackpad, problems);
         let gaming_mode_config = GamingModeConfig::from_raw(raw_gaming_mode, aliases);
         let device = raw_device.map(|d| DeviceDeclaration {
             class: if d.class == "hid-steam" { DeviceClass::HidSteam } else { DeviceClass::Evdev },
@@ -1210,16 +1218,6 @@ impl Config {
     }
 }
 
-/// Parse a single event name like "BTN_MODE" or "LSTICK_UP" into an Event.
-/// Returns None and logs a warning if the name is not recognized.
-pub fn parse_event_name(name: &str) -> Option<Event> {
-    let event = event_from_name(name);
-    if event.is_none() {
-        eprintln!("[makima] WARNING: unknown binding name {:?} — skipping (typo in config?)", name);
-    }
-    event
-}
-
 /// Resolve a name to its event without logging. The alias table is checked with
 /// this so a broken entry can be reported once by its alias name, instead of
 /// once per use site under the substituted value.
@@ -1248,7 +1246,7 @@ fn parse_binding_input(
         let str_modifiers: Vec<&str> = mods_str.split('-').collect();
         let mut modifiers: Vec<Event> = Vec::new();
         for m in str_modifiers.iter().filter(|&&m| !m.is_empty()) {
-            match parse_event_name(resolve_alias(m, aliases)) {
+            match event_from_name(resolve_alias(m, aliases)) {
                 Some(event) => modifiers.push(event),
                 // Dropping just the modifier would leave the binding firing
                 // unmodified, so `L1-A` would quietly hijack a bare A press.
@@ -1266,16 +1264,17 @@ fn parse_binding_input(
         if str_modifiers.first().map(|s| s.is_empty()).unwrap_or(false) {
             modifiers.push(Event::Hold);
         }
-        (parse_event_name(resolve_alias(event_str, aliases)), modifiers)
+        (event_from_name(resolve_alias(event_str, aliases)), modifiers)
     } else {
-        (parse_event_name(resolve_alias(input, aliases)), Vec::new())
+        (event_from_name(resolve_alias(input, aliases)), Vec::new())
     }
 }
 
 /// `problems` gets one line for every binding that had to be skipped, led by
 /// where it is written in the dotted form an override path uses
-/// (`remap.L1-X: …`). The parser still logs each one where it finds it, as it
-/// always has.
+/// (`remap.L1-X: …`). Nothing here logs: a file's caller logs the problems
+/// (`try_from_file`), and an override that is refused over them must not
+/// leave warnings in the journal that read as if it had been applied.
 fn parse_raw_config(
     raw_config: RawConfig,
     aliases: &HashMap<String, String>,
@@ -1300,7 +1299,7 @@ fn parse_raw_config(
         custom: Vec::new(),
         all: Vec::new(),
     };
-    mapped_modifiers.custom.extend(settings_modifiers(&settings, aliases));
+    mapped_modifiers.custom.extend(settings_modifiers(&settings, aliases, problems));
 
     for (input, value) in remap {
         let (output, np, wg, lbl, sl, hp, nt) = match value {
@@ -1343,7 +1342,6 @@ fn parse_raw_config(
         // `expect`, which took the whole process down over one typo — and the
         // override session parses text that arrives over a socket.
         let Ok(rel) = Relative::from_str(output.as_str()) else {
-            eprintln!("[makima] WARNING: unknown movement {output:?} for {input:?} — skipping");
             problems.push(format!("movements.{input}: {output:?} is not a movement"));
             continue;
         };
@@ -1374,11 +1372,24 @@ fn parse_raw_config(
 
 /// The custom modifiers the settings declare on their own, with no binding:
 /// `CUSTOM_MODIFIERS` and the two stick activation lists.
-fn settings_modifiers(settings: &HashMap<String, String>, aliases: &HashMap<String, String>) -> Vec<Event> {
-    ["CUSTOM_MODIFIERS", "LSTICK_ACTIVATION_MODIFIERS", "RSTICK_ACTIVATION_MODIFIERS"]
-        .iter()
-        .flat_map(|parameter| parse_modifiers(settings, parameter, aliases))
-        .collect()
+///
+/// A name that is no button is left out and reported in `problems`.
+fn settings_modifiers(
+    settings: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
+    problems: &mut Vec<String>,
+) -> Vec<Event> {
+    let mut modifiers = Vec::new();
+    for parameter in ["CUSTOM_MODIFIERS", "LSTICK_ACTIVATION_MODIFIERS", "RSTICK_ACTIVATION_MODIFIERS"] {
+        let Some(list) = settings.get(parameter) else { continue };
+        for name in list.split('-').filter(|m| !m.is_empty()) {
+            match event_from_name(resolve_alias(name, aliases)) {
+                Some(event) => modifiers.push(event),
+                None => problems.push(format!("settings.{parameter}: {name:?} is not a button")),
+            }
+        }
+    }
+    modifiers
 }
 
 pub fn parse_modifiers(
@@ -1392,7 +1403,9 @@ pub fn parse_modifiers(
         Some(modifiers) => modifiers
             .split('-')
             .filter(|m| !m.is_empty())
-            .filter_map(|m| parse_event_name(resolve_alias(m, aliases)))
+            // Quiet: an unknown name was reported when the file was parsed
+            // (`settings_modifiers`), and this runs again on every reinit.
+            .filter_map(|m| event_from_name(resolve_alias(m, aliases)))
             .collect(),
         None => Vec::new(),
     }

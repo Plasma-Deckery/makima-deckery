@@ -90,13 +90,13 @@ fn merge_base_remap_to_command_override() {
     );
 }
 
-/// parse_event_name returns Some for valid names and None for unknown ones.
+/// event_from_name returns Some for valid names and None for unknown ones.
 #[test]
-fn parse_event_name_known_and_unknown() {
-    assert!(parse_event_name("BTN_TL").is_some(), "BTN_TL must be recognised");
-    assert!(parse_event_name("BTN_GRIPR2").is_some(), "BTN_GRIPR2 (Steam Deck back paddle) must be recognised");
-    assert!(parse_event_name("BTN_TOTALLY_FAKE").is_none(), "unknown name must return None");
-    assert!(parse_event_name("").is_none(), "empty string must return None");
+fn event_from_name_known_and_unknown() {
+    assert!(event_from_name("BTN_TL").is_some(), "BTN_TL must be recognised");
+    assert!(event_from_name("BTN_GRIPR2").is_some(), "BTN_GRIPR2 (Steam Deck back paddle) must be recognised");
+    assert!(event_from_name("BTN_TOTALLY_FAKE").is_none(), "unknown name must return None");
+    assert!(event_from_name("").is_none(), "empty string must return None");
 }
 
 /// Unrelated combos from the base must still be inherited normally.
@@ -442,10 +442,10 @@ fn combo_with_unresolvable_trigger_is_dropped() {
     assert!(bindings.remap.is_empty());
 }
 
-/// `event_from_name` answers the same question as `parse_event_name` without
-/// logging — the alias table is validated with it before any binding is read.
+/// `event_from_name` resolves without logging — the alias table is validated
+/// with it before any binding is read.
 #[test]
-fn event_from_name_is_silent_and_agrees_with_parse_event_name() {
+fn event_from_name_is_silent() {
     assert_eq!(event_from_name("BTN_TL"), Some(key(Key::BTN_TL)));
     assert!(event_from_name("BTN_TYPO").is_none());
     assert!(event_from_name("").is_none());
