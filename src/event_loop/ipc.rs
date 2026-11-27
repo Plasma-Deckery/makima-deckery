@@ -5,15 +5,18 @@
 //! path — which is also why `paused` has no representation in `machine`: it
 //! cannot be produced by an event, only by one of these.
 //!
-//! What a line *means* is decided by `parse`, which is pure; what is done about
-//! it is the loop below. The split is there so the grammar can be pinned by
+//! What a line *means* is decided by `parse`, which is pure; the control socket
+//! carries it out (`crate::control_socket`), and what the reader does about a
+//! pause is below: it follows the process's pause switch, so a rebuild can
+//! neither miss a pause nor undo one. The split is there so the grammar can be pinned by
 //! tests: `pause` is how the controller is handed to the auth daemon for PIN
 //! entry, and a command that silently stops matching leaves keys held during
 //! unlock with nothing to say why.
 
 use super::*;
 
-/// One command the control socket understands.
+/// One command the control socket understands. All of them are carried out
+/// by the socket itself — see `crate::control_socket`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IpcCommand {
     /// Suppress remaps and let go of every held output key.
@@ -121,97 +124,84 @@ pub(super) fn pause_resume_snapshot(
 
 
 impl EventReader {
-    pub(super) async fn ipc_command_loop(&self, mut rx: broadcast::Receiver<String>) {
+    /// Follow the process's pause switch.
+    ///
+    /// The control socket sets it; this reader does what a pause or a resume
+    /// does to its input path when the switch changes. A reader built while
+    /// paused started paused (see `assemble`), so a rebuild never resumes.
+    pub(super) async fn pause_loop(&self) {
+        // Built at the switch's value already; this only catches a change
+        // that landed between the build and this loop's first poll.
+        self.sync_pause().await;
         loop {
-            let cmd = match rx.recv().await {
-                Ok(cmd) => cmd,
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            };
-            let Some(command) = parse(&cmd) else { continue };
-            match command {
-                IpcCommand::Pause | IpcCommand::Resume => {
-                    let pausing = command == IpcCommand::Pause;
-                    *self.paused.lock().await = pausing;
-                    // On pause: release all held output keys immediately so
-                    // nothing stays stuck while an external process (e.g.
-                    // deckery-auth-daemon) takes over the controller. What
-                    // the user still holds is kept (issue #62). Resume sends
-                    // nothing: no output goes back down, the held state just
-                    // carries on, and a custom modifier still held is marked
-                    // used so its release does not tap.
-                    if pausing {
-                        self.pause_release_outputs().await;
-                    } else {
-                        self.resume_mark_held_modifiers().await;
-                    }
-                    // Write state for pause/resume immediately.
-                    let is_paused = *self.paused.lock().await;
-                    let is_gaming = *self.gaming_mode.lock().await;
-                    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
-                    let config = match tokio::time::timeout(TIMEOUT, self.current_config.lock()).await {
-                        Ok(g) => g.clone(), Err(_) => continue,
-                    };
-                    let mods = match tokio::time::timeout(TIMEOUT, self.modifiers.lock()).await {
-                        Ok(g) => g.clone(), Err(_) => continue,
-                    };
-                    let la = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
-                        Ok(g) => g.clone(), Err(_) => continue,
-                    };
-                    let hk = match tokio::time::timeout(TIMEOUT, self.held_keys.lock()).await {
-                        Ok(g) => g.clone(), Err(_) => continue,
-                    };
-                    let mut event_state = pause_resume_snapshot(
-                        &config, &mods, is_paused, is_gaming,
-                        &hk, &la, &self.base_name, &self.gaming_mode_config,
-                    );
-                    self.mark_override(&mut event_state);
-                    // The analog half is left out, but the switch is reported
-                    // as it is: a snapshot saying "off" while it is on read as
-                    // a lost `analog-state-export on` in every diagnosis.
-                    event_state["context"]["analog_state_export"] =
-                        serde_json::Value::Bool(self.analog_state_export.is_on());
-                    // pause/resume is a discrete event — must not be dropped.
-                    let _ = self.state_tx.send(StateCommand::SetEventState(Some(event_state))).await;
-                }
-                IpcCommand::GamingMode(new_state) => {
-                    // Route through the unified Gaming Mode channel.
-                    // gaming_mode_set_loop applies the change,
-                    // fires haptics, and writes state.
-                    println!("deckery: Gaming Mode trigger — IPC command: {}", cmd.trim());
-                    let _ = self.gaming_mode_tx.send(new_state).await;
-                }
-                // Set by the control socket, which does not broadcast it —
-                // see `crate::analog_export`.
-                IpcCommand::AnalogStateExport(_) => {}
-                IpcCommand::ConfigGroup { enabling, name: group } => {
-                    if !self.registry.set_group_enabled(&group, enabling) {
-                        eprintln!("deckery: IPC config group enable/disable: no group named {:?}", group);
-                        continue;
-                    }
-                    eprintln!("deckery: IPC config group {}: {:?}",
-                        if enabling { "enable" } else { "disable" }, group);
-                    let _ = self.state_tx.send(
-                        StateCommand::SetLoadedConfigs(self.registry.snapshot())
-                    ).await;
-                }
-                // The control socket answers these before anything is
-                // broadcast; one arriving here was sent by nobody.
-                IpcCommand::Override(_) => {}
-                IpcCommand::Config { enabling, name } => {
-                    // set_enabled and snapshot are synchronous (std::sync::Mutex) — no .await.
-                    if !self.registry.set_enabled(&name, enabling) {
-                        eprintln!("deckery: IPC config enable/disable: no config named {:?}", name);
-                        continue;
-                    }
-                    eprintln!("deckery: IPC config {}: {:?}",
-                        if enabling { "enable" } else { "disable" }, name);
-                    let _ = self.state_tx.send(
-                        StateCommand::SetLoadedConfigs(self.registry.snapshot())
-                    ).await;
-                }
-            }
+            let changed = self.pause_rx.lock().await.changed().await;
+            if changed.is_err() { return; }
+            self.sync_pause().await;
         }
+    }
+
+    /// Bring this reader to the pause switch's value, if it is not there.
+    pub(super) async fn sync_pause(&self) {
+        let want = *self.pause_rx.lock().await.borrow_and_update();
+        if want != *self.paused.lock().await {
+            self.apply_pause(want).await;
+        }
+    }
+
+    /// Apply the control socket's Gaming Mode requests for as long as this
+    /// reader runs. Only the reader that also takes the Gaming Mode channel
+    /// runs this; a request sent while no reader runs waits in the queue.
+    pub(super) async fn gaming_requests_loop(&self) {
+        let queue = self.switches.gaming.queue();
+        let mut queue = queue.lock().await;
+        while let Some(on) = queue.recv().await {
+            self.apply_gaming_request(on).await;
+        }
+    }
+
+    /// What a pause or a resume does to the input path, and the snapshot it
+    /// writes at once.
+    pub(super) async fn apply_pause(&self, pausing: bool) {
+        *self.paused.lock().await = pausing;
+        // On pause: release all held output keys immediately so nothing stays
+        // stuck while an external process (e.g. deckery-auth-daemon) takes
+        // over the controller. What the user still holds is kept (issue #62).
+        // Resume sends nothing: no output goes back down, the held state just
+        // carries on, and a custom modifier still held is marked used so its
+        // release does not tap.
+        if pausing {
+            self.pause_release_outputs().await;
+        } else {
+            self.resume_mark_held_modifiers().await;
+        }
+        // Write state for pause/resume immediately.
+        let is_paused = *self.paused.lock().await;
+        let is_gaming = *self.gaming_mode.lock().await;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+        let config = match tokio::time::timeout(TIMEOUT, self.current_config.lock()).await {
+            Ok(g) => g.clone(), Err(_) => return,
+        };
+        let mods = match tokio::time::timeout(TIMEOUT, self.modifiers.lock()).await {
+            Ok(g) => g.clone(), Err(_) => return,
+        };
+        let la = match tokio::time::timeout(TIMEOUT, self.last_action.lock()).await {
+            Ok(g) => g.clone(), Err(_) => return,
+        };
+        let hk = match tokio::time::timeout(TIMEOUT, self.held_keys.lock()).await {
+            Ok(g) => g.clone(), Err(_) => return,
+        };
+        let mut event_state = pause_resume_snapshot(
+            &config, &mods, is_paused, is_gaming,
+            &hk, &la, &self.base_name, &self.gaming_mode_config,
+        );
+        self.mark_override(&mut event_state);
+        // The analog half is left out, but the switch is reported as it is: a
+        // snapshot saying "off" while it is on read as a lost
+        // `analog-state-export on` in every diagnosis.
+        event_state["context"]["analog_state_export"] =
+            serde_json::Value::Bool(self.switches.analog.is_on());
+        // pause/resume is a discrete event — must not be dropped.
+        let _ = self.state_tx.send(StateCommand::SetEventState(Some(event_state))).await;
     }
 }
 

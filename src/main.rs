@@ -20,6 +20,7 @@ mod ledger;
 mod machine;
 mod mt_trackpad;
 mod output;
+mod process_switches;
 mod pad_keys;
 mod override_session;
 mod preferences;
@@ -40,7 +41,6 @@ use crate::udev_monitor::start_monitoring_udev;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio;
-use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 /// Process start time, set once at the top of `main()`. Used to log
@@ -117,19 +117,21 @@ async fn main() {
     let tasks: Vec<JoinHandle<()>> = Vec::new();
     let gaming_mode: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
 
-    // IPC socket — bound once here, broadcast to all active EventReaders.
-    let (ipc_tx, _) = broadcast::channel::<String>(16);
     // The override session outlives every device generation, like the registry
     // it lays its layer into. Held in memory only: a restart starts without one.
     let (override_session, device_requests) =
         override_session::OverrideSession::new(registry.clone());
-    // Outlives every device generation, and is switched by the control socket
-    // itself — see `analog_export`.
-    let analog_export = analog_export::AnalogExport::default();
-    tokio::spawn(control_socket::serve(ipc_tx.clone(), override_session.clone(), analog_export.clone()));
+    // What the control socket switches outlives every device generation —
+    // see `process_switches`. The socket is bound once, here.
+    let switches = process_switches::Switches::default();
+    tokio::spawn(control_socket::serve(control_socket::Control {
+        session: override_session.clone(),
+        switches: switches.clone(),
+        registry: registry.clone(),
+        state_tx: state_tx.clone(),
+    }));
 
     start_monitoring_udev(
-        registry, tasks, gaming_mode, state_tx, ipc_tx, override_session, device_requests,
-        analog_export,
+        registry, tasks, gaming_mode, state_tx, override_session, device_requests, switches,
     ).await;
 }

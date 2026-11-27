@@ -6,7 +6,7 @@ use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle};
 use crate::virtual_devices::VirtualDevices;
 use crate::override_session::{DeviceRequest, OverrideSession};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -15,10 +15,9 @@ pub async fn start_monitoring_udev(
     mut tasks: Vec<JoinHandle<()>>,
     gaming_mode: Arc<Mutex<bool>>,
     state_tx: StateWriterHandle,
-    ipc_tx: broadcast::Sender<String>,
     override_session: Arc<OverrideSession>,
     mut device_requests: tokio::sync::mpsc::UnboundedReceiver<DeviceRequest>,
-    analog_export: crate::analog_export::AnalogExport,
+    switches: crate::process_switches::Switches,
 ) {
     let environment = crate::session::set_environment();
     // Modules gated by `[module] requires_compositor` can only be judged once
@@ -106,10 +105,9 @@ pub async fn start_monitoring_udev(
         window_changed,
         gaming_mode,
         state_tx:            state_tx.clone(),
-        ipc_tx,
         virt_dev:            virt_dev.clone(),
         game_focus,
-        analog_state_export: analog_export,
+        switches,
         override_session:    override_session.clone(),
     };
 

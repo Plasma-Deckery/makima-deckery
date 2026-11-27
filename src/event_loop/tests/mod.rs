@@ -32,6 +32,7 @@ mod override_session;
 mod pad_click;
 mod pause;
 mod read_path;
+mod rebuild_gap;
 mod remaps;
 
 use super::*;
@@ -124,7 +125,8 @@ impl EventReader {
         event_rx: mpsc::Receiver<ControllerEvent>,
         environment: Environment,
         tap: Tap,
-        analog_state_export: crate::analog_export::AnalogExport,
+        switches: crate::process_switches::Switches,
+        state_tx: StateWriterHandle,
         gaming_mode_tx: mpsc::Sender<bool>,
         override_session: Arc<OverrideSession>,
     ) -> Self {
@@ -142,14 +144,13 @@ impl EventReader {
             last_action,
             state_write_rx,
         };
-        let (state_tx, _) = mpsc::channel(1);
         Self::assemble(
             base_config, registry, base_name, event_rx, false, 0, None,
             Arc::new(Mutex::new(Vec::new())),
             // What `device_tasks` starts it at.
             Arc::new(Mutex::new(true)),
             environment, Arc::new(Mutex::new(Client::Default)), Arc::new(Notify::new()),
-            Arc::new(Mutex::new(false)), gaming_mode_tx, state_tx, analog_state_export, ports, override_session,
+            Arc::new(Mutex::new(false)), gaming_mode_tx, state_tx, switches, ports, override_session,
         )
     }
 }
@@ -173,7 +174,11 @@ pub(super) struct Deck {
     /// Gaming Mode requests the reader sent, waiting for `settle`.
     gaming_requests: mpsc::Receiver<bool>,
     /// The device session's analog export flag, which a rebuild hands on.
-    analog_state_export: crate::analog_export::AnalogExport,
+    /// The process's switches, shared by the reader and the control socket.
+    pub switches: crate::process_switches::Switches,
+    /// What the reader sends the state writer — the pause snapshot goes here.
+    pub state_rx: mpsc::Receiver<StateCommand>,
+    state_tx: StateWriterHandle,
 }
 
 impl Drop for Deck {
@@ -193,8 +198,8 @@ impl Deck {
 
     /// A reader as a rebuild starts it: with the analog export flag of the
     /// device session it belongs to, which outlives every reader.
-    pub fn in_session(name: &str, analog_state_export: crate::analog_export::AnalogExport) -> Self {
-        Self::with(name, Server::Unsupported, analog_state_export)
+    pub fn in_session(name: &str, switches: crate::process_switches::Switches) -> Self {
+        Self::with(name, Server::Unsupported, switches)
     }
 
     /// A reader on KDE, where the focused window is whatever `active_client`
@@ -203,7 +208,7 @@ impl Deck {
         Self::with(name, Server::Connected("KDE".to_string()), Default::default())
     }
 
-    fn with(name: &str, server: Server, analog_state_export: crate::analog_export::AnalogExport) -> Self {
+    fn with(name: &str, server: Server, switches: crate::process_switches::Switches) -> Self {
         // Unique per test and per run: the tests run in parallel, and a
         // directory left behind by a crashed run must not leak into this one.
         let dir = std::env::temp_dir()
@@ -213,14 +218,15 @@ impl Deck {
         std::fs::create_dir_all(system.join("apps")).unwrap();
         std::fs::write(system.join("Steam Deck.toml"), BASE).unwrap();
         std::fs::write(system.join("apps").join("firefox.toml"), FIREFOX).unwrap();
-        Self::from_dir(dir, server, analog_state_export)
+        Self::from_dir(dir, server, switches)
     }
 
     /// A reader for the configs already in `dir`, as a freshly started makima
     /// would load them.
-    fn from_dir(dir: PathBuf, server: Server, analog_state_export: crate::analog_export::AnalogExport) -> Self {
+    fn from_dir(dir: PathBuf, server: Server, switches: crate::process_switches::Switches) -> Self {
         let registry = ConfigRegistry::load(ConfigRoots { system: dir.join("system"), user: dir.join("user") });
         let (session, device_requests) = OverrideSession::new(registry.clone());
+        let (state_tx, state_rx) = mpsc::channel(4096);
         let (gaming_mode_tx, gaming_requests) = mpsc::channel(8);
         // What `device_tasks` hands to `new`.
         let base_config = registry.base_configs().into_iter().next()
@@ -235,8 +241,8 @@ impl Deck {
             server: server.clone(),
         };
         let reader = Arc::new(EventReader::for_test(
-            base_config, registry, event_rx, environment, Tap::new(tap_tx), analog_state_export.clone(),
-            gaming_mode_tx, session.clone(),
+            base_config, registry, event_rx, environment, Tap::new(tap_tx), switches.clone(),
+            state_tx.clone(), gaming_mode_tx, session.clone(),
         ));
         // The production loop, running for the whole test: what it keeps
         // between events — which stick direction is held, which trigger is
@@ -247,7 +253,7 @@ impl Deck {
         });
         Self {
             reader, events, tap, read_loop, dir, server, session,
-            device_requests, device_log: Vec::new(), gaming_requests, analog_state_export,
+            device_requests, device_log: Vec::new(), gaming_requests, switches, state_rx, state_tx,
         }
     }
 
@@ -267,7 +273,7 @@ impl Deck {
         };
         let reader = Arc::new(EventReader::for_test(
             base_config, registry, event_rx, environment, Tap::new(tap_tx),
-            self.analog_state_export.clone(), gaming_mode_tx, session,
+            self.switches.clone(), self.state_tx.clone(), gaming_mode_tx, session,
         ));
         self.read_loop.abort();
         self.read_loop = tokio::spawn({
@@ -295,11 +301,11 @@ impl Deck {
         std::fs::write(self.dir.join("system").join("Steam Deck.toml"), text).unwrap();
     }
 
-    /// One override line through the control socket's own `answer`, then
+    /// One override line through the control socket's own `handle`, then
     /// everything the session asked for carried out. Returns the reply and
     /// what the reader did meanwhile.
     pub async fn override_cmd(&mut self, line: &str) -> (String, Vec<OutputAction>) {
-        let reply = crate::control_socket::answer(line, &self.session)
+        let reply = self.control_socket().handle(line, "test").await
             .expect("an override line is answered by the control socket");
         self.settle().await;
         (reply, self.take())
@@ -367,36 +373,52 @@ impl Deck {
         self.feed(report(key, 0)).await
     }
 
-    /// One line through the control socket's own `handle`, as a client
-    /// sends it: carried out there if it belongs there, else broadcast to
-    /// this reader's production IPC loop.
-    pub async fn control(&mut self, line: &str) -> Vec<OutputAction> {
-        match crate::control_socket::handle(line, &self.session, &self.analog_state_export, "test") {
-            crate::control_socket::Handled::Broadcast => self.ipc(line).await,
-            _ => self.take(),
+    /// The control socket as production builds it, over this deck's
+    /// session, switches and registry.
+    pub fn control_socket(&self) -> crate::control_socket::Control {
+        crate::control_socket::Control {
+            session: self.session.clone(),
+            switches: self.switches.clone(),
+            registry: self.reader.registry.clone(),
+            state_tx: self.state_tx.clone(),
         }
     }
 
-    /// One line on the control socket, through the production IPC loop.
-    ///
-    /// The loop runs until its channel closes, and the sender is dropped once
-    /// the line is in, so this returns when the command has been handled in
-    /// full. The read loop is idle meanwhile — every `feed` ends on a fence —
-    /// so the two never interleave in a way a test did not ask for.
-    pub async fn ipc(&mut self, line: &str) -> Vec<OutputAction> {
-        let (tx, rx) = broadcast::channel(4);
-        tx.send(line.to_string()).unwrap();
-        drop(tx);
-        self.reader.ipc_command_loop(rx).await;
+    /// One line through the control socket's own `handle`, as a client sends
+    /// it, then what the reader's loops do about it: follow the pause switch,
+    /// and apply the queued Gaming Mode requests. Those loops run beside the
+    /// read loop in production; here they are stepped once, so the test sees
+    /// the command handled in full. Returns the reply, if any, and what the
+    /// reader did.
+    pub async fn control(&mut self, line: &str) -> Vec<OutputAction> {
+        let _ = self.control_socket().handle(line, "test").await;
+        self.follow_switches().await;
         self.take()
     }
 
+    /// The reader catching up with the switches: what its pause loop and its
+    /// Gaming Mode request loop do in production.
+    pub async fn follow_switches(&mut self) {
+        self.reader.sync_pause().await;
+        let queue = self.switches.gaming.queue();
+        loop {
+            let next = queue.lock().await.try_recv();
+            let Ok(on) = next else { break };
+            self.reader.apply_gaming_request(on).await;
+        }
+    }
+
+    /// One line on the control socket — the name the older tests use.
+    pub async fn ipc(&mut self, line: &str) -> Vec<OutputAction> {
+        self.control(line).await
+    }
+
     pub async fn pause(&mut self) -> Vec<OutputAction> {
-        self.ipc("pause").await
+        self.control("pause").await
     }
 
     pub async fn resume(&mut self) -> Vec<OutputAction> {
-        self.ipc("resume").await
+        self.control("resume").await
     }
 
     /// Gaming Mode switched by whatever asks for it — Steam detection, the IPC

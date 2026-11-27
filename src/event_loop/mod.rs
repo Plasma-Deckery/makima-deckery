@@ -44,7 +44,7 @@ use std::{
     sync::Arc,
 };
 use crate::settings::Settings;
-use tokio::sync::{broadcast, mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use crate::override_session::OverrideSession;
 
 pub(crate) use ipc::{parse as parse_ipc_line, IpcCommand};
@@ -89,10 +89,14 @@ pub struct EventReader {
     state_cache: Arc<Mutex<Option<state::StateCache>>>,
     /// Raw IMU values (ABS_HAT2X, ABS_HAT2Y) — gyroscope/accelerometer, range 0..32767.
     imu_raw: Arc<Mutex<(i32, i32)>>,
-    /// When off, write_state_analog() is a no-op — no 60 Hz analog writes to
-    /// state.json. One switch per process, set by the control socket — see
-    /// `crate::analog_export`.
-    analog_state_export: crate::analog_export::AnalogExport,
+    /// The process's switches, set by the control socket: the analog export
+    /// (when off, write_state_analog() is a no-op), the pause, the Gaming
+    /// Mode requests — see `crate::process_switches`.
+    switches: crate::process_switches::Switches,
+    /// This reader's view of the pause, taken when it is built: what
+    /// `paused` above follows. Taken at construction rather than when its
+    /// loop starts, so a change in between is not missed.
+    pause_rx: Mutex<tokio::sync::watch::Receiver<bool>>,
     cursor_movement: Arc<Mutex<(i32, i32)>>,
     scroll_movement: Arc<Mutex<(i32, i32)>>,
     modifiers: Arc<Mutex<Vec<Event>>>,
@@ -175,7 +179,7 @@ impl EventReader {
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
         state_tx: StateWriterHandle,
-        analog_state_export: crate::analog_export::AnalogExport,
+        switches: crate::process_switches::Switches,
         override_session: Arc<OverrideSession>,
     ) -> Self {
         // The production ports. `last_action` and the publish channel are made
@@ -201,7 +205,7 @@ impl EventReader {
         Self::assemble(
             base_config, registry, base_name, event_rx, is_tablet, max_abs_wheel,
             lizard_mode, modifiers, modifier_was_activated, environment, active_client,
-            window_changed, gaming_mode, gaming_mode_tx, state_tx, analog_state_export, ports, override_session,
+            window_changed, gaming_mode, gaming_mode_tx, state_tx, switches, ports, override_session,
         )
     }
 
@@ -227,7 +231,7 @@ impl EventReader {
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
         state_tx: StateWriterHandle,
-        analog_state_export: crate::analog_export::AnalogExport,
+        switches: crate::process_switches::Switches,
         ports: Ports,
         override_session: Arc<OverrideSession>,
     ) -> Self {
@@ -246,7 +250,10 @@ impl EventReader {
         let cursor_movement = Arc::new(Mutex::new((0, 0)));
         let scroll_movement = Arc::new(Mutex::new((0, 0)));
         let device_is_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
-        let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        // A reader started while paused — a rebuild with the HUD open —
+        // starts paused. It holds nothing yet, so there is nothing to release.
+        let mut pause_rx = switches.pause.subscribe();
+        let paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(*pause_rx.borrow_and_update()));
         let held_keys: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let emitted_outputs: Arc<Mutex<crate::ledger::Ledger>> = Arc::new(Mutex::new(HashMap::new()));
         let current_config: Arc<Mutex<Arc<Config>>> =
@@ -292,7 +299,7 @@ impl EventReader {
             lstick_raw,
             rstick_raw,
             imu_raw,
-            analog_state_export,
+            switches,
             analog_snapshot,
             state_cache,
             cursor_movement,
@@ -321,10 +328,11 @@ impl EventReader {
             state_tx,
             state_write_rx: Mutex::new(Some(state_write_rx)),
             override_session,
+            pause_rx: Mutex::new(pause_rx),
         }
     }
 
-    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>, ipc_rx: broadcast::Receiver<String>, session: Option<TrackpadSession>) {
+    pub async fn start(&self, gaming_rx: mpsc::Receiver<bool>, takes_gaming_requests: bool, session: Option<TrackpadSession>) {
         let name = self.base_name.clone();
         let name = &name;
         println!("{:?} detected, reading events. +{}ms since startup\n", name, crate::startup_ms());
@@ -341,7 +349,12 @@ impl EventReader {
             self.window_changed_loop(),
             self.gaming_mode_set_loop(gaming_rx),
             self.state_write_loop(state_rx),
-            self.ipc_command_loop(ipc_rx),
+            self.pause_loop(),
+            async {
+                if takes_gaming_requests {
+                    self.gaming_requests_loop().await;
+                }
+            },
             self.override_loop(),
             async {
                 // The trackpad session is a producer of its own — hidraw
@@ -430,14 +443,20 @@ impl EventReader {
     /// Returns when all senders are dropped (device disconnected / non-KDE).
     async fn gaming_mode_set_loop(&self, mut rx: mpsc::Receiver<bool>) {
         while let Some(new_state) = rx.recv().await {
-            if new_state && self.override_session.is_active() {
-                println!("deckery: Gaming Mode refused — an override session is open");
-                continue;
-            }
-            if new_state != *self.gaming_mode.lock().await {
-                println!("deckery: Gaming Mode trigger — channel, new_state={}", new_state);
-                self.set_gaming_mode(new_state, false).await;
-            }
+            self.apply_gaming_request(new_state).await;
+        }
+    }
+
+    /// One Gaming Mode request, from the channel or the control socket:
+    /// refused during an override session, applied if it changes anything.
+    pub(super) async fn apply_gaming_request(&self, new_state: bool) {
+        if new_state && self.override_session.is_active() {
+            println!("deckery: Gaming Mode refused — an override session is open");
+            return;
+        }
+        if new_state != *self.gaming_mode.lock().await {
+            println!("deckery: Gaming Mode trigger — channel, new_state={}", new_state);
+            self.set_gaming_mode(new_state, false).await;
         }
     }
 

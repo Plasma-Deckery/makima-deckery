@@ -72,7 +72,7 @@ impl EventReader {
     }
 
     pub(super) async fn write_state_analog(&self) {
-        if !self.analog_state_export.is_on() {
+        if !self.switches.analog.is_on() {
             return;
         }
         self.write_state_inner(true).await;
@@ -139,7 +139,7 @@ impl EventReader {
         let lstick_raw = *self.lstick_raw.lock().await;
         let rstick_raw = *self.rstick_raw.lock().await;
         let imu_raw = *self.imu_raw.lock().await;
-        let analog_state_export = self.analog_state_export.is_on();
+        let analog_state_export = self.switches.analog.is_on();
         let lstick_dz = crate::analog::normalize_dz(self.settings.lstick.deadzone);
         let rstick_dz = crate::analog::normalize_dz(self.settings.rstick.deadzone);
         let lstick_x = crate::analog::normalize(lstick_raw.0);

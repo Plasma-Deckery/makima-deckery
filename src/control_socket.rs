@@ -1,31 +1,38 @@
-//! The control socket: one line in per connection, broadcast to the readers —
-//! or, for an override command, answered with one line back.
+//! The control socket: one line in per connection, carried out right here.
 //!
-//! Moved out of `main` when the override session needed replies. Every other
-//! command is fire-and-forget, as it always was: the auth daemon, the tray and
-//! the Gaming Mode toggle write a line and close.
+//! Moved out of `main` when the override session needed replies. Every command
+//! but those is fire-and-forget, as it always was: the auth daemon, the tray,
+//! the HUD and the Gaming Mode toggle write a line and close. An override
+//! command is answered with one line on the same connection before it closes.
 //!
-//! Two kinds of command are carried out right here instead of being
-//! broadcast, because they belong to the process rather than to a reader:
-//!
-//! * an override command, against the one shared session, with its reply
-//!   written back on the same connection before it is closed;
-//! * `analog-state-export on|off`, on the one shared switch (see
-//!   `crate::analog_export`). A broadcast during a rebuild of the device
-//!   tasks reaches no reader at all, and was lost.
+//! Nothing is broadcast to the readers any more. Every command acts on
+//! something that belongs to the process — the override session, the registry,
+//! the switches in `crate::process_switches` — so a rebuild of the device tasks,
+//! which has no readers for a moment, cannot swallow it. A reader learns of a
+//! change through those switches, including one made while it did not exist.
 
+use crate::config_registry::ConfigRegistry;
 use crate::event_loop::{parse_ipc_line, IpcCommand};
-use crate::analog_export::AnalogExport;
 use crate::override_session::OverrideSession;
+use crate::process_switches::Switches;
+use crate::state_writer::{StateCommand, StateWriterHandle};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::broadcast;
 
 /// How long a client gets to send its line, and to take the reply.
 const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Everything a command acts on.
+#[derive(Clone)]
+pub struct Control {
+    pub session: Arc<OverrideSession>,
+    pub switches: Switches,
+    pub registry: Arc<ConfigRegistry>,
+    pub state_tx: StateWriterHandle,
+}
+
 /// Bind the socket and serve it for the life of the process.
-pub async fn serve(ipc_tx: broadcast::Sender<String>, session: Arc<OverrideSession>, analog: AnalogExport) {
+pub async fn serve(control: Control) {
     // Bind in $XDG_RUNTIME_DIR (= /run/user/<uid>), not /tmp.
     //
     // /tmp is mode 1777, so any local process can create the socket
@@ -58,51 +65,48 @@ pub async fn serve(ipc_tx: broadcast::Sender<String>, session: Arc<OverrideSessi
         if read.is_err() || read.unwrap().is_err() { continue; }
         let cmd = line.trim().to_string();
         if cmd.is_empty() { continue; }
-        match handle(&cmd, &session, &analog, &sender) {
-            Handled::Reply(reply) => {
-                let mut stream = reader.into_inner();
-                let _ = tokio::time::timeout(
-                    CLIENT_TIMEOUT, stream.write_all(format!("{reply}\n").as_bytes()),
-                ).await;
+        if let Some(reply) = control.handle(&cmd, &sender).await {
+            let mut stream = reader.into_inner();
+            let _ = tokio::time::timeout(
+                CLIENT_TIMEOUT, stream.write_all(format!("{reply}\n").as_bytes()),
+            ).await;
+        }
+    }
+}
+
+impl Control {
+    /// Carry out one line, and say what to answer if it is answered.
+    /// Parsed by `event_loop::parse`, which keeps the grammar in one place.
+    /// `sender` names who sent it, for the journal. An unknown line is
+    /// ignored without a word, as it always was.
+    pub async fn handle(&self, line: &str, sender: &str) -> Option<String> {
+        let source = format!("control socket, {sender}");
+        match parse_ipc_line(line)? {
+            IpcCommand::Override(command) => return Some(self.session.handle(&command).to_string()),
+            IpcCommand::AnalogStateExport(on) => self.switches.analog.set(on, &source),
+            IpcCommand::Pause => self.switches.pause.set(true, &source),
+            IpcCommand::Resume => self.switches.pause.set(false, &source),
+            IpcCommand::GamingMode(on) => self.switches.gaming.request(on, &source),
+            IpcCommand::Config { enabling, name } => {
+                if !self.registry.set_enabled(&name, enabling) {
+                    eprintln!("deckery: IPC config enable/disable: no config named {name:?} ({source})");
+                    return None;
+                }
+                eprintln!("deckery: IPC config {}: {name:?} ({source})",
+                    if enabling { "enable" } else { "disable" });
+                let _ = self.state_tx.send(StateCommand::SetLoadedConfigs(self.registry.snapshot())).await;
             }
-            Handled::Done => {}
-            Handled::Broadcast => { let _ = ipc_tx.send(cmd); }
+            IpcCommand::ConfigGroup { enabling, name } => {
+                if !self.registry.set_group_enabled(&name, enabling) {
+                    eprintln!("deckery: IPC config group enable/disable: no group named {name:?} ({source})");
+                    return None;
+                }
+                eprintln!("deckery: IPC config group {}: {name:?} ({source})",
+                    if enabling { "enable" } else { "disable" });
+                let _ = self.state_tx.send(StateCommand::SetLoadedConfigs(self.registry.snapshot())).await;
+            }
         }
-    }
-}
-
-/// What became of one line.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Handled {
-    /// Carried out here; this is the one line to send back.
-    Reply(String),
-    /// Carried out here; nothing is sent back.
-    Done,
-    /// For the readers.
-    Broadcast,
-}
-
-/// Carry out `line` if it belongs here, or say it goes to the readers.
-/// Parsed by the same `parse` the readers use, so the grammar is one.
-/// `sender` names who sent it, for the journal.
-pub fn handle(line: &str, session: &OverrideSession, analog: &AnalogExport, sender: &str) -> Handled {
-    match parse_ipc_line(line) {
-        Some(IpcCommand::Override(command)) => Handled::Reply(session.handle(&command).to_string()),
-        Some(IpcCommand::AnalogStateExport(on)) => {
-            analog.set(on, &format!("control socket, {sender}"));
-            Handled::Done
-        }
-        _ => Handled::Broadcast,
-    }
-}
-
-/// The reply to an override line, `None` for any other line. What the
-/// harness drives the override session through.
-#[cfg(test)]
-pub fn answer(line: &str, session: &OverrideSession) -> Option<String> {
-    match handle(line, session, &AnalogExport::default(), "test") {
-        Handled::Reply(reply) => Some(reply),
-        _ => None,
+        None
     }
 }
 

@@ -20,10 +20,9 @@ fn empty_session(state_tx: StateWriterHandle) -> DeviceSession {
         window_changed:      Arc::new(Notify::new()),
         gaming_mode:         Arc::new(Mutex::new(false)),
         state_tx,
-        ipc_tx:              tokio::sync::broadcast::channel(1).0,
         game_focus:          tokio::sync::watch::channel(Default::default()).1,
         virt_dev:            Arc::new(Mutex::new(VirtualDevices::new())),
-        analog_state_export: Default::default(),
+        switches:            Default::default(),
     }
 }
 

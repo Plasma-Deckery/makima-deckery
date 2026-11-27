@@ -31,14 +31,15 @@ async fn move_rpad(deck: &mut Deck, x: i32) -> Vec<OutputAction> {
 
 #[tokio::test]
 async fn the_export_survives_a_rebuild() {
-    let flag = crate::analog_export::AnalogExport::default();
-    let mut before = Deck::in_session("analog-before", flag.clone());
+    let switches = crate::process_switches::Switches::default();
+    let flag = switches.analog.clone();
+    let mut before = Deck::in_session("analog-before", switches.clone());
     before.control("analog-state-export on").await;
     assert_eq!(analog_rpad_x(&move_rpad(&mut before, 16384).await).len(), 1);
     drop(before);
 
     // The rebuild: a new reader, the same session, no new command.
-    let mut after = Deck::in_session("analog-after", flag.clone());
+    let mut after = Deck::in_session("analog-after", switches.clone());
     let xs = analog_rpad_x(&move_rpad(&mut after, -16384).await);
     assert_eq!(xs.len(), 1, "the pad's position must keep reaching the state");
     assert!(xs[0] < 0.0, "{xs:?}");
@@ -48,14 +49,15 @@ async fn the_export_survives_a_rebuild() {
     assert!(!flag.is_on(), "off is the session's too");
 }
 
-/// The analog switch is the control socket's, not a reader's: it is never
-/// broadcast, so it cannot be lost when no reader is listening.
+/// The analog switch is the control socket's, not a reader's: it takes
+/// effect with no reader listening.
 #[tokio::test]
-async fn the_switch_is_not_broadcast_to_the_readers() {
-    let flag = crate::analog_export::AnalogExport::default();
-    let deck = Deck::in_session("analog-socket", flag.clone());
-    let handled = crate::control_socket::handle("analog-state-export on", &deck.session, &flag, "test");
-    assert_eq!(handled, crate::control_socket::Handled::Done);
+async fn the_switch_needs_no_reader() {
+    let switches = crate::process_switches::Switches::default();
+    let flag = switches.analog.clone();
+    let deck = Deck::in_session("analog-socket", switches.clone());
+    // Straight to the socket: no reader loop is stepped.
+    assert_eq!(deck.control_socket().handle("analog-state-export on", "test").await, None);
     assert!(flag.is_on());
 }
 
@@ -66,8 +68,9 @@ async fn the_switch_is_not_broadcast_to_the_readers() {
 /// After every step the switch is on and the pad's position reaches the state.
 #[tokio::test]
 async fn the_export_survives_the_tour_with_on_sent_mid_rebuild() {
-    let flag = crate::analog_export::AnalogExport::default();
-    let mut deck = Deck::in_session("analog-tour", flag.clone());
+    let switches = crate::process_switches::Switches::default();
+    let flag = switches.analog.clone();
+    let mut deck = Deck::in_session("analog-tour", switches.clone());
 
     let stage = |mode: &str, gestures: bool, click: bool| format!(
         r#"override set trackpad {{ "combined_gesture_device": {gestures}, "right": {{ "mode": "{mode}", "click": {click} }}, "gestures": {{ "click": {click} }} }}"#);
@@ -91,9 +94,7 @@ async fn the_export_survives_the_tour_with_on_sent_mid_rebuild() {
                 // In the middle of the rebuild no reader is listening: a
                 // line broadcast now would reach nobody. It has to be
                 // carried out by the socket itself.
-                let handled = crate::control_socket::handle(
-                    "analog-state-export on", &deck.session, &flag, "test");
-                assert_ne!(handled, crate::control_socket::Handled::Broadcast);
+                deck.control_socket().handle("analog-state-export on", "test").await;
                 on_sent = true;
             }
             deck = deck.rebuilt();
@@ -116,12 +117,13 @@ async fn the_export_survives_the_tour_with_on_sent_mid_rebuild() {
 /// reader is involved, so their order is the order they take effect in.
 #[tokio::test]
 async fn off_then_on_ends_on_whatever_the_rebuild_timing() {
-    let flag = crate::analog_export::AnalogExport::default();
-    let mut deck = Deck::in_session("analog-off-on", flag.clone());
-    let send = |deck: &Deck, line: &str| {
-        crate::control_socket::handle(line, &deck.session, &flag, "test")
-    };
-    send(&deck, "analog-state-export on");
+    let switches = crate::process_switches::Switches::default();
+    let flag = switches.analog.clone();
+    let mut deck = Deck::in_session("analog-off-on", switches.clone());
+    async fn send(deck: &Deck, line: &str) {
+        deck.control_socket().handle(line, "test").await;
+    }
+    send(&deck, "analog-state-export on").await;
     deck.override_cmd("override begin").await;
 
     for (i, set) in [r#""trackball""#, r#""mt-trackpad""#, r#""trackball""#].iter().enumerate() {
@@ -129,11 +131,11 @@ async fn off_then_on_ends_on_whatever_the_rebuild_timing() {
         deck.device_log.clear();
         match i {
             // Both before the rebuild.
-            0 => { send(&deck, "analog-state-export off"); send(&deck, "analog-state-export on"); deck = deck.rebuilt(); }
+            0 => { send(&deck, "analog-state-export off").await; send(&deck, "analog-state-export on").await; deck = deck.rebuilt(); }
             // Split by it.
-            1 => { send(&deck, "analog-state-export off"); deck = deck.rebuilt(); send(&deck, "analog-state-export on"); }
+            1 => { send(&deck, "analog-state-export off").await; deck = deck.rebuilt(); send(&deck, "analog-state-export on").await; }
             // Both after it.
-            _ => { deck = deck.rebuilt(); send(&deck, "analog-state-export off"); send(&deck, "analog-state-export on"); }
+            _ => { deck = deck.rebuilt(); send(&deck, "analog-state-export off").await; send(&deck, "analog-state-export on").await; }
         }
         assert!(flag.is_on(), "round {i}: off then on did not end on");
         assert_eq!(analog_rpad_x(&move_rpad(&mut deck, 4096).await).len(), 1, "round {i}");

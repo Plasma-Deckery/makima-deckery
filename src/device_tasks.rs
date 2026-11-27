@@ -19,7 +19,7 @@ use crate::state_writer::{StateWriterHandle, StateCommand, AppLifecycle};
 use crate::virtual_devices::VirtualDevices;
 use deckery_controller::{SteamDeckController, LizardModeSuppression, ControllerEvent};
 use std::{path::{Path, PathBuf}, process::Command, sync::Arc};
-use tokio::sync::{broadcast, mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -37,7 +37,6 @@ pub struct DeviceSession {
     pub window_changed:      Arc<Notify>,
     pub gaming_mode:         Arc<Mutex<bool>>,
     pub state_tx:            StateWriterHandle,
-    pub ipc_tx:              broadcast::Sender<String>,
     /// Persistent output device layer, pre-created by `start_monitoring_udev`.
     /// All `EventReader` instances share this single set of virtual devices;
     /// the same `Arc` is reused across reinits so uinput nodes never disappear.
@@ -46,12 +45,10 @@ pub struct DeviceSession {
     /// one task started alongside this session, so Gaming Mode detection and
     /// muting read the same answer.
     pub game_focus:          tokio::sync::watch::Receiver<crate::game_focus::GameFocus>,
-    /// Whether the readers write the analog part of the state (sticks, pads,
-    /// IMU) on every movement, as `analog-state-export on|off` last said. Here
-    /// rather than in each reader because the HUD sends it only when it
-    /// changes its mind: a flag that every rebuild — a config reload, a
-    /// device change — reset to off stopped the export behind its back.
-    pub analog_state_export: crate::analog_export::AnalogExport,
+    /// What the control socket switches — the analog export, the pause,
+    /// Gaming Mode requests. Made once per process and handed to every reader,
+    /// so no rebuild resets or loses one; see `crate::process_switches`.
+    pub switches: crate::process_switches::Switches,
     /// The one override session, handed to every reader.
     pub override_session:    Arc<crate::override_session::OverrideSession>,
 }
@@ -270,8 +267,8 @@ pub async fn launch_tasks(
 ) -> Arc<Mutex<Vec<Event>>> {
     let DeviceSession {
         registry, environment, device_error_notify, active_client,
-        window_changed, gaming_mode, state_tx, ipc_tx, virt_dev, game_focus,
-        analog_state_export,
+        window_changed, gaming_mode, state_tx, virt_dev, game_focus,
+        switches,
         override_session,
     } = session;
     // Unified Gaming Mode channel: steam detection and IPC both send here.
@@ -424,6 +421,9 @@ pub async fn launch_tasks(
             None
         };
 
+        // The reader that takes the Gaming Mode channel also applies the
+        // control socket's requests: one consumer, as before.
+        let takes_gaming_requests = gaming_mode_rx_opt.is_some();
         let gaming_rx = gaming_mode_rx_opt.take().unwrap_or_else(|| {
             let (_, dead_rx) = mpsc::channel(1);
             dead_rx
@@ -446,10 +446,10 @@ pub async fn launch_tasks(
             gaming_mode.clone(),
             gaming_mode_tx.clone(),
             state_tx.clone(),
-            analog_state_export.clone(),
+            switches.clone(),
             override_session.clone(),
         );
-        tasks.push(tokio::spawn(start_reader(reader, gaming_rx, ipc_tx.subscribe(), session)));
+        tasks.push(tokio::spawn(start_reader(reader, gaming_rx, takes_gaming_requests, session)));
         devices_found += 1;
     }
 
@@ -461,8 +461,8 @@ pub async fn launch_tasks(
     modifiers
 }
 
-pub async fn start_reader(reader: EventReader, gaming_rx: mpsc::Receiver<bool>, ipc_rx: broadcast::Receiver<String>, session: Option<TrackpadSession>) {
-    reader.start(gaming_rx, ipc_rx, session).await;
+pub async fn start_reader(reader: EventReader, gaming_rx: mpsc::Receiver<bool>, takes_gaming_requests: bool, session: Option<TrackpadSession>) {
+    reader.start(gaming_rx, takes_gaming_requests, session).await;
 }
 
 #[cfg(test)]
