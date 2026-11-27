@@ -259,11 +259,13 @@ pub async fn run_single(
     press_chain:     Option<HapticChain>,
     release_chain:   Option<HapticChain>,
     movement_pulse:  Option<MovementHaptic>,
+    click_enabled:   bool,
 ) {
     let mut progress    = HapticProgress::default();
     let mut first_frame = true;
 
     while let Some(frame) = rx.recv().await {
+        let frame = frame.with_click(click_enabled);
         outputs.dispatch(&crate::trackpad::plan_pad_frame(
             pad.device(), frame.x, frame.y, frame.touching, Some(frame.click),
         )).await;

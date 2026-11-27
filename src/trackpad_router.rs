@@ -86,6 +86,14 @@ impl SinglePadFrame {
     pub fn interrupt() -> Self {
         Self { interrupted: true, ..Self::default() }
     }
+
+    /// This frame as a handler sees it with the pad's `click` switch:
+    /// unchanged when the click is on, never clicked when it is off. Taken
+    /// out at the handler's door, so neither `BTN_LEFT` nor a click haptic —
+    /// both are driven by this one bit — can see a press.
+    pub fn with_click(self, click_enabled: bool) -> Self {
+        Self { click: self.click && click_enabled, ..self }
+    }
 }
 
 /// Both pads' data as delivered to the combined-gesture handler while a

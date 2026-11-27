@@ -29,6 +29,7 @@ mod gaming_mode;
 mod ledger;
 mod modifiers;
 mod override_session;
+mod pad_click;
 mod pause;
 mod read_path;
 mod remaps;

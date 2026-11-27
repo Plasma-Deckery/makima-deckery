@@ -21,6 +21,7 @@ fn config(
             on_gesture_move:  mov,
             on_gesture_end:   end.map(HapticChain::single),
         },
+        click: true,
     }
 }
 
@@ -163,4 +164,15 @@ fn a_list_plays_as_a_list() {
     let (cfg, _) = parse("[haptic]\non_gesture_start = [{ duration_us = 1, pause_ms = 5 }, { duration_us = 2 }]");
     let (_, actions) = plan_haptics(GestureProgress::default(), GestureEvent::Start(both_at(0, 0, 0, 0)), &cfg);
     assert!(matches!(&actions[..], [OutputAction::Haptic { pad: HapticPad::Both, chain: HapticChain::Chain(s) }] if s.len() == 2));
+}
+
+#[test]
+fn the_click_switch_parses_and_defaults_to_on() {
+    let parse = |src: &str| GesturePadConfig::parse(&toml::from_str::<toml::Value>(src).unwrap());
+    assert!(parse("").0.click);
+    let (c, w) = parse("click = false");
+    assert!(!c.click && w.is_empty());
+    let (c, w) = parse("click = 1");
+    assert!(c.click);
+    assert_eq!(w.len(), 1);
 }

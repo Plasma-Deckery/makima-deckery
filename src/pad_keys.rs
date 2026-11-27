@@ -13,7 +13,7 @@
 //! reads from every pad table.
 
 /// Keys Core reads from every pad table, or that hold sub-tables.
-const CORE_KEYS: &[&str] = &["mode", "click_pressure", "kde", "haptic"];
+const CORE_KEYS: &[&str] = &["mode", "click_pressure", "click", "kde", "haptic"];
 
 /// Whether some pad mode reads `key` at the top of a pad table.
 pub fn is_pad_key(key: &str) -> bool {

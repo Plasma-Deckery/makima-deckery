@@ -618,6 +618,7 @@ pub async fn run_single(
     outputs: &Outputs,
     haptic_pad: HapticPad,
     config: TrackballConfig,
+    click_enabled: bool,
 ) {
     let mut state = TrackballState::default();
     let mut last = tokio::time::Instant::now();
@@ -633,7 +634,7 @@ pub async fn run_single(
             tokio::select! {
                 biased;
                 frame = rx.recv() => match frame {
-                    Some(f) => Input::Frame(f),
+                    Some(f) => Input::Frame(f.with_click(click_enabled)),
                     None => break,
                 },
                 _ = t.tick() => Input::Tick,
@@ -641,7 +642,7 @@ pub async fn run_single(
         } else {
             ticker = None;
             match rx.recv().await {
-                Some(f) => Input::Frame(f),
+                Some(f) => Input::Frame(f.with_click(click_enabled)),
                 None => break,
             }
         };

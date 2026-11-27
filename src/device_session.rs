@@ -71,6 +71,10 @@ pub struct TrackpadSession {
     left_trackball:  Option<TrackballConfig>,
     right_trackball: Option<TrackballConfig>,
 
+    /// Each pad's `click` switch, which both handlers take.
+    left_click:  bool,
+    right_click: bool,
+
     gesture_pad_config: GesturePadConfig,
 
     /// Keeps the click-pressure watch channel alive for the session lifetime,
@@ -194,6 +198,8 @@ impl TrackpadSession {
             right_movement_pulse: right_mt.movement_pulse(),
             left_trackball,
             right_trackball,
+            left_click:  trackpad.left.click,
+            right_click: trackpad.right.click,
             gesture_pad_config,
             _click_pressure: click_pressure,
         }
@@ -243,7 +249,7 @@ impl TrackpadSession {
             async {
                 match (self.left_rx, self.left_trackball) {
                     (Some(rx), Some(config)) => {
-                        trackball::run_single(rx, outputs, HapticPad::Left, config).await;
+                        trackball::run_single(rx, outputs, HapticPad::Left, config, self.left_click).await;
                     }
                     (Some(rx), None) => {
                         mt_trackpad::run_single(
@@ -252,6 +258,7 @@ impl TrackpadSession {
                             self.left_press_chain,
                             self.left_release_chain,
                             self.left_movement_pulse,
+                            self.left_click,
                         )
                         .await;
                     }
@@ -261,7 +268,7 @@ impl TrackpadSession {
             async {
                 match (self.right_rx, self.right_trackball) {
                     (Some(rx), Some(config)) => {
-                        trackball::run_single(rx, outputs, HapticPad::Right, config).await;
+                        trackball::run_single(rx, outputs, HapticPad::Right, config, self.right_click).await;
                     }
                     (Some(rx), None) => {
                         mt_trackpad::run_single(
@@ -270,6 +277,7 @@ impl TrackpadSession {
                             self.right_press_chain,
                             self.right_release_chain,
                             self.right_movement_pulse,
+                            self.right_click,
                         )
                         .await;
                     }

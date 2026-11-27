@@ -713,7 +713,7 @@ async fn run_single_keeps_rolling_without_frames_and_ends_with_its_channel() {
         tokio::time::sleep(Duration::from_secs(3)).await;
         drop(tx);
     };
-    tokio::join!(run_single(rx, &outputs, PAD, quiet()), driver);
+    tokio::join!(run_single(rx, &outputs, PAD, quiet(), true), driver);
 
     let mut actions = Vec::new();
     while let Ok(e) = tap_rx.try_recv() {

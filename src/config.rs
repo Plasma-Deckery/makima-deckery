@@ -36,6 +36,12 @@ pub struct TrackpadSideConfig {
     /// Raw `[trackpad.left.kde]` / `[trackpad.right.kde]` sub-table, handed
     /// unparsed to `kde_input_defaults`. Empty table when absent.
     pub kde_config: toml::Value,
+    /// `click = false`: the pad's physical click sends no `BTN_LEFT` and plays
+    /// no click haptic, whatever the mode. Movement is untouched. A Core key
+    /// like `click_pressure`, because it means the same in every mode — but
+    /// unlike that one it touches no firmware: it is an output gate in the
+    /// handler, so it can be switched on and off again freely. Default true.
+    pub click: bool,
 }
 
 impl TrackpadSideConfig {
@@ -54,6 +60,7 @@ impl Default for TrackpadSideConfig {
             click_pressure: None,
             handler_config: toml::Value::Table(toml::value::Table::new()),
             kde_config: toml::Value::Table(toml::value::Table::new()),
+            click: true,
         }
     }
 }
@@ -139,6 +146,19 @@ pub struct RawTrackpadConfig {
     pub gestures: Option<toml::Value>,
 }
 
+/// A pad table's `click` switch: absent is on, `true`/`false` as written,
+/// anything else warned about and left on.
+pub(crate) fn parse_click(value: Option<&toml::Value>, section: &str) -> bool {
+    match value {
+        None => true,
+        Some(toml::Value::Boolean(on)) => *on,
+        Some(other) => {
+            eprintln!("[makima] Warning: {section}: click = {other} is not true or false; the click stays on");
+            true
+        }
+    }
+}
+
 fn parse_trackpad_side(raw: Option<&toml::Value>) -> TrackpadSideConfig {
     if let Some(toml::Value::Table(t)) = raw {
         let mode = t.get("mode")
@@ -156,6 +176,7 @@ fn parse_trackpad_side(raw: Option<&toml::Value>) -> TrackpadSideConfig {
             click_pressure,
             handler_config: toml::Value::Table(t.clone()),
             kde_config,
+            click: parse_click(t.get("click"), "trackpad pad"),
         }
     } else {
         TrackpadSideConfig::default()

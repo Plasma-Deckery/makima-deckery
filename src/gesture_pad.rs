@@ -81,9 +81,19 @@ pub struct GestureMoveHaptic {
 
 /// This handler's own config, parsed from the raw `[trackpad.gestures]` TOML
 /// table that Core (`config.rs`) hands it unparsed.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GesturePadConfig {
     pub haptic: GestureHapticConfig,
+    /// `click = false`: a physical click during a gesture sends no `BTN_LEFT`.
+    /// Pinch, scroll and pan are the two slots and stay as they are. Default
+    /// true, which is the old pass-everything-through behaviour.
+    pub click: bool,
+}
+
+impl Default for GesturePadConfig {
+    fn default() -> Self {
+        Self { haptic: GestureHapticConfig::default(), click: true }
+    }
 }
 
 const HAPTIC_KEYS: &[&str] = &["on_gesture_start", "on_gesture_move", "on_gesture_end"];
@@ -109,6 +119,11 @@ impl GesturePadConfig {
             return (c, warnings);
         };
         let pixel_interval = parse_pixel_interval(table, GESTURE_PIXEL_INTERVAL, &mut warnings);
+        match table.get("click") {
+            None => {}
+            Some(toml::Value::Boolean(on)) => c.click = *on,
+            Some(other) => warnings.push(format!("click = {other} is not true or false; the click stays on")),
+        }
         match table.get("haptic") {
             None => {}
             Some(toml::Value::Table(h)) => {
@@ -153,8 +168,8 @@ fn frame_distance(prev: CombinedPadFrame, curr: CombinedPadFrame) -> f64 {
 
 /// Runs the combined two-finger gesture MT trackpad handler until `rx`
 /// closes. Forwards each frame's raw click bit (either pad physically
-/// pressed) through to the virtual device's `BTN_LEFT` unconditionally —
-/// same as a real multi-touch pad would — but fires no click-based haptic:
+/// pressed) through to the virtual device's `BTN_LEFT` — same as a real
+/// multi-touch pad would, unless `click = false` — but fires no click-based haptic:
 /// see the module doc for why click has no gesture-lifecycle meaning. Fires
 /// `on_gesture_start`/`on_gesture_move`/`on_gesture_end` instead, keyed off
 /// the lifecycle tag `trackpad_router` attaches to each `GestureEvent`.
@@ -165,19 +180,10 @@ pub async fn run(
 ) {
     let mut progress = GestureProgress::default();
 
-    /// A physical click on either half reads as one click on the combined
-    /// device.
-    fn frame_actions(frame: CombinedPadFrame) -> Vec<OutputAction> {
-        plan_gesture_frame(
-            frame.lx, frame.ly, frame.rx, frame.ry, frame.ltouch, frame.rtouch,
-            Some(frame.lclick || frame.rclick),
-        )
-    }
-
     while let Some(event) = rx.recv().await {
         match event {
             GestureEvent::Start(frame) | GestureEvent::Move(frame) => {
-                outputs.dispatch(&frame_actions(frame)).await;
+                outputs.dispatch(&frame_actions(frame, config.click)).await;
             }
             GestureEvent::End => {
                 outputs.dispatch(&plan_gesture_frame(0, 0, 0, 0, false, false, Some(false))).await;
@@ -188,6 +194,16 @@ pub async fn run(
         progress = next;
         outputs.dispatch(&actions).await;
     }
+}
+
+/// One gesture frame on the combined device. A physical click on either half
+/// reads as one click — unless the gestures' `click` switch is off, when the
+/// button stays up and only the two slots move.
+pub fn frame_actions(frame: CombinedPadFrame, click_enabled: bool) -> Vec<OutputAction> {
+    plan_gesture_frame(
+        frame.lx, frame.ly, frame.rx, frame.ry, frame.ltouch, frame.rtouch,
+        Some(click_enabled && (frame.lclick || frame.rclick)),
+    )
 }
 
 /// What the gesture's movement haptic has to remember between frames.

@@ -124,3 +124,15 @@ fn the_trackpad_table_round_trips() {
     assert!(back.combined_gesture_device);
     assert_eq!(back.gesture_kde_config, config.trackpad.gesture_kde_config);
 }
+
+/// A pad's `click` switch in a file: on unless written false.
+#[test]
+fn the_pad_click_switch_defaults_to_on() {
+    let (config, _) = Config::from_toml_value(
+        value("[trackpad.right]\nmode = \"trackball\"\nclick = false\n[trackpad.left]\nmode = \"mt-trackpad\""),
+        "o".into(), &HashMap::new(),
+    ).unwrap();
+    assert!(!config.trackpad.right.click);
+    assert!(config.trackpad.left.click);
+    assert!(TrackpadSideConfig::default().click);
+}
