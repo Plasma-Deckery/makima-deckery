@@ -87,6 +87,9 @@ pub struct EventReader {
     imu_raw: Arc<Mutex<(i32, i32)>>,
     /// When false, write_state_analog() is a no-op — no 60 Hz analog writes to state.json.
     /// The UI sends "analog on"/"analog off" via the IPC socket to control this.
+    /// Owned by the device session, not by the reader: the HUD sends the
+    /// command only when it changes its mind, so a reader that started at
+    /// false after a rebuild stopped the export until the HUD toggled again.
     analog_state_export: Arc<Mutex<bool>>,
     cursor_movement: Arc<Mutex<(i32, i32)>>,
     scroll_movement: Arc<Mutex<(i32, i32)>>,
@@ -166,6 +169,7 @@ impl EventReader {
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
         state_tx: StateWriterHandle,
+        analog_state_export: Arc<Mutex<bool>>,
     ) -> Self {
         // The production ports. `last_action` and the publish channel are made
         // here because the reader keeps the other end of each: it reads the
@@ -190,7 +194,7 @@ impl EventReader {
         Self::assemble(
             base_config, registry, base_name, event_rx, is_tablet, max_abs_wheel,
             lizard_mode, modifiers, modifier_was_activated, environment, active_client,
-            window_changed, gaming_mode, gaming_mode_tx, state_tx, ports,
+            window_changed, gaming_mode, gaming_mode_tx, state_tx, analog_state_export, ports,
         )
     }
 
@@ -216,6 +220,7 @@ impl EventReader {
         gaming_mode: Arc<Mutex<bool>>,
         gaming_mode_tx: mpsc::Sender<bool>,
         state_tx: StateWriterHandle,
+        analog_state_export: Arc<Mutex<bool>>,
         ports: Ports,
     ) -> Self {
         let Ports { outputs, last_action, state_write_rx } = ports;
@@ -228,7 +233,6 @@ impl EventReader {
         let lstick_raw = Arc::new(Mutex::new((0i32, 0i32)));
         let rstick_raw = Arc::new(Mutex::new((0i32, 0i32)));
         let imu_raw = Arc::new(Mutex::new((0i32, 0i32)));
-        let analog_state_export = Arc::new(Mutex::new(false));
         let analog_snapshot = Arc::new(Mutex::new([f32::NAN; 8]));
         let state_cache = Arc::new(Mutex::new(None));
         let cursor_movement = Arc::new(Mutex::new((0, 0)));

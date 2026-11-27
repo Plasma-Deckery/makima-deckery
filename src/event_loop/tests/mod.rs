@@ -24,6 +24,7 @@
 //! which is the path production takes, so aliases, the automatic registration
 //! of custom modifiers and the merge are the real ones.
 
+mod analog_export;
 mod gaming_mode;
 mod ledger;
 mod modifiers;
@@ -119,6 +120,7 @@ impl EventReader {
         event_rx: mpsc::Receiver<ControllerEvent>,
         environment: Environment,
         tap: Tap,
+        analog_state_export: Arc<Mutex<bool>>,
     ) -> Self {
         let base_name = base_config.name.clone();
         // The reader's own cell, written by the port as in production, so a
@@ -142,7 +144,7 @@ impl EventReader {
             // What `device_tasks` starts it at.
             Arc::new(Mutex::new(true)),
             environment, Arc::new(Mutex::new(Client::Default)), Arc::new(Notify::new()),
-            Arc::new(Mutex::new(false)), gaming_mode_tx, state_tx, ports,
+            Arc::new(Mutex::new(false)), gaming_mode_tx, state_tx, analog_state_export, ports,
         )
     }
 }
@@ -167,16 +169,22 @@ impl Drop for Deck {
 impl Deck {
     /// A reader for `BASE` in a session with no display server.
     pub fn new(name: &str) -> Self {
-        Self::with(name, Server::Unsupported)
+        Self::with(name, Server::Unsupported, Arc::new(Mutex::new(false)))
+    }
+
+    /// A reader as a rebuild starts it: with the analog export flag of the
+    /// device session it belongs to, which outlives every reader.
+    pub fn in_session(name: &str, analog_state_export: Arc<Mutex<bool>>) -> Self {
+        Self::with(name, Server::Unsupported, analog_state_export)
     }
 
     /// A reader on KDE, where the focused window is whatever `active_client`
     /// says — which is how a test switches apps without a compositor.
     pub fn on_kde(name: &str) -> Self {
-        Self::with(name, Server::Connected("KDE".to_string()))
+        Self::with(name, Server::Connected("KDE".to_string()), Arc::new(Mutex::new(false)))
     }
 
-    fn with(name: &str, server: Server) -> Self {
+    fn with(name: &str, server: Server, analog_state_export: Arc<Mutex<bool>>) -> Self {
         // Unique per test and per run: the tests run in parallel, and a
         // directory left behind by a crashed run must not leak into this one.
         let dir = std::env::temp_dir()
@@ -201,7 +209,7 @@ impl Deck {
             server,
         };
         let reader = Arc::new(EventReader::for_test(
-            base_config, registry, event_rx, environment, Tap::new(tap_tx),
+            base_config, registry, event_rx, environment, Tap::new(tap_tx), analog_state_export,
         ));
         // The production loop, running for the whole test: what it keeps
         // between events — which stick direction is held, which trigger is

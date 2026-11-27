@@ -1,6 +1,6 @@
 Name:           makima-deckery
 Version:        2.0.0~beta1
-Release:        12%{?dist}
+Release:        13%{?dist}
 Summary:        Steam Deck-native input remapper for KDE Plasma desktop
 
 License:        GPL-3.0-only
@@ -91,6 +91,9 @@ udevadm control --reload-rules 2>/dev/null || true
 %{_udevrulesdir}/50-makima.rules
 
 %changelog
+* Fri Nov 27 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-13
+- Keep the analog state export on across a rebuild of the device tasks
+
 * Fri Nov 27 2026 Philipp Schimmelfennig <philipp@plasma-deckery.dev> - 2.0.0~beta1-12
 - mt-trackpad: on_movement ticks every 12000 raw units by default, not 3000
 

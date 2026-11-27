@@ -21,6 +21,7 @@ fn empty_session(state_tx: StateWriterHandle) -> DeviceSession {
         ipc_tx:              tokio::sync::broadcast::channel(1).0,
         game_focus:          tokio::sync::watch::channel(Default::default()).1,
         virt_dev:            Arc::new(Mutex::new(VirtualDevices::new())),
+        analog_state_export: Arc::new(Mutex::new(false)),
     }
 }
 

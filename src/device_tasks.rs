@@ -46,6 +46,12 @@ pub struct DeviceSession {
     /// one task started alongside this session, so Gaming Mode detection and
     /// muting read the same answer.
     pub game_focus:          tokio::sync::watch::Receiver<crate::game_focus::GameFocus>,
+    /// Whether the readers write the analog part of the state (sticks, pads,
+    /// IMU) on every movement, as `analog-state-export on|off` last said. Here
+    /// rather than in each reader because the HUD sends it only when it
+    /// changes its mind: a flag that every rebuild — a config reload, a
+    /// device change — reset to off stopped the export behind its back.
+    pub analog_state_export: Arc<Mutex<bool>>,
 }
 
 /// Spawn a reconnecting evdev reader for a non-Steam-Deck device.
@@ -263,6 +269,7 @@ pub async fn launch_tasks(
     let DeviceSession {
         registry, environment, device_error_notify, active_client,
         window_changed, gaming_mode, state_tx, ipc_tx, virt_dev, game_focus,
+        analog_state_export,
     } = session;
     // Unified Gaming Mode channel: steam detection and IPC both send here.
     // The EventReader's gaming_mode_set_loop is the sole consumer.
@@ -436,6 +443,7 @@ pub async fn launch_tasks(
             gaming_mode.clone(),
             gaming_mode_tx.clone(),
             state_tx.clone(),
+            analog_state_export.clone(),
         );
         tasks.push(tokio::spawn(start_reader(reader, gaming_rx, ipc_tx.subscribe(), session)));
         devices_found += 1;

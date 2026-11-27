@@ -99,6 +99,7 @@ pub async fn start_monitoring_udev(registry: Arc<ConfigRegistry>, mut tasks: Vec
         ipc_tx,
         virt_dev:            virt_dev.clone(),
         game_focus,
+        analog_state_export: Arc::new(Mutex::new(false)),
     };
 
     let mut prev_modifiers = device_tasks::launch_tasks(&session, &mut tasks).await;
