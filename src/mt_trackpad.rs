@@ -21,7 +21,7 @@
 //! ```toml
 //! [trackpad.left]
 //! mode = "mt-trackpad"
-//! pixel_interval = 3000   # Raw units the finger travels per on_movement tick
+//! pixel_interval = 12000  # Raw units the finger travels per on_movement tick (~7 mm)
 //!
 //! [trackpad.left.haptic]
 //! on_press    = { duration_us = 8000, interval_us = 8000, count = 3 }
@@ -43,7 +43,13 @@ use crate::trackpad::PadState;
 use crate::trackpad_router::SinglePadFrame;
 use tokio::sync::mpsc;
 
-const DEFAULT_PIXEL_INTERVAL: u32 = 3000;
+/// The default gate of a pad's `on_movement`: about 7 mm of finger travel
+/// (the pad has 1638 raw units per mm), five or six ticks across the full
+/// width. 3000 (under 2 mm, over twenty ticks across) live-tested as a
+/// near-continuous rattle. 12000 sits next to the trackball's raster at its
+/// usual `grid` of 7 or 8 (9362 / 8192 units per cell), so a pad switched
+/// between the two modes keeps roughly the same tick density.
+pub(crate) const PAD_PIXEL_INTERVAL: u32 = 12_000;
 
 /// Distance-gated movement haptic: what to play, plus the raw-unit distance
 /// that gates it. Movement has no natural single trigger instant, so it needs
@@ -81,18 +87,18 @@ impl Default for MtTrackpadConfig {
 }
 
 /// `pixel_interval` of a pad or gesture section: a whole number of raw units
-/// of at least 0, default 3000.
-pub(crate) fn parse_pixel_interval(table: &toml::value::Table, warnings: &mut Vec<String>) -> u32 {
+/// of at least 0, `default` when absent or invalid.
+pub(crate) fn parse_pixel_interval(table: &toml::value::Table, default: u32, warnings: &mut Vec<String>) -> u32 {
     match table.get("pixel_interval") {
-        None => DEFAULT_PIXEL_INTERVAL,
+        None => default,
         Some(v) => match v.as_integer().and_then(|n| u32::try_from(n).ok()) {
             Some(n) => n,
             None => {
                 warnings.push(format!(
                     "pixel_interval = {} is not valid (must be a whole number of at least 0); using {}",
-                    v, DEFAULT_PIXEL_INTERVAL
+                    v, default
                 ));
-                DEFAULT_PIXEL_INTERVAL
+                default
             }
         },
     }
@@ -120,7 +126,7 @@ impl MtTrackpadConfig {
             warnings.push(format!("expected a table, got {}; using defaults", value.type_str()));
             return (c, warnings);
         };
-        let pixel_interval = parse_pixel_interval(table, &mut warnings);
+        let pixel_interval = parse_pixel_interval(table, PAD_PIXEL_INTERVAL, &mut warnings);
         match table.get("haptic") {
             None => {}
             Some(toml::Value::Table(h)) => {

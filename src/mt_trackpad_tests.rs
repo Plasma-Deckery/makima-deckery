@@ -163,12 +163,12 @@ fn every_haptic_key_takes_a_single_event_or_a_list() {
 }
 
 #[test]
-fn the_gate_defaults_to_3000_and_false_true_work() {
+fn the_gate_defaults_to_12000_and_false_true_work() {
     let (c, w) = parse("[haptic]\non_press = false\non_release = false\non_movement = true");
     assert!(w.is_empty(), "{w:?}");
     assert_eq!(c.on_press, None);
     assert_eq!(c.on_release, None);
-    assert_eq!(c.on_movement, Some(MovementHaptic { pixel_interval: 3000, chain: crate::config::default_tick() }));
+    assert_eq!(c.on_movement, Some(MovementHaptic { pixel_interval: 12000, chain: crate::config::default_tick() }));
 }
 
 #[test]
@@ -191,7 +191,40 @@ fn bad_values_warn_and_fall_back_on_their_own() {
     assert_eq!(w.len(), 3, "{w:?}");
     assert_eq!(c.on_press, Some(HapticChain::default()));
     assert_eq!(c.on_release, Some(HapticChain::default()));
-    assert_eq!(c.on_movement.unwrap().pixel_interval, 3000);
+    assert_eq!(c.on_movement.unwrap().pixel_interval, 12000);
+}
+
+/// Ticks of `cfg`'s movement haptic over one straight swipe across the whole
+/// pad, in steps of 200 raw units.
+fn ticks_over_a_full_swipe(cfg: &MtTrackpadConfig) -> usize {
+    let m = cfg.movement_pulse().expect("on_movement is on");
+    let mut progress = HapticProgress::default();
+    let mut ticks = 0;
+    for x in (-32_700..=32_700).step_by(200) {
+        let (next, actions) = plan_haptics(progress, &frame(x, 0, true, false), HapticPad::Right, None, None, Some(&m));
+        progress = next;
+        ticks += actions.len();
+    }
+    ticks
+}
+
+/// The onboarding tour switches a trackball pad to mt-trackpad and leaves the
+/// rest of the table alone. The trackball's `grid` is not read here, so its
+/// `on_movement` is gated by the mode's own default: five ticks across the
+/// pad, about what that trackball's grid of 7 gives, not twenty-one.
+#[test]
+fn a_trackball_table_switched_to_mt_trackpad_ticks_at_the_default_gate() {
+    let (c, w) = parse(r#"
+        mode = "mt-trackpad"
+        sensitivity = 0.008
+        friction = 2.0
+        grid = 7
+        [haptic]
+        on_movement = { duration_us = 4000, interval_us = 4000, count = 1, gain_db = 0 }
+    "#);
+    assert!(w.is_empty(), "{w:?}");
+    assert_eq!(c.movement_pulse().unwrap().pixel_interval, 12000, "`grid` does not gate this mode");
+    assert_eq!(ticks_over_a_full_swipe(&c), 5);
 }
 
 #[test]

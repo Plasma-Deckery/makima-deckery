@@ -44,6 +44,11 @@ use crate::trackpad::plan_gesture_frame;
 use crate::trackpad_router::{CombinedPadFrame, GestureEvent};
 use tokio::sync::mpsc;
 
+/// The default gate of `on_gesture_move`, in raw units summed over both
+/// fingers. Unchanged when a single pad's default went to 12000: two-finger
+/// scrolling is a different feel and nobody has asked for it to change.
+const GESTURE_PIXEL_INTERVAL: u32 = 3000;
+
 /// Haptic policy for the gesture pad, keyed on gesture lifecycle rather than
 /// click (a click has no meaning mid-gesture — see the module doc above).
 /// Unlike `mt_trackpad`'s `on_press`/`on_release`, none of these three have
@@ -103,7 +108,7 @@ impl GesturePadConfig {
             warnings.push(format!("expected a table, got {}; using defaults", value.type_str()));
             return (c, warnings);
         };
-        let pixel_interval = parse_pixel_interval(table, &mut warnings);
+        let pixel_interval = parse_pixel_interval(table, GESTURE_PIXEL_INTERVAL, &mut warnings);
         match table.get("haptic") {
             None => {}
             Some(toml::Value::Table(h)) => {
