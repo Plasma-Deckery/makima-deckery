@@ -4,6 +4,7 @@ mod enabling;
 mod files;
 mod lookup;
 mod merging;
+mod pad_choice;
 mod resolve;
 
 use super::*;
@@ -27,6 +28,8 @@ fn make_registry(entries: Vec<ConfigEntry>) -> Arc<ConfigRegistry> {
         entries: Mutex::new(map),
         compositor: Mutex::new(None),
         preferences: Mutex::new(crate::preferences::Preferences::default()),
+        pad_choice: Mutex::new(Default::default()),
+        preferences_text: Arc::new(Mutex::new(None)),
         resolved: Mutex::new(HashMap::new()),
         generation: std::sync::atomic::AtomicU64::new(0),
     })
@@ -102,6 +105,8 @@ fn registry_with_user_root(entries: Vec<ConfigEntry>, user: &Path) -> Arc<Config
         entries: Mutex::new(map),
         compositor: Mutex::new(None),
         preferences: Mutex::new(Preferences::default()),
+        pad_choice: Mutex::new(Default::default()),
+        preferences_text: Arc::new(Mutex::new(None)),
         resolved: Mutex::new(HashMap::new()),
         generation: std::sync::atomic::AtomicU64::new(0),
     })

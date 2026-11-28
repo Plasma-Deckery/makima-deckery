@@ -17,6 +17,12 @@
 //     [modules]
 //     disabled = ["Voice Control"]
 //
+//     [trackpad.right]
+//     mode = "trackball"
+//
+// `[trackpad]` holds the user's own choices for the pads, laid over the
+// effective config key by key — see `pad_preferences`.
+//
 // Only deviations from the default are recorded. A module absent from
 // `disabled` is enabled, which keeps the file small and makes a newly shipped
 // module active without the user having to opt in.
@@ -39,6 +45,10 @@ pub struct Preferences {
     pub groups: GroupPreferences,
     #[serde(default)]
     pub modules: ModulePreferences,
+    /// Kept as written, so a key a later version reads survives a save by
+    /// this one; read through `pad_preferences::PadChoice`.
+    #[serde(default, skip_serializing_if = "toml::value::Table::is_empty")]
+    pub trackpad: crate::pad_preferences::PadPreferences,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -131,13 +141,7 @@ impl Preferences {
             eprintln!("deckery: cannot create {user_root:?}: {e}");
             return;
         }
-        let text = match toml::to_string_pretty(self) {
-            Ok(text) => text,
-            Err(e) => {
-                eprintln!("deckery: cannot serialise preferences: {e}");
-                return;
-            }
-        };
+        let Some(text) = self.to_text() else { return };
         // Same directory as the target: rename is only atomic within a filesystem.
         let tmp = path.with_extension("toml.tmp");
         if let Err(e) = std::fs::write(&tmp, text) {
@@ -147,6 +151,18 @@ impl Preferences {
         if let Err(e) = std::fs::rename(&tmp, &path) {
             eprintln!("deckery: cannot replace {path:?}: {e}");
             let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The file's text as `save` writes it. The registry remembers it, so its
+    /// file watcher can tell its own write from somebody else's.
+    pub fn to_text(&self) -> Option<String> {
+        match toml::to_string_pretty(self) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("deckery: cannot serialise preferences: {e}");
+                None
+            }
         }
     }
 

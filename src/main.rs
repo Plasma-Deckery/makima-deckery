@@ -18,6 +18,7 @@ mod ledger;
 mod machine;
 mod mt_trackpad;
 mod output;
+mod pad_preferences;
 mod preferences;
 mod resolver;
 mod scroll_pad;

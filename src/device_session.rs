@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, Mutex};
 
 /// Whether `setup` knows a trackpad mode. Anything else is warned about and
 /// then behaves like `disabled`, because no handler is spawned for it.
-fn is_known_trackpad_mode(mode: &str) -> bool {
+pub(crate) fn is_known_trackpad_mode(mode: &str) -> bool {
     ["disabled", "mt-trackpad", "trackball", "scroll"].contains(&mode)
 }
 

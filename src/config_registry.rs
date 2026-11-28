@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::config::{Config, Event};
+use crate::pad_preferences::PadChoice;
 use crate::preferences::Preferences;
 use crate::session::Client;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -274,6 +275,14 @@ pub struct ConfigRegistry {
     /// The user's activation choices, mirrored to `preferences.toml` on every
     /// change. Held in memory so `reload()` can re-apply them without a read.
     preferences: Mutex<Preferences>,
+    /// The pad modes `preferences.toml` chooses, checked once per read — see
+    /// `pad_preferences`. Laid over every base config.
+    pad_choice: Mutex<PadChoice>,
+    /// The text of `preferences.toml` as this process last read or wrote it.
+    /// The file watcher compares against it: the file changing to anything
+    /// else is somebody else's edit — the onboarding tour recording a pad
+    /// choice — and reloads; this process's own writes do not.
+    preferences_text: Arc<Mutex<Option<String>>>,
     /// Memoised `resolve()` results.
     ///
     /// `resolve()` runs on every key press, and rebuilding its answer means
@@ -312,7 +321,9 @@ impl ConfigRegistry {
         // user has their own copy.
         crate::preferences::seed_from(&roots.system, &roots.user);
         refresh_readme(&roots);
+        let preferences_text = std::fs::read_to_string(crate::preferences::path_in(&roots.user)).ok();
         let preferences = Preferences::load(&roots.user);
+        let pad_choice = PadChoice::from_table(&preferences.trackpad);
         let mut entries = Self::load_entries(&roots);
         // No compositor yet — `set_compositor()` runs this again once there is
         // one, which is what settles a group whose choice is gated.
@@ -322,6 +333,8 @@ impl ConfigRegistry {
             roots,
             compositor: Mutex::new(None),
             preferences: Mutex::new(preferences),
+            pad_choice: Mutex::new(pad_choice),
+            preferences_text: Arc::new(Mutex::new(preferences_text)),
             resolved: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         })
@@ -340,6 +353,8 @@ impl ConfigRegistry {
             entries: Mutex::new(HashMap::new()),
             compositor: Mutex::new(None),
             preferences: Mutex::new(Preferences::default()),
+            pad_choice: Mutex::new(Default::default()),
+            preferences_text: Arc::new(Mutex::new(None)),
             resolved: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         })
@@ -354,6 +369,8 @@ impl ConfigRegistry {
             entries: Mutex::new(entries.into_iter().map(|e| (e.name.clone(), e)).collect()),
             compositor: Mutex::new(None),
             preferences: Mutex::new(Preferences::default()),
+            pad_choice: Mutex::new(Default::default()),
+            preferences_text: Arc::new(Mutex::new(None)),
             resolved: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         })
@@ -370,10 +387,13 @@ impl ConfigRegistry {
     /// if a reload and a restart could disagree about which modules are active,
     /// the user would see their choice silently revert at the next boot.
     pub fn reload(&self) {
+        *self.preferences_text.lock().unwrap() =
+            std::fs::read_to_string(crate::preferences::path_in(&self.roots.user)).ok();
         let preferences = Preferences::load(&self.roots.user);
         let mut new_entries = Self::load_entries(&self.roots);
         apply_preferences(&mut new_entries, &preferences, self.compositor().as_deref());
         *self.entries.lock().unwrap() = new_entries;
+        *self.pad_choice.lock().unwrap() = PadChoice::from_table(&preferences.trackpad);
         *self.preferences.lock().unwrap() = preferences;
         self.invalidate_resolved();
     }
@@ -413,10 +433,15 @@ impl ConfigRegistry {
         &self,
         change_tx: tokio::sync::mpsc::Sender<()>,
     ) -> RecommendedWatcher {
+        let known_preferences = self.preferences_text.clone();
         let mut watcher = RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    if Self::is_config_change(&event) { let _ = change_tx.try_send(()); }
+                    if Self::is_config_change(&event)
+                        || Self::is_preferences_edit(&event, &known_preferences.lock().unwrap())
+                    {
+                        let _ = change_tx.try_send(());
+                    }
                 }
             },
             notify::Config::default(),
@@ -444,6 +469,28 @@ impl ConfigRegistry {
         watcher
     }
 
+    /// Write `preferences.toml`, remembering the text first so the watcher
+    /// sees this write as the process's own however soon its event arrives.
+    fn save_preferences(&self, preferences: &Preferences) {
+        *self.preferences_text.lock().unwrap() = preferences.to_text();
+        preferences.save(&self.roots.user);
+    }
+
+    /// Whether a file-system event is an edit of `preferences.toml` from
+    /// outside this process: the file now reads differently from `known`, the
+    /// text this process last read or wrote. Its own writes read the same and
+    /// change nothing.
+    pub(crate) fn is_preferences_edit(event: &notify::Event, known: &Option<String>) -> bool {
+        use notify::EventKind::*;
+        if !matches!(event.kind, Create(_) | Modify(_) | Remove(_)) {
+            return false;
+        }
+        event.paths.iter()
+            .filter(|p| p.file_name().and_then(|n| n.to_str())
+                .is_some_and(crate::preferences::is_preferences_file))
+            .any(|p| std::fs::read_to_string(p).ok() != *known)
+    }
+
     /// Whether a file-system event is one that should reload the configs.
     ///
     /// Split out of `start_watcher` so the filter can be tested without
@@ -453,11 +500,10 @@ impl ConfigRegistry {
         use notify::EventKind::*;
         match event.kind {
             Create(_) | Modify(_) | Remove(_) => {
-                // preferences.toml is deliberately not watched. It is
-                // written by this process on every IPC toggle, and the
-                // resulting event would reload every config just to
-                // re-read what we had just written. It only ever
-                // changes through IPC, so there is nothing to observe.
+                // preferences.toml is not a config: it is written by this
+                // process on every IPC toggle, and reacting to that would
+                // reload every config to re-read what was just written.
+                // An edit from outside is `is_preferences_edit`'s.
                 event.paths.iter().any(|p| {
                     p.extension().and_then(|e| e.to_str()) == Some("toml")
                         && p.file_name().and_then(|n| n.to_str())
@@ -531,11 +577,12 @@ impl ConfigRegistry {
     /// `launch_tasks()` iterates these declared targets to find physical devices.
     pub fn base_configs(&self) -> Vec<Config> {
         let compositor = self.compositor();
+        let pad_choice = self.pad_choice.lock().unwrap().clone();
         let entries = self.entries.lock().unwrap();
         entries.values()
             .filter_map(|e| usable(e, compositor.as_deref()))
             .filter(|c| c.device.is_some())
-            .map(|c| with_modules(&entries, c, compositor.as_deref()))
+            .map(|c| with_choices(with_modules(&entries, c, compositor.as_deref()), &pad_choice))
             .collect()
     }
 
@@ -619,11 +666,12 @@ impl ConfigRegistry {
     fn resolve_uncached(&self, base_name: &str, client: &Client) -> Option<Config> {
         let compositor = self.compositor();
         let compositor = compositor.as_deref();
+        let pad_choice = self.pad_choice.lock().unwrap().clone();
         let entries = self.entries.lock().unwrap();
 
         let base_raw = usable(entries.get(base_name)?, compositor)
             .filter(|c| c.device.is_some())?;
-        let base = with_modules(&entries, base_raw, compositor);
+        let base = with_choices(with_modules(&entries, base_raw, compositor), &pad_choice);
 
         let client_class = match client {
             Client::Class(class, _, _) => Some(class.as_str()),
@@ -757,7 +805,7 @@ impl ConfigRegistry {
             preferences.clone()
         };
         self.invalidate_resolved();
-        preferences.save(&self.roots.user);
+        self.save_preferences(&preferences);
         true
     }
 
@@ -803,7 +851,7 @@ impl ConfigRegistry {
             preferences.clone()
         };
         self.invalidate_resolved();
-        preferences.save(&self.roots.user);
+        self.save_preferences(&preferences);
         true
     }
 
@@ -1040,6 +1088,14 @@ fn usable<'a>(entry: &'a ConfigEntry, compositor: Option<&str>) -> Option<&'a Co
 /// auto-discovery pulls in — everything else is activated by a condition.
 fn is_plain_module(config: &Config) -> bool {
     config.device.is_none() && config.module.match_window_class.is_none()
+}
+
+/// `config` with the user's standing choices from `preferences.toml` laid
+/// over it — today the pad modes. Above every module, below an app override
+/// and an override session's layer, which apply later.
+fn with_choices(mut config: Config, pad_choice: &PadChoice) -> Config {
+    pad_choice.apply(&mut config.trackpad);
+    config
 }
 
 /// Merge every usable plain module into `config`.
