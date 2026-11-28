@@ -6,11 +6,13 @@
 //! cost was three dependency cycles, the worst of which pointed `compositor/`,
 //! a self-contained adapter package, back at the top of the module tree.
 //!
-//! This module therefore depends on nothing inside the crate and never will:
+//! This module therefore depends on nothing inside the crate except
+//! `desktop_detect`, which is equally self-contained:
 //! it is the vocabulary the compositor adapters, the config registry and the
 //! event reader share. `set_environment()` sits here for the same reason —
 //! it is what builds an `Environment`, and it has nothing to do with udev.
 
+use crate::desktop_detect;
 use std::env;
 use std::process::Command;
 
@@ -67,25 +69,32 @@ pub fn set_environment() -> Environment {
         env::set_var("XDG_SESSION_TYPE", "wayland")
     }
 
-    // Compositors listed here get Server::Connected and enable per-app bindings.
-    // KDE and Hyprland use event-driven adapters (compositor module).
-    // sway and niri use the legacy get_active_window() polling fallback.
-    let supported_compositors = vec!["KDE", "Hyprland", "sway", "niri"]
-        .into_iter()
-        .map(|str| String::from(str))
-        .collect::<Vec<String>>();
+    // Compositors listed in `desktop_detect::SUPPORTED` get Server::Connected
+    // and enable per-app bindings. KDE and Hyprland use event-driven adapters
+    // (compositor module); sway and niri use the get_active_window() polling
+    // fallback. An unset XDG_CURRENT_DESKTOP is filled in from the running
+    // compositor process, so the adapters and hyprctl see the same name.
+    let inherited = env::var("XDG_CURRENT_DESKTOP").ok().filter(|v| !v.trim().is_empty());
+    let processes = match inherited {
+        Some(_) => Vec::new(),
+        None => desktop_detect::running_process_names(),
+    };
+    let desktop = desktop_detect::resolve_desktop(inherited.as_deref(), &processes);
+    if inherited.is_none() {
+        if let Some(found) = &desktop {
+            println!("XDG_CURRENT_DESKTOP not set, detected {} from the running compositor.", found);
+            env::set_var("XDG_CURRENT_DESKTOP", found);
+        }
+    }
     let (x11, wayland) = (String::from("x11"), String::from("wayland"));
-    let server: Server = match (
-        env::var("XDG_SESSION_TYPE"),
-        env::var("XDG_CURRENT_DESKTOP"),
-    ) {
-        (Ok(session), Ok(desktop))
-            if session == wayland && supported_compositors.contains(&desktop) =>
+    let server: Server = match (env::var("XDG_SESSION_TYPE"), desktop) {
+        (Ok(session), Some(desktop))
+            if session == wayland && desktop_detect::SUPPORTED.contains(&desktop.as_str()) =>
         {
             println!("Running on {}, per application bindings enabled.", desktop);
             Server::Connected(desktop)
         }
-        (Ok(session), Ok(desktop)) if session == wayland => {
+        (Ok(session), Some(desktop)) if session == wayland => {
             println!("Warning: unsupported compositor: {}, won't be able to change bindings according to the active window.\n\
                     Currently supported desktops: Plasma/KWin (event-driven), Hyprland (event-driven), Sway (polling), Niri (polling), X11.\n", desktop);
             Server::Unsupported
@@ -94,8 +103,8 @@ pub fn set_environment() -> Environment {
             println!("Running on X11, per application bindings enabled.");
             Server::Connected(session)
         }
-        (Ok(session), Err(_)) if session == wayland => {
-            println!("Warning: unable to retrieve the current desktop based on XDG_CURRENT_DESKTOP env var.\n\
+        (Ok(session), None) if session == wayland => {
+            println!("Warning: unable to retrieve the current desktop from XDG_CURRENT_DESKTOP or the running compositor.\n\
                     Won't be able to change bindings according to the active window.\n");
             Server::Unsupported
         }

@@ -23,7 +23,8 @@
 //! 2. Implement `pub async fn run_focus_watcher(active_client, notify)` in the new module.
 //!    Call `super::notify_focus_change()` on each focus-change event.
 //! 3. Update `detect()` and `CompositorKind::is_event_driven()`.
-//! 4. Add the compositor name to `supported_compositors` in `udev_monitor.rs`.
+//! 4. Add the compositor name to `SUPPORTED` (and its process name to
+//!    `COMPOSITOR_PROCESSES`) in `desktop_detect.rs`.
 
 pub mod fallback;
 pub mod hyprland;
@@ -103,7 +104,7 @@ impl CompositorKind {
 // ── Detection ─────────────────────────────────────────────────────────────────
 
 /// Detect the active compositor from the `XDG_CURRENT_DESKTOP` value already
-/// resolved by `udev_monitor::set_environment()`.
+/// resolved by `session::set_environment()` (see `desktop_detect`).
 pub fn detect(desktop: &str) -> CompositorKind {
     match desktop {
         "KDE"      => CompositorKind::Kde,

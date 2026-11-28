@@ -4,6 +4,7 @@ mod auto_mute;
 mod config;
 mod config_registry;
 mod decode;
+mod desktop_detect;
 mod device_session;
 mod device_tasks;
 mod game_focus;
