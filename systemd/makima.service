@@ -7,11 +7,11 @@ BindsTo=deckery-tray.service
 ExecStart=%h/.local/bin/makima-deckery
 Restart=on-failure
 RestartSec=3
+# XDG_CURRENT_DESKTOP, WAYLAND_DISPLAY, DISPLAY and HYPRLAND_INSTANCE_SIGNATURE
+# come from the user manager environment the session imports (Plasma, uwsm).
+# Never hard-code them here: the compositor adapter is chosen from them.
 Environment=DECKERY_CONFIG=%h/.config/deckery
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=DISPLAY=:0
 Environment=XDG_SESSION_TYPE=wayland
-Environment=XDG_CURRENT_DESKTOP=KDE
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 
 [Install]
