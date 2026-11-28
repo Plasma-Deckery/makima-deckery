@@ -5,12 +5,19 @@
 //! `.socket.sock` for the active window's PID (not included in the event itself).
 //! Event-driven: focus changes are pushed immediately, no polling needed.
 //!
-//! Socket locations:
-//!   `/tmp/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock`  — request/response
-//!   `/tmp/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock` — event stream
+//! Socket locations (`.socket.sock` is request/response, `.socket2.sock` the
+//! event stream), tried in this order:
+//!   `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/` — Hyprland 0.40 and later
+//!   `/tmp/hypr/$HYPRLAND_INSTANCE_SIGNATURE/`             — older releases
+//!
+//! If `HYPRLAND_INSTANCE_SIGNATURE` was not imported into the user manager,
+//! the instance directory under `$XDG_RUNTIME_DIR/hypr/` (or `/tmp/hypr/`)
+//! whose event socket was touched last is used, and the signature is exported
+//! so `hyprctl` in the polling path finds the same instance.
 
 use super::notify_focus_change;
 use crate::session::Client;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -20,14 +27,75 @@ const RECONNECT_DELAY_SECS: u64 = 2;
 
 // ── Socket paths ──────────────────────────────────────────────────────────────
 
-fn socket2_path() -> Option<String> {
-    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
-    Some(format!("/tmp/hypr/{}/.socket2.sock", sig))
+const EVENT_SOCKET: &str = ".socket2.sock";
+const REQUEST_SOCKET: &str = ".socket.sock";
+const LEGACY_BASE: &str = "/tmp/hypr";
+
+/// Directories that may hold Hyprland instances, current location first.
+fn instance_bases(runtime_dir: Option<&str>) -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Some(dir) = runtime_dir.filter(|d| !d.is_empty()) {
+        bases.push(Path::new(dir).join("hypr"));
+    }
+    bases.push(PathBuf::from(LEGACY_BASE));
+    bases
 }
 
-fn socket1_path() -> Option<String> {
-    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
-    Some(format!("/tmp/hypr/{}/.socket.sock", sig))
+/// Where the socket `name` of instance `signature` may be, in the order to try.
+fn socket_candidates(runtime_dir: Option<&str>, signature: &str, name: &str) -> Vec<PathBuf> {
+    instance_bases(runtime_dir)
+        .into_iter()
+        .map(|base| base.join(signature).join(name))
+        .collect()
+}
+
+/// The first candidate for which `exists` holds.
+fn resolve_socket(
+    runtime_dir: Option<&str>,
+    signature: &str,
+    name: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    socket_candidates(runtime_dir, signature, name)
+        .into_iter()
+        .find(|p| exists(p))
+}
+
+/// The signature of the instance whose event socket changed last, for sessions
+/// that did not import `HYPRLAND_INSTANCE_SIGNATURE`.
+fn newest_instance(runtime_dir: Option<&str>) -> Option<String> {
+    instance_bases(runtime_dir)
+        .into_iter()
+        .find_map(|base| {
+            std::fs::read_dir(base)
+                .ok()?
+                .flatten()
+                .filter_map(|entry| {
+                    let modified = entry.path().join(EVENT_SOCKET).metadata().ok()?.modified().ok()?;
+                    Some((modified, entry.file_name().to_string_lossy().into_owned()))
+                })
+                .max()
+                .map(|(_, signature)| signature)
+        })
+}
+
+/// The instance signature: the environment's, else the newest instance found
+/// on disk (exported, so `hyprctl` agrees).
+fn instance_signature() -> Option<String> {
+    if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        if !sig.is_empty() {
+            return Some(sig);
+        }
+    }
+    let sig = newest_instance(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())?;
+    println!("deckery: hyprland_watcher: HYPRLAND_INSTANCE_SIGNATURE not set, using instance {sig}");
+    std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", &sig);
+    Some(sig)
+}
+
+fn socket_path(signature: &str, name: &str) -> Option<PathBuf> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+    resolve_socket(runtime_dir.as_deref(), signature, name, |p| p.exists())
 }
 
 // ── PID query ─────────────────────────────────────────────────────────────────
@@ -36,7 +104,8 @@ fn socket1_path() -> Option<String> {
 /// The `activewindow` event on socket2 does not include PID, so we fetch it
 /// separately. Returns `None` if the query fails or the window has no pid.
 async fn query_active_window_pid() -> Option<u32> {
-    let path = socket1_path()?;
+    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+    let path = socket_path(&sig, REQUEST_SOCKET)?;
     let mut stream = UnixStream::connect(&path).await.ok()?;
     stream.write_all(b"j/activewindow").await.ok()?;
     let mut response = String::new();
@@ -53,19 +122,25 @@ pub async fn run_focus_watcher(
     active_client: Arc<Mutex<Client>>,
     notify: Arc<Notify>,
 ) {
-    let path = match socket2_path() {
-        Some(p) => p,
-        None => {
-            eprintln!("deckery: hyprland_watcher: HYPRLAND_INSTANCE_SIGNATURE not set, focus watcher disabled");
-            return;
-        }
-    };
-
+    let mut logged_missing = false;
     loop {
+        // Resolved on every attempt: at login the socket may not exist yet,
+        // and a missing signature can only be found once the instance is up.
+        let path = instance_signature().and_then(|sig| socket_path(&sig, EVENT_SOCKET));
+        let Some(path) = path else {
+            if !logged_missing {
+                eprintln!("deckery: hyprland_watcher: no Hyprland event socket found yet, retrying");
+                logged_missing = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+            continue;
+        };
         match UnixStream::connect(&path).await {
             Ok(stream) => {
+                logged_missing = false;
                 println!(
-                    "deckery: hyprland_watcher: connected to event socket, window-activation events enabled. +{}ms since startup",
+                    "deckery: hyprland_watcher: connected to event socket {}, window-activation events enabled. +{}ms since startup",
+                    path.display(),
                     crate::startup_ms()
                 );
                 let mut reader = BufReader::new(stream);
@@ -122,6 +197,59 @@ mod tests {
             Arc::new(Mutex::new(Client::Default)),
             Arc::new(Notify::new()),
         )
+    }
+
+    #[test]
+    fn the_runtime_dir_socket_is_tried_before_tmp() {
+        assert_eq!(
+            socket_candidates(Some("/run/user/1000"), "abc_123", EVENT_SOCKET),
+            vec![
+                PathBuf::from("/run/user/1000/hypr/abc_123/.socket2.sock"),
+                PathBuf::from("/tmp/hypr/abc_123/.socket2.sock"),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_runtime_dir_only_tmp_is_tried() {
+        assert_eq!(
+            socket_candidates(None, "abc", REQUEST_SOCKET),
+            vec![PathBuf::from("/tmp/hypr/abc/.socket.sock")]
+        );
+        assert_eq!(socket_candidates(Some(""), "abc", REQUEST_SOCKET).len(), 1);
+    }
+
+    #[test]
+    fn resolution_takes_the_current_path_when_it_exists() {
+        let found = resolve_socket(Some("/run/user/1000"), "abc", EVENT_SOCKET, |_| true);
+        assert_eq!(found, Some(PathBuf::from("/run/user/1000/hypr/abc/.socket2.sock")));
+    }
+
+    #[test]
+    fn resolution_falls_back_to_tmp_for_old_hyprland() {
+        let found = resolve_socket(Some("/run/user/1000"), "abc", EVENT_SOCKET, |p| p.starts_with("/tmp"));
+        assert_eq!(found, Some(PathBuf::from("/tmp/hypr/abc/.socket2.sock")));
+    }
+
+    #[test]
+    fn resolution_finds_nothing_when_no_socket_exists() {
+        assert_eq!(resolve_socket(Some("/run/user/1000"), "abc", EVENT_SOCKET, |_| false), None);
+    }
+
+    #[test]
+    fn the_newest_instance_is_found_on_disk() {
+        let runtime = std::env::temp_dir().join(format!("makima-hypr-test-{}", std::process::id()));
+        for sig in ["old", "new"] {
+            let dir = runtime.join("hypr").join(sig);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(EVENT_SOCKET), b"").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // A directory without an event socket is not an instance.
+        std::fs::create_dir_all(runtime.join("hypr").join("stale")).unwrap();
+        let found = newest_instance(runtime.to_str());
+        std::fs::remove_dir_all(&runtime).unwrap();
+        assert_eq!(found.as_deref(), Some("new"));
     }
 
     #[tokio::test]
